@@ -87,6 +87,8 @@ class ToolCallFinished(Event):
     name: str = ""
     ok: bool = False
     rejected: bool = False
+    # auto / approved / denied / rejected —— 审计据此区分「谁拒的」
+    decision: str = "auto"
     exit_code: int | None = None
     duration_ms: int | None = None
     level: str | None = None
@@ -105,15 +107,44 @@ class FileChanged(Event):
     snapshot_id: str | None = None
 
 
+class Verification(Event):
+    """一步做完后自动跑验证的结果。
+
+    status: ok / failed（跑过）、not_configured（没有可用的测试命令）、skipped（没跑）。
+    """
+
+    type: Literal["verification"] = "verification"
+    status: str = "skipped"
+    command: str = ""
+    ok: bool = True
+    summary: str = ""
+    issues: list[str] = Field(default_factory=list)
+
+
+class RepairStarted(Event):
+    """验证失败后开始第 N 次修复。"""
+
+    type: Literal["repair_started"] = "repair_started"
+    attempt: int = 1
+    limit: int = 0
+    summary: str = ""
+    issues: list[str] = Field(default_factory=list)
+
+
 # --------------------------------------------------------------------------
-# 人工审批（W5 接入 interrupt 后生效）
+# 人工审批
 # --------------------------------------------------------------------------
 
 class ApprovalRequested(Event):
-    """需要用户确认才能继续。审批结果经 request_id 回传。"""
+    """图已挂起，等待人工确认。
+
+    前端收集答复后调用 `AgentRuntime.resume(thread_id, {request_id: bool})`。
+    若事件流以本事件收尾（而不是 RunFinished），即表示处于挂起状态。
+    """
 
     type: Literal["approval_requested"] = "approval_requested"
     request_id: str = ""
+    tool: str = ""
     command: str = ""
     level: str = ""
     reason: str = ""
@@ -144,6 +175,8 @@ EventType = (
     | ToolCallStarted
     | ToolCallFinished
     | FileChanged
+    | Verification
+    | RepairStarted
     | ApprovalRequested
     | RunFinished
     | RunFailed

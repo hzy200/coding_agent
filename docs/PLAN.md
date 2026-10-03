@@ -33,7 +33,7 @@ LLM **不直接连接操作系统**。模型只能输出结构化工具调用 `{
                     │
 ┌───────────────────▼──────────────────────┐
 │        LangGraph 编排（StateGraph）        │
-│ planner→retrieve→act→gate→execute→verify→repair │
+│ planner→retrieve→act→approval_gate→execute→verify→repair │
 └───────────────────┬──────────────────────┘
                     │  {tool, args}
 ┌───────────────────▼──────────────────────┐
@@ -75,30 +75,30 @@ LLM **不直接连接操作系统**。模型只能输出结构化工具调用 `{
 coding_agent/
   pyproject.toml
   .env.example
-  docs/PLAN.md
+  README.md
+  docs/  PLAN.md  ARCHITECTURE.md  USAGE.md  DEMO.md  ACCEPTANCE.md
   src/coding_agent/
-    runtime.py                                   # AgentRuntime：唯一编排入口
-    events.py                                    # 领域事件（前端契约）
-    cli/            app.py  render.py  slash.py
-    tui/            app.py  widgets/             # W3 后接入
+    runtime.py        # AgentRuntime：唯一编排入口，产出领域事件
+    events.py         # 领域事件（前端契约）
+    config.py         # pydantic-settings 配置
+    diffing.py        # unified diff 生成与统计
+    messages.py       # 消息取文本
+    cli/              # app.py：typer 入口（doctor/run/tui/web/…）
+    tui/              # app.py：Textual 界面
+    web/              # app.py + static/index.html：最小验证界面
     graph/
-      state.py                                     # AgentState
-      build.py                                     # 编译 StateGraph
-      routing.py                                   # 条件边
-      nodes/  act.py  tools.py  planner.py
-              retrieve.py  verify.py  repair.py
-    tools/    shell.py files.py search.py git.py
-              deps.py testrun.py registry.py
-    tools/    shell.py files.py artifacts.py registry.py
-              search.py git.py deps.py testrun.py
-    sandbox/  wsl_exec.py policy.py pathguard.py fs.py limits.py
-    memory/   checkpointer.py longterm.py
+      state.py  build.py  routing.py
+      nodes/  planner.py act.py approve.py tools.py
+              verify.py repair.py advance.py respond.py
+    tools/    shell.py files.py git.py deps.py
+              search.py testrun.py artifacts.py registry.py
+    sandbox/  wsl_exec.py policy.py pathguard.py
+              fs.py snapshots.py limits.py
+    memory/   checkpointer.py sessions.py longterm.py
     audit/    logger.py models.py
-    llm/      deepseek.py prompts.py
-    config.py
-  tests/  unit/  integration/  smoke/
-  scripts/  demo_*.py
-  web/      app.py                                 # 最小验证 UI
+    llm/      deepseek.py prompts.py context.py
+  tests/  unit/  integration/  tui/
+  scripts/  demo.py
 ```
 
 ---
@@ -151,14 +151,126 @@ START → planner → retrieve → act ⇄ tools
 
 `cp` / `ln` / `mv` 刻意**不**放在自动放行的 L1：它们能覆盖或替换文件，会绕过文件工具的精确替换、diff 与写前备份，让「可回滚的修改流程」出现旁路。
 
-### 4.3 文件工具与回滚
+### 4.3 审批：决定与执行分离
+
+```
+act ──(有 tool_calls)──→ approval_gate ──→ tools ──→ act
+                              │
+                         interrupt() 挂起
+                              ↓
+                    前端收集答复 → Command(resume=...)
+```
+
+- **approval_gate 只做决定**：按 `SessionPolicy` 把风险等级翻译成 放行 / 询问 / 拒绝；
+  需要询问时 `interrupt()` 挂起，图状态存进 checkpoint，前端拿 `ApprovalRequested` 事件。
+- **tools 节点负责强制**：它是所有工具执行的唯一咽喉，没拿到 `auto` / `approved` 的调用
+  一律不执行，只回一条说明给模型。分开的好处是判定逻辑保持纯函数，执行侧的检查无法绕过。
+- **fail closed**：审批记录缺失、前端答复无法解析、`--yes` 之外的非交互环境，一律按拒绝处理。
+- **一次性**：审批结果由 tools 节点消费后即清空，不会跨轮次误放行。
+
+注意：`interrupt()` 恢复时节点会**从头重跑**，所以 gate 里除 `interrupt()` 外必须保持纯函数。
+
+### 4.4 验证：失败要看得见
+
+`verify` 节点在**每一步做完后**跑一遍项目的测试/构建，把输出结构化成
+`文件:行号 + 消息` 再回灌，而不是丢一大坨 stdout 给模型自己找。
+
+两个刻意的取舍：
+
+- **只在改过东西时才验证**（状态里的 `dirty`）。只读探索跑测试纯属浪费。
+- **自动验证不走审批**。它跑的是宿主从项目清单推导出的固定命令，模型影响不了跑什么；
+  模型主动调用 `run_tests` 才走 L2 审批。区别在「谁决定执行什么」。
+
+命令按清单自动识别：`Cargo.toml` → cargo、`go.mod` → go、`package.json` 带 test 脚本 →
+npm、`pytest.ini`/`tests/` + pytest 可用 → pytest、`Makefile` 有 `test:` → make。
+都识别不出就返回 `not_configured`，**不当成失败**。也可用 `AGENT_VERIFY_COMMAND` 覆盖。
+
+解析按输出格式分派：Python traceback（unittest）→ 定点报错（mypy/gcc，兼收 pytest 的
+`FAILED` 摘要）→ 断言细节兜底。**验证失败不改变路由**——W10 的 repair 循环才会在这里接管，
+当前是把结构化错误写进状态、事件与审计，由 respond 如实报告。
+
+### 4.5 检索与上下文
+
+**检索走结构化工具**（`search_code` / `find_files`），不是让模型继续拼 `grep -rn … | head`：
+
+- 结果逐条解析成「文件:行号:内容」，能报「命中 N 条，显示前 M 条」，
+  模型不必自己数 head 截到哪。
+- 模式、glob、路径逐参数传递，没有引号事故。
+- 顺带消掉一个误伤：`find … | xargs grep …` 会被分级判成 L2 而拦下，
+  有了专用工具就不必给 `xargs` 开白名单。
+
+**双后端**：沙箱里没有 ripgrep 时退到 `grep` / `find`。值钱的是结构化接口，
+不是具体哪个二进制。两个后端必须输出同一套格式 —— 因此 grep 分支**显式加 `-E`**：
+grep 默认是 BRE，`(` `)` 是字面量，同一个模式在 rg 下和在 grep 下含义会不同，
+双后端就失去意义了。grep 不读 `.gitignore`，还要显式排除
+`.git` / `.venv` / `node_modules` 等目录，否则在有虚拟环境的仓库里会扫到天荒地老。
+
+**上下文裁剪**（`llm/context.py`）：长会话的体积主要来自工具结果，一次 `file_read`
+就可能几千字符。裁剪只发生在**发给模型的历史**上，不改写会话状态。
+
+唯一的不变量：**只截断内容，绝不丢弃消息**。丢消息会破坏
+`tool_calls` ↔ `tool_call_id` 配对，下一轮 API 直接报错 —— 这是 W2 踩过并专门立过
+不变量的坑。截断内容不动结构，配对永远完整。超预算时先降到 `tool_chars`，
+仍超再降到 300 字符的硬上限。
+
+### 4.6 沙箱资源限制
+
+两层，都在沙箱内生效：
+
+- **`ulimit`**：CPU 时间（默认 600s）、单文件大小（512MB）、进程数（1024）。
+  内存（`ulimit -v`）默认关闭 —— JVM / Node / 编译器会索取远超实际使用的虚拟地址空间，
+  贸然开启会把正常构建打死。单项设置失败不影响整条命令。
+- **沙箱内 `timeout`**：外层 `proc.kill()` 只能杀掉 `wsl.exe`，Linux 侧子进程未必跟着走。
+  在沙箱里再套一层 `timeout --kill-after=5`，超时就能确定性清理；退出码 124 表示超时。
+  外层 subprocess 超时只用 `shell_timeout + 10s` 兜底。
+
+### 4.7 结构化工具：为什么 git 与依赖不走 shell
+
+模型完全可以用 `shell_exec` 拼 `git commit -m "..."`，但结构化工具换来三件事：
+
+- **参数不能逃逸**：提交信息、路径由宿主逐参数 `shlex.quote`；依赖包名走白名单正则
+  （拒绝 `-` 开头、空格、`;`、`|`、反引号等），模型无法借参数构造第二条命令。
+- **等级可判定**：`git add` 只动索引 → L1；`git commit` / 安装依赖 → L2 询问。
+  不再依赖对整条命令字符串做正则猜测。
+- **审计可读**：日志里是 `git_commit` + `{"message": ...}`，而不是一串原始命令。
+
+另有一条纪律：**`.agent/`（agent 自己的备份目录）不许进版本控制**。
+`git_add` 拒绝暂存它，`git_commit` 在提交前检查暂存区，用 shell `git add -A`
+绕过也拦得住 —— 否则模型一个手滑就把 agent 的备份提交进用户仓库。
+
+### 4.8 文件工具与回滚
 
 - 编辑采用 `old_string → new_string` 精确替换或 unified diff，不走 shell
 - `pathguard`：词法归一化后必须落在 workspace root 内，拒绝 `..` 逃逸与越界绝对路径
-- 写盘前 snapshot 到 `.agent/backups/<snapshot_id>/`（或影子 git 提交）
-- `/undo` 按 snapshot_id 还原，`/diff` 输出 unified diff
 
-### 4.4 事件层与前端解耦
+**快照布局**：`<工作区>/.agent/backups/<snapshot_id>/<相对路径>`，
+`snapshot_id` 形如 `20261003T024018-a1b2c3` —— 时间戳前缀让目录名天然按时间排序，
+所以**不需要额外索引文件**，列目录就能找到某个文件的历史版本。
+
+**恢复语义是「先留底再覆盖」**：回滚前把当前内容也存一份，
+因此**回滚本身也可回滚**，一次误回滚不会把用户当下的改动直接抹掉。
+新建文件不留底（没有「改之前」可言，否则回滚会变成删文件）。
+
+入口有三处，共用同一个 `SnapshotStore`：
+模型侧 `file_restore` 工具（可自纠错）、用户侧 `agent undo/diff/snapshots`
+与 TUI 的 `/undo` `/diff` `/snapshots`。回滚记录以 `rollback` 类型写入审计。
+
+### 4.9 会话与长期记忆
+
+**会话列表不另建存储**：审计日志里已有 `run_start`（thread_id / 工作区 / 用户提问）
+与逐条 `tool_call`，`SessionIndex` 直接据此归纳出「有哪些会话、聊了什么、动了多少工具」。
+再维护一张会话表就是重复状态，还得处理两边不一致。代价是审计关闭时列不出会话 —— 可接受的降级。
+
+**长期记忆**落在工作区内的 `.agent/memory.md`（纯文本、一行一条、可手工编辑）。
+放工作区而不是宿主目录，因为事实是关于**项目**的。
+
+刻意做成**显式增删**，不做 LLM 自动提炼：自动记忆既容易积累噪声，
+又难以回答"这条结论是哪来的"。原型阶段宁可少而准。
+
+注入点是 `act` 的系统提示，每次 `run` 从文件重读 —— 会话中途 `/remember`
+加的事实能立刻生效，且不写回消息历史。
+
+### 4.10 事件层与前端解耦
 
 前端（CLI / TUI / Web）**不直接驱动图，也不持有工具**，只消费 `AgentRuntime` 产出的领域事件：
 
@@ -181,7 +293,7 @@ AgentRuntime（图 + 沙箱 + 安全策略）
    （该语义仅在 `ToolNode` 内生效，而 `ToolNode` 在 langgraph 1.2.x 下无法脱离图调用），
    因此改用 `artifacts.pack/unpack` 显式封装。
 
-### 4.5 多会话与审计
+### 4.11 多会话与审计
 
 **checkpoint**：`AsyncSqliteSaver` 落盘到 `<cwd>/.agent/checkpoints.sqlite`，
 `--thread-id` 复用同一会话即可跨进程恢复。必须用 Async 版 —— 同步的 `SqliteSaver`
@@ -262,7 +374,41 @@ exit_code / duration_ms / path / snapshot_id`。`args` 落库前统一截断，
 | 上下文超限 | 检索裁剪 + 历史摘要压缩 |
 | 回滚不彻底 | 所有写操作统一走 snapshot 抽象，禁止旁路 |
 | 修复循环不收敛 | 硬性重试上限 + 失败原因分类上报 |
+| 思考模式下 API 报 `reasoning_content must be passed back` | 见 §6.1 |
+
 | WSL 命令行转义踩坑 | 命令经 stdin 传给 `bash -l -s`，不走 argv |
+
+### 6.1 已知问题：思考模式的 `reasoning_content`
+
+在 `DEEPSEEK_MODEL=deepseek-v4-flash` 下偶发：
+
+```
+400 - The `reasoning_content` in the thinking mode must be passed back to the API.
+```
+
+W12 查清了成因，结论是**当前不修，只规避**。
+
+**根因（已确认，非推测）**：`langchain_openai/chat_models/base.py` 的模块文档
+明确写着 `reasoning_content` / `reasoning_details` **不被提取**；响应的
+`additional_kwargs` 里实测只有 `refusal`。而序列化函数
+`_convert_message_to_dict` 对 assistant 消息**只透传** `name` / `tool_calls` /
+`function_call` / `audio`，任意 `additional_kwargs` 不会进请求体。
+所以即使把 `reasoning_content` 塞进 `additional_kwargs` 也**传不回去**。
+
+**为什么不在这一轮修**：真正的修复要同时改两侧的私有方法 ——
+`_get_request_payload`（回传）与 `_create_chat_result` /
+`_convert_delta_to_message_chunk`（捕获）。而**捕获侧无法验证**：
+几轮尝试都不能稳定触发思考模式（单轮简单/复杂提示、流式多轮工具循环都不触发），
+只在「多轮工具调用 + 校验失败 + repair 重入 act」时遇到过一次。
+把无法验证的改动放进**请求路径**，风险是所有正常运行都可能被改坏，
+这比容忍一个偶发错误更糟。
+
+**当前处理**：
+- 以 `RunFailed` 事件显式报出（含原始 API 文本），不崩栈；审计留 `run_error` 记录。
+- **规避方式：`DEEPSEEK_MODEL=deepseek-chat`**（也是配置默认值），同一场景实测正常。
+
+**真要修的话**：需要在项目里维护一个 `ChatOpenAI` 子类，重写上述私有方法；
+私有 API 会随版本变动，且必须先有稳定的复现手段才能验证。
 
 ---
 
@@ -290,7 +436,165 @@ exit_code / duration_ms / path / snapshot_id`。`args` 落库前统一截断，
 | W2.6 | ✅ 完成 | TUI 骨架：计划面板、工具时间线、流式输出、斜杠命令、架构约束测试 |
 | W3 | ✅ 完成 | 文件工具（read/write/edit）、符号链接守卫、unified diff、写前备份、FileChanged 事件 |
 | W4 | ✅ 完成 | 审计日志（JSONL）、AsyncSqliteSaver 持久化 checkpoint、事件 call_id 配对、`agent audit` / TUI `/audit` |
-| W5–W16 | ⏳ 待开始 | 见第 5 节 |
+| W5 | ✅ 完成 | `approval_gate` + `interrupt()` 挂起/恢复、`SessionPolicy`、CLI 确认、TUI `ModalScreen` |
+| W6 | ✅ 完成 | Git 工具（status/diff/log/add/commit）、依赖管理（uv/poetry/pnpm/yarn/npm/pip）、ulimit 资源上限与沙箱内超时 |
+| W7 | ✅ 完成 | `SnapshotStore` 快照存储、`file_restore` 工具、`/undo` `/diff` `/snapshots`（CLI 子命令 + TUI 斜杠命令） |
+| W8 | ✅ 完成 | `SessionIndex` 会话列表（从审计归纳）、`LongTermMemory` 项目记忆、`/sessions` `/switch` `/memory` `/remember` |
+| W9 | ✅ 完成 | `verify` 节点、测试命令自动识别、输出结构化为「位置 + 消息」、`Verification` 事件与审计 |
+| W10 | ✅ 完成 | `repair` 节点、失败驱动修复循环、硬性重试上限与上报、`RepairStarted` 事件 |
+| W11 | ✅ 完成 | `search_code` / `find_files` 检索工具（rg 优先、grep 兜底）、上下文裁剪 |
+| W12 | ✅ 完成 | 追踪元数据与 doctor 连通性检查、prompt 调优（去 markdown、压步骤小结、最终答复分界） |
+| W13 | ✅ 完成 | 覆盖率 75%→89%（补 runtime 事件流、CLI 渲染与子命令、planner/respond）；顺带修出 3 个真实缺陷 |
+| W14 | ✅ 完成 | Web 最小验证（SSE 流式 / 多会话 / 联通测试，零构建链）、TUI 打磨、`scripts/demo.py` 四场景演示 |
+| W15 | ✅ 完成 | 文档拆分：`ARCHITECTURE.md`（分层/数据流/不变量/扩展点）、`USAGE.md`（工作流/配置/故障排查）、`DEMO.md`（讲稿） |
+| W16 | ✅ 完成 | 冻结前审计（删死字段、清理过时注释）、需求对照表 `ACCEPTANCE.md`、代码冻结 |
+
+### W15 记录：文档拆分的取舍
+
+README 之前是八周里逐段追加出来的，涨到 400 行什么都讲。这周按**读者意图**拆成三份：
+
+| 文档 | 读者想问的问题 |
+|---|---|
+| `README.md` | 这是什么、怎么跑起来、能做什么 |
+| `ARCHITECTURE.md` | 怎么设计的、为什么这么设计、我想加东西该改哪 |
+| `USAGE.md` | 某个具体事怎么做、出错了怎么办 |
+| `DEMO.md` | 答辩时说什么、先演示什么 |
+
+**最有价值的一节是 `ARCHITECTURE.md` 的「不变量」表** ——
+九条全是从真实故障里踩出来并固化成测试的（tool_call 配对、审批一次性、
+fail closed、审计失败显式报出……）。之前它们散落在各周的工作记录里，
+新人（包括几个月后的自己）改动相关代码时不会知道。每条都标了对应测试名。
+
+另外补了「扩展点」：加工具 / 加节点 / 加前端各三步，以及**容易漏的那一步** ——
+加工具必须在 `approve.tool_level` 登记等级，否则按 L3 处理（故意的 fail closed）。
+
+写完做了一轮链接校验：所有内部链接与锚点都存在（`docs/` 下 5 份文档）。
+
+### W14 记录：Web 与演示脚本
+
+**Web 是"最小验证"，不是第二套产品界面。** 只做三件原计划里写明的事：
+SSE 流式对话、多会话列表、API 联通测试。刻意**不引前端构建链** ——
+一个自包含的 HTML + 原生 JS，有测试守着（断言页面里没有外链脚本）。
+
+**审批固定拒绝**（`WEB_APPROVAL_MODE = "deny"`）。Web 端没有做审批交互，
+与其让 L2/L3 命令悬在那里等一个永远不会来的答复，不如明确拒绝、并在页面上说清楚。
+需要审批能力用 TUI。这条有测试锁着，避免以后有人顺手改成 `ask` 把网页卡住。
+
+Web 端点本身很薄：`AgentRuntime` 产出的领域事件本来就能 JSON 化，
+`event.model_dump_json()` 直接就是一个 SSE 数据帧 —— **事件层解耦在这里第二次兑现**
+（第一次是 TUI 无头测试）。
+
+**演示脚本** `scripts/demo.py` 按四个创新点各安排一个场景，顺序递进：
+只读 → 被拦 → 修复 → 回滚。`--list` 只看说明，`--only N` 跑单个。
+
+写它的时候踩到两个老坑，都是 `wsl.exe` 的：
+
+- 输出编码随环境在 UTF-16LE / UTF-8 间摆动，直接按 UTF-8 解会留下 NUL，
+  拿去当路径就是 `embedded null character` → 复用产品里的 `decode_wsl_output`
+- WSL 自己的诊断（localhost 代理提示）走 stderr，混进 stdout 后
+  「取最后一行当路径」会取到警告文案 → 只在失败时合并 stderr
+
+顺带发现 `wslpath -w /tmp/...` 给出的是 UNC 路径，`-C` 认不了；
+改成把演示工作区放在 Windows 临时目录下，用 `win_to_wsl` 正推，不碰 `wslpath`。
+
+### W13 记录：测试补全查出来的问题
+
+覆盖率是量出来的，不是猜的：先跑 `--cov` 定位缺口，再补。
+`runtime.py`（中枢，43%）与 `cli/app.py`（主界面，**0%**）占了未覆盖行的 71%。
+
+用**注入假图**的方式测 `AgentRuntime._stream`：喂给它与真实图同构的
+`(mode, data)` 序列，就能不碰 LLM、不碰沙箱地断言事件翻译与审计。
+CLI 则用记录型 Console + CliRunner。
+
+**补测试过程中发现并修掉的真实缺陷：**
+
+1. **`run_start` 的审计写入在 `try` 之外** —— 审计失败会直接抛给调用方，
+   而 README 承诺的是"写入失败会转成 `RunFailed`"。也就是说**这条承诺只对循环内的写入成立**。
+   顺带把 except 里的审计改成尽力而为：它自己再失败一次会把真正的错误盖掉。
+2. **`[ui]` 被 rich 当成样式标记吞掉** —— 缺依赖时的提示
+   `pip install -e ".[ui]"` 显示成 `pip install -e "."`，用户照着敲会失败。
+3. **回滚目标解析失败时没有写审计** —— 用户以为回滚了但没回滚，审计里一片空白。
+   与"审计日志无缺口"的验收指标直接冲突。
+
+### 测试执行速度
+
+初测：**全套 599 秒**（10 分钟），单个集成用例 10–100 秒。三个原因，都已修：
+
+| 问题 | 处理 | 效果 |
+|---|---|---|
+| 全是串行的 `wsl.exe` 进程启动 | `pytest-xdist`，默认 `-n auto` | 599s → 180s |
+| **读一个文件要 3 次进程启动**（`resolve`+`stat`+`base64` 各一趟） | 合成一次调用；`resolve`+`stat` 合并为 `probe`；写入的 realpath 校验移进 shell 脚本 | 180s → 113s |
+| 用例在真的 `pip install` / `npm install`（走网络）；langsmith 重试退避把一条用例拖到 50 秒 | 只验证"选了哪个包管理器"而不执行安装；让 Client 直接抛异常 | 病态用例消失 |
+
+读路径的 3→1 不只是测试收益：**每次 `file_read` / `file_edit` 都少两次进程启动**，
+这是产品层面的性能改善。
+
+两种跑法：
+
+```bash
+pytest -m "not wsl"   # 快反馈：单元 + UI，约 46 秒
+pytest                # 全量（含真实 WSL 沙箱），约 2 分钟
+```
+
+### W12 记录：追踪与调优
+
+**LangSmith**：运行时给图挂 `run_name` / `tags` / `metadata`（thread_id、工作区、模型、
+权限、审批模式），trace 因此可按会话与工作区筛选。元数据**只放标识与开关，
+不放提示词或文件内容** —— 追踪数据会离开本机，有测试守着这条边界。
+
+**一次真实的排查：403 其实是配置被静默覆盖**
+
+现象：开启追踪后 ingestion 一直 403，`/sessions` 直连也是 403。一度判断为凭据失效。
+
+重新排查时的关键判据是 **401 与 403 的区别**：
+
+| 请求 | 结果 |
+|---|---|
+| 空 key | **401** `Invalid token` |
+| 格式合法但不存在的 key | **403** `Forbidden` |
+| 本机 key | **403** `Forbidden` |
+
+403 是「token 解析不出租户」，即**钥匙不存在/已吊销**。但真正的原因不在钥匙本身：
+`.env` 里已经写入了新的 key，而**系统环境变量里还留着旧的**
+（前 12 位与长度都没变）。配置优先级是 `环境变量 > .env`，所以旧的把新的盖住了。
+
+这个覆盖**完全静默**，用户改完 `.env` 发现不生效，无从定位。
+
+**进一步排查发现删不掉**：这些变量不在 Windows 注册表的任何作用域
+（HKCU 只有 7 项、HKLM 27 项，无一匹配），也不在 `.claude/settings.json`
+或任何 shell 配置里。沿进程链往上追，源头是 **`Claude Code Haha.exe`**
+在启动时注入进程环境 —— 用户既看不到来源也删不掉。
+
+因此做了两个修改：
+
+1. **优先级改为 `.env` > 环境变量**（偏离通用约定，`settings_customise_sources`
+   重排）。项目目录里的 `.env` 是显式写下、看得见、可编辑的意图，让它优先。
+   构造函数参数仍最高优先（测试与嵌入式用法依赖），`_env_file=None` 这类显式
+   覆盖继续生效 —— 自定义 source 是**委托**给原 source 加一层空值过滤，
+   而不是重建，否则会把这个覆盖无视掉。
+   `.env` 里的空占位（`KEY=`）不算配置，不会盖掉环境变量。
+2. **差异仍然上报**：`shadowed_env_keys()` 比对两侧，`agent doctor` 用 WARN 列出
+   「环境变量里也有、但当前以 `.env` 为准」的键，避免反向困惑。
+
+修正后实测追踪链路完全正常：
+
+```
+run: 'agent:c04ed4f1'  status=success  type=chain
+metadata: {"thread_id": "c04ed4f1", "workspace": "/mnt/c/.../agent-w11",
+           "model": "deepseek-chat", "allow_write": false, "approval_mode": "ask"}
+```
+
+`agent doctor` 同时保留连通性检查：开启追踪但凭据确实不可用时**提前报 FAIL**，
+而不是让 langsmith 在每次调用后往 stderr 打一串 ingestion 失败让用户去猜。
+
+**prompt 调优**（依据观察到的真实输出，不是凭感觉改）：
+
+1. **去掉 Markdown**：终端不渲染，`**加粗**` 与 `# 标题` 只显示成多余符号。
+2. **压步骤小结**：原先 act 每步收尾都写成完整报告，与 respond 的最终答复大量重叠，
+   短任务的输出长度几乎翻倍。现在明确要求步骤小结只交代本步做了什么。
+3. **最终答复分界**：act 与 respond 内容重叠是架构固有的（每步小结 + 最终汇总），
+   靠提示词消除不掉。改为在界面上打 `── 最终答复 ──` 分界 ——
+   读者因此知道那是汇总结论，而不是重复输出。
 
 ### UI 排期（已确认：TUI 为主，Web 最小化，答辩演示级）
 

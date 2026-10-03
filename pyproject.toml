@@ -26,9 +26,16 @@ dependencies = [
 dev = [
     "pytest>=8.2",
     "ruff>=0.5",
+    # 集成测试全是 wsl.exe 进程启动，串行跑要十分钟；并行后 1 分钟内
+    "pytest-xdist>=3.6",
+    "pytest-cov>=5.0",
 ]
 ui = [
     "textual>=0.80",
+]
+web = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
 ]
 
 [project.scripts]
@@ -40,7 +47,9 @@ packages = ["src/coding_agent"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-addopts = "-q"
+# 默认并行：集成测试的开销几乎全在 wsl.exe 进程启动上（每次约 0.3s），
+# 串行跑一遍要十分钟，且完全受 I/O 限制，并行几乎线性加速。
+addopts = "-q -n auto --dist loadfile"
 markers = [
     "wsl: 需要本机可用的 WSL2 发行版",
     "llm: 需要 DEEPSEEK_API_KEY",

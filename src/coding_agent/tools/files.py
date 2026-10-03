@@ -6,31 +6,28 @@
 - **精确替换**：`file_edit` 要求 `old_string` 在文件中唯一，出现 0 次或多于 1 次都拒绝执行，
   并把原因回灌给模型让它补充上下文 —— 这是「修改精确」的实现方式。
 - **写前备份**：覆盖或编辑前把原文件存进 `.agent/backups/<snapshot_id>/`，
-  为 W7 的回滚流程留下依据。
+  回滚时据此还原（见 `sandbox/snapshots.py`）。
 - **路径双重校验**：词法 + realpath（见 sandbox/fs.py），堵住符号链接逃逸。
 """
 
 from __future__ import annotations
 
-import difflib
-import posixpath
-from datetime import UTC, datetime
-from uuid import uuid4
-
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
 
 from coding_agent.config import Settings
+from coding_agent.diffing import count_changes, unified_diff
 from coding_agent.sandbox.fs import SandboxFs, SandboxFsError
 from coding_agent.sandbox.pathguard import SandboxPathError
+from coding_agent.sandbox.snapshots import SnapshotStore
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
 from coding_agent.tools.artifacts import FileArtifact, pack
 
 READ_TOOL_NAME = "file_read"
 WRITE_TOOL_NAME = "file_write"
 EDIT_TOOL_NAME = "file_edit"
+RESTORE_TOOL_NAME = "file_restore"
 
-BACKUP_DIRNAME = ".agent/backups"
 DEFAULT_READ_LINES = 400
 
 READ_DESCRIPTION = """\
@@ -58,6 +55,16 @@ EDIT_DESCRIPTION = """\
 何时使用：改动已有文件的局部内容。
 """
 
+RESTORE_DESCRIPTION = """\
+把一个文件回滚到之前某次修改前的状态。
+
+何时使用：你刚做的修改是错的、或用户要求撤销时。
+不传参数则回滚最近一次文件改动；也可以给 path 回滚该文件最近一次修改，
+或用 snapshot_id 指定具体快照。
+
+回滚前会先给当前内容留底，所以这次回滚本身也可以再回滚。
+"""
+
 
 class ReadInput(BaseModel):
     path: str = Field(description="文件路径，工作区内相对路径或绝对路径")
@@ -80,51 +87,20 @@ class EditInput(BaseModel):
     replace_all: bool = Field(default=False, description="old_string 出现多次时是否全部替换")
 
 
+class RestoreInput(BaseModel):
+    path: str | None = Field(
+        default=None, description="要回滚的文件；省略则回滚最近一次文件改动"
+    )
+    snapshot_id: str | None = Field(
+        default=None, description="指定快照 id；省略则用该文件最近一次留底"
+    )
+    reason: str = Field(description="回滚的意图，一句话说明")
+
+
 def _relpath(path: str, root: str) -> str:
     """展示用的工作区相对路径。"""
     prefix = root.rstrip("/") + "/"
     return path[len(prefix) :] if path.startswith(prefix) else path
-
-
-def make_diff(old: str, new: str, display_path: str, context: int = 3) -> str:
-    """生成 unified diff；内容相同返回空串。"""
-    if old == new:
-        return ""
-    lines = difflib.unified_diff(
-        old.splitlines(keepends=True),
-        new.splitlines(keepends=True),
-        fromfile=f"a/{display_path}",
-        tofile=f"b/{display_path}",
-        n=context,
-    )
-    return "".join(lines)
-
-
-def _count_changes(diff: str) -> tuple[int, int]:
-    added = removed = 0
-    for line in diff.splitlines():
-        if line.startswith("+++") or line.startswith("---"):
-            continue
-        if line.startswith("+"):
-            added += 1
-        elif line.startswith("-"):
-            removed += 1
-    return added, removed
-
-
-class _Backup:
-    """把原文件存进工作区内的备份目录。"""
-
-    def __init__(self, fs: SandboxFs, root: str) -> None:
-        self._fs = fs
-        self._root = root
-
-    def save(self, path: str, original: str) -> str:
-        snapshot_id = f"{datetime.now(UTC):%Y%m%dT%H%M%S}-{uuid4().hex[:6]}"
-        rel = _relpath(path, self._root)
-        target = posixpath.join(self._root, BACKUP_DIRNAME, snapshot_id, rel.lstrip("/"))
-        self._fs.write_text(target, original)
-        return snapshot_id
 
 
 def build_file_tools(
@@ -135,7 +111,7 @@ def build_file_tools(
 ) -> list[BaseTool]:
     root = resolve_workspace(settings, sandbox)
     fs = SandboxFs(sandbox, root)
-    backup = _Backup(fs, root)
+    snapshots = SnapshotStore(sandbox, fs, root)
     max_bytes = settings.max_file_read_bytes
 
     def _reject(path: str, action: str, message: str) -> str:
@@ -189,13 +165,11 @@ def build_file_tools(
     # ------------------------------------------------------------------
 
     def _write(path: str, content: str, reason: str) -> str:
+        # probe 一次拿到路径与状态：拆成 resolve + stat 就是两次 wsl.exe 启动
         try:
-            target = fs.resolve(path)
-        except (SandboxPathError, SandboxFsError) as exc:
+            target, info = fs.probe(path)
+        except SandboxPathError as exc:
             return _reject(path, "overwrite", f"路径被拒绝：{exc}")
-
-        try:
-            info = fs.stat(target)
         except SandboxFsError as exc:
             return _error(path, "overwrite", f"无法读取文件状态：{exc}")
 
@@ -212,8 +186,8 @@ def build_file_tools(
         snapshot_id: str | None = None
         if original is not None:
             try:
-                snapshot_id = backup.save(target, original)
-            except SandboxFsError as exc:
+                snapshot_id = snapshots.save(target, original)
+            except (SandboxFsError, SandboxPathError) as exc:
                 return _error(target, action, f"备份失败，已中止写入：{exc}")
 
         try:
@@ -221,8 +195,8 @@ def build_file_tools(
         except (SandboxFsError, SandboxPathError) as exc:
             return _error(target, action, f"写入失败：{exc}")
 
-        diff = make_diff(original or "", content, _relpath(target, root))
-        added, removed = _count_changes(diff)
+        diff = unified_diff(original or "", content, _relpath(target, root))
+        added, removed = count_changes(diff)
         verb = "已覆盖" if action == "overwrite" else "已创建"
         note = f"（备份 {snapshot_id}）" if snapshot_id else ""
         artifact = FileArtifact(
@@ -283,8 +257,8 @@ def build_file_tools(
         )
 
         try:
-            snapshot_id = backup.save(target, original)
-        except SandboxFsError as exc:
+            snapshot_id = snapshots.save(target, original)
+        except (SandboxFsError, SandboxPathError) as exc:
             return _error(target, "edit", f"备份失败，已中止修改：{exc}")
 
         try:
@@ -292,8 +266,8 @@ def build_file_tools(
         except (SandboxFsError, SandboxPathError) as exc:
             return _error(target, "edit", f"写入失败：{exc}")
 
-        diff = make_diff(original, updated, _relpath(target, root))
-        added, removed = _count_changes(diff)
+        diff = unified_diff(original, updated, _relpath(target, root))
+        added, removed = count_changes(diff)
         scope = f"{hits} 处" if replace_all else "1 处"
         artifact = FileArtifact(
             path=_relpath(target, root),
@@ -310,6 +284,66 @@ def build_file_tools(
             f"+{added} -{removed}，备份 {snapshot_id}）\n{diff}"
         )
         return pack(text, artifact)
+
+    # ------------------------------------------------------------------
+    # restore
+    # ------------------------------------------------------------------
+
+    def _restore(
+        reason: str, path: str | None = None, snapshot_id: str | None = None
+    ) -> str:
+        entry = None
+        if snapshot_id:
+            wanted = None
+            if path:
+                try:
+                    wanted = _relpath(fs.resolve(path), root).lstrip("/")
+                except (SandboxPathError, SandboxFsError) as exc:
+                    return _reject(path, "restore", f"路径被拒绝：{exc}")
+            entry = snapshots.find(snapshot_id, wanted)
+            if entry is None:
+                return _error(
+                    path or snapshot_id,
+                    "restore",
+                    f"找不到快照 {snapshot_id}"
+                    + (f" 中与 {wanted} 匹配的文件。" if wanted else "。"),
+                )
+        elif path:
+            try:
+                target = fs.resolve(path)
+            except (SandboxPathError, SandboxFsError) as exc:
+                return _reject(path, "restore", f"路径被拒绝：{exc}")
+            entry = snapshots.latest_for(target)
+            if entry is None:
+                return _error(
+                    target, "restore", f"{_relpath(target, root)} 没有任何留底，无法回滚。"
+                )
+        else:
+            entries = snapshots.list(limit=1)
+            if not entries:
+                return _error("", "restore", "工作区里还没有任何快照，无法回滚。")
+            entry = entries[0]
+
+        result = snapshots.restore(entry)
+        if not result.ok:
+            return _error(result.path, "restore", result.message)
+
+        artifact = FileArtifact(
+            path=result.path,
+            action="restore" if result.diff else "restore-noop",
+            ok=True,
+            added=result.added,
+            removed=result.removed,
+            diff=result.diff,
+            snapshot_id=result.snapshot_id,
+        )
+        note = (
+            f"（回滚前的状态已留底为 {result.undo_snapshot_id}）"
+            if result.undo_snapshot_id
+            else ""
+        )
+        text = f"[文件] {reason}\n{result.message}{note}"
+        return pack(f"{text}\n{result.diff}" if result.diff else text, artifact)
 
     tools: list[BaseTool] = [
         StructuredTool.from_function(
@@ -329,6 +363,12 @@ def build_file_tools(
                 name=EDIT_TOOL_NAME,
                 description=EDIT_DESCRIPTION,
                 args_schema=EditInput,
+            ),
+            StructuredTool.from_function(
+                func=_restore,
+                name=RESTORE_TOOL_NAME,
+                description=RESTORE_DESCRIPTION,
+                args_schema=RestoreInput,
             ),
         ]
     return tools

@@ -58,6 +58,14 @@ def make_planner_node(
         if not steps:
             steps = [request or "完成用户请求"]
 
-        return {"plan": steps, "step_idx": 0, "tool_rounds": 0, "budget_exhausted": False}
+        return {
+            "plan": steps,
+            "step_idx": 0,
+            "tool_rounds": 0,
+            "budget_exhausted": False,
+            "dirty": False,
+            "verification": {},
+            "retry": 0,
+        }
 
     return plan

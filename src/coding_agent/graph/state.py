@@ -1,6 +1,7 @@
 """图状态定义。
 
-字段在整个四个月中逐步启用，当前阶段只用到 messages / cwd / tool_rounds。
+只放**必须跨节点传递**的东西。字段的生命周期（谁写入、谁重置）见
+`docs/ARCHITECTURE.md` 第 5 节 —— 重置漏了会让状态跨步骤串味。
 """
 
 from __future__ import annotations
@@ -16,13 +17,22 @@ class AgentState(TypedDict, total=False):
     messages: Annotated[list[AnyMessage], add_messages]
     # 沙箱内的工作目录
     cwd: str
-    # 已发生的模型轮次，用于限制工具循环
+    # 跨会话的项目事实，每次 run 从记忆文件刷新后注入系统提示
+    memories: list[str]
+
+    # 计划与步进
+    plan: list[str]
+    step_idx: int
+
+    # 当前步骤的用量与结果 —— 全部由 planner / advance / repair 按步重置
     tool_rounds: int
-    # 当前步骤是否因工具预算耗尽而被 act 强制收尾
     budget_exhausted: bool
-    # --- 以下字段在后续里程碑启用 ---
-    plan: list[str]              # W2  planner
-    step_idx: int                # W2  planner
-    retry: int                   # W10 repair
-    approvals: list[dict[str, Any]]  # W5 审批记录
-    snapshot_id: str | None      # W7 回滚快照
+    # 本步是否改过文件/依赖：没改动就不必跑验证
+    dirty: bool
+    # 最近一次验证结果（VerifyResult 的 model_dump）
+    verification: dict[str, Any]
+    # 当前步骤已修复次数
+    retry: int
+
+    # call_id -> auto | approved | denied，由 approval_gate 写入、tools 消费后清空
+    approvals: dict[str, str]

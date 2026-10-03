@@ -24,7 +24,8 @@ from langchain_core.messages import AIMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
 from coding_agent.graph.state import AgentState
-from coding_agent.llm.prompts import compose_system_prompt
+from coding_agent.llm.context import ContextBudget, trim_messages
+from coding_agent.llm.prompts import compose_system_prompt, format_verification_feedback
 
 BUDGET_EXHAUSTED_TEMPLATE = "（本步骤已达到工具调用上限 {limit} 轮，停止继续尝试。）"
 
@@ -34,7 +35,12 @@ def make_act_node(
     *,
     max_tool_rounds: int,
     allow_write: bool = False,
+    max_repair_rounds: int = 0,
+    budget: ContextBudget | None = None,
 ) -> Callable[[AgentState, RunnableConfig], dict[str, Any]]:
+    # 裁剪只影响发给模型的内容，不改动写回 state 的历史
+    trim_budget = budget or ContextBudget()
+
     def act(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         rounds = state.get("tool_rounds", 0)
 
@@ -46,12 +52,25 @@ def make_act_node(
                 "budget_exhausted": True,
             }
 
+        # 上一步验证失败时，把结构化错误合成进系统提示 ——
+        # 不写回消息历史，否则每轮重试都在往上下文里塞一条伪造口吻的消息
+        feedback = ""
+        verification = state.get("verification") or {}
+        attempt = state.get("retry", 0)
+        if verification.get("status") == "failed" and attempt > 0:
+            feedback = format_verification_feedback(
+                verification, attempt=attempt, limit=max_repair_rounds or attempt
+            )
+
         system = compose_system_prompt(
             plan=state.get("plan"),
             step_idx=state.get("step_idx", 0),
             allow_write=allow_write,
+            memories=state.get("memories"),
+            feedback=feedback,
         )
-        messages = [SystemMessage(content=system), *state["messages"]]
+        history, _ = trim_messages(state["messages"], trim_budget)
+        messages = [SystemMessage(content=system), *history]
 
         response = llm.invoke(messages, config)
         return {"messages": [response], "tool_rounds": rounds + 1}

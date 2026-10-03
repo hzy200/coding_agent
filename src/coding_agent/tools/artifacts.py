@@ -28,6 +28,8 @@ class ToolArtifact(BaseModel):
     """所有工具产物的共同基类。`kind` 是判别字段。"""
 
     kind: str = ""
+    # auto / approved / denied / rejected —— 审计据此记账，见 sandbox/policy.py
+    decision: str = "auto"
 
 
 class ShellArtifact(ToolArtifact):

@@ -44,6 +44,49 @@ class Verdict:
 
 
 # --------------------------------------------------------------------------
+# 会话策略：把风险等级翻译成「放行 / 询问 / 拒绝」
+# --------------------------------------------------------------------------
+
+AUTO = "auto"          # 直接执行
+ASK = "ask"            # 挂起，等人工确认
+DENY = "deny"          # 直接拒绝
+
+APPROVED = "approved"  # 人工确认通过（approval_gate 写入）
+DENIED = "denied"      # 人工拒绝
+
+APPROVAL_ASK = "ask"
+APPROVAL_APPROVE = "approve"
+APPROVAL_DENY = "deny"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionPolicy:
+    """一次会话的授权范围。
+
+    刻意不做成全局单例：策略必须是图的显式输入，否则「谁批的」就说不清楚，
+    审计也无从追溯。
+    """
+
+    allow_write: bool = False
+    approval_mode: str = APPROVAL_ASK
+
+    def decide(self, level: CommandLevel) -> str:
+        if level <= CommandLevel.READ:
+            return AUTO
+
+        if level == CommandLevel.LOW_WRITE:
+            # L1 由 --write 一次性授权，不逐条询问
+            return AUTO if self.allow_write else DENY
+
+        # L2/L3
+        if self.approval_mode == APPROVAL_APPROVE:
+            return AUTO
+        if self.approval_mode == APPROVAL_DENY:
+            return DENY
+        return ASK
+
+
+# --------------------------------------------------------------------------
 # 白名单
 # --------------------------------------------------------------------------
 

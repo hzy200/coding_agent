@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CodingAgent</title>
+<style>
+  :root {
+    --bg: #12141a; --panel: #1a1d26; --border: #2b3040;
+    --fg: #d6dae4; --dim: #7f879b; --accent: #6ea8fe;
+    --ok: #79c98a; --warn: #e0b458; --bad: #e07a7a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; flex-direction: column;
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.6 ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+  header {
+    padding: 8px 14px; border-bottom: 1px solid var(--border);
+    display: flex; gap: 16px; align-items: center; font-size: 13px;
+  }
+  header .name { color: var(--accent); font-weight: bold; }
+  header .meta { color: var(--dim); }
+  #health.ok { color: var(--ok); } #health.bad { color: var(--bad); }
+
+  main { flex: 1; display: flex; min-height: 0; }
+  aside {
+    width: 260px; border-right: 1px solid var(--border);
+    overflow-y: auto; padding: 10px; font-size: 13px;
+  }
+  aside h3 { margin: 0 0 8px; font-size: 12px; color: var(--dim); font-weight: normal;
+             text-transform: uppercase; letter-spacing: .06em; }
+  #sessions { list-style: none; margin: 0 0 16px; padding: 0; }
+  #sessions li {
+    padding: 6px 8px; border-radius: 4px; cursor: pointer; margin-bottom: 2px;
+    border: 1px solid transparent;
+  }
+  #sessions li:hover { background: var(--panel); }
+  #sessions li.active { border-color: var(--accent); color: var(--accent); }
+  #sessions li .t { display: block; overflow: hidden; text-overflow: ellipsis;
+                    white-space: nowrap; }
+  #sessions li .m { color: var(--dim); font-size: 11px; }
+
+  #main-col { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #log { flex: 1; overflow-y: auto; padding: 12px 16px; }
+  #log > div { margin-bottom: 6px; white-space: pre-wrap; word-break: break-word; }
+  .you { color: var(--accent); }
+  .say { color: var(--ok); }
+  .tool { color: var(--dim); }
+  .bad { color: var(--bad); } .warn { color: var(--warn); }
+  .sep { color: var(--dim); border-top: 1px solid var(--border); padding-top: 6px;
+         margin-top: 10px; }
+
+  footer { border-top: 1px solid var(--border); padding: 10px 14px; display: flex; gap: 10px; }
+  input[type=text] {
+    flex: 1; background: var(--panel); border: 1px solid var(--border); color: var(--fg);
+    padding: 8px 10px; border-radius: 4px; font: inherit;
+  }
+  input[type=text]:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+    padding: 8px 14px; border-radius: 4px; cursor: pointer; font: inherit;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+</style>
+</head>
+<body>
+<header>
+  <span class="name">CodingAgent</span>
+  <span class="meta" id="health">检查中…</span>
+  <span class="meta" id="thread"></span>
+  <span class="meta">变更类命令会被拒绝（无审批交互，请用 TUI）</span>
+</header>
+
+<main>
+  <aside>
+    <h3>会话</h3>
+    <ul id="sessions"></ul>
+    <button id="new">新会话</button>
+  </aside>
+
+  <div id="main-col">
+    <div id="log"></div>
+    <footer>
+      <input type="text" id="prompt" placeholder="输入指令，回车发送…" autocomplete="off">
+      <button id="send">发送</button>
+    </footer>
+  </div>
+</main>
+
+<script>
+const log = document.getElementById('log');
+const promptEl = document.getElementById('prompt');
+const sendBtn = document.getElementById('send');
+const healthEl = document.getElementById('health');
+const threadEl = document.getElementById('thread');
+const sessionsEl = document.getElementById('sessions');
+
+let threadId = '';
+let busy = false;
+
+function line(text, cls) {
+  const div = document.createElement('div');
+  if (cls) div.className = cls;
+  div.textContent = text;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+  return div;
+}
+
+function setBusy(value) {
+  busy = value;
+  sendBtn.disabled = value;
+  promptEl.disabled = value;
+}
+
+async function health() {
+  try {
+    const r = await fetch('/api/health');
+    const d = await r.json();
+    if (d.reachable) {
+      healthEl.textContent = `API 已联通 · ${d.model}`;
+      healthEl.className = 'meta ok';
+    } else {
+      healthEl.textContent = `API 不可用：${d.error || '未配置 Key'}`;
+      healthEl.className = 'meta bad';
+    }
+  } catch (e) {
+    healthEl.textContent = 'API 状态获取失败';
+    healthEl.className = 'meta bad';
+  }
+}
+
+async function loadSessions() {
+  const r = await fetch('/api/sessions');
+  const d = await r.json();
+  sessionsEl.innerHTML = '';
+  for (const s of d.sessions) {
+    const li = document.createElement('li');
+    if (s.thread_id === threadId) li.className = 'active';
+    li.innerHTML = `<span class="t"></span><span class="m"></span>`;
+    li.querySelector('.t').textContent = s.title || '（无标题）';
+    li.querySelector('.m').textContent =
+      `${s.thread_id} · ${s.last_active} · ${s.prompts} 次提问`;
+    li.onclick = () => openThread(s.thread_id);
+    sessionsEl.appendChild(li);
+  }
+}
+
+async function openThread(id) {
+  if (busy) return;
+  threadId = id;
+  threadEl.textContent = `会话 ${id}`;
+  log.innerHTML = '';
+  await loadSessions();
+  try {
+    const r = await fetch(`/api/thread/${id}`);
+    if (!r.ok) return;
+    const d = await r.json();
+    if (!d.messages.length) { line('（该会话没有可显示的历史）', 'tool'); return; }
+    for (const m of d.messages) {
+      line((m.role === 'user' ? '你 › ' : '助手 › ') + m.text,
+           m.role === 'user' ? 'you' : 'say');
+    }
+  } catch (e) { /* 历史拿不到不影响继续对话 */ }
+}
+
+// 后端把领域事件序列化成 SSE，这里只做渲染 —— 和 CLI/TUI 用的是同一套事件
+function render(ev) {
+  switch (ev.type) {
+    case 'plan_created':
+      if (ev.steps.length) line('计划：\n' + ev.steps.map((s, i) => `  ${i + 1}. ${s}`).join('\n'), 'tool');
+      break;
+    case 'step_started':
+      if (ev.total > 1) line(`第 ${ev.index + 1}/${ev.total} 步  ${ev.text}`, 'tool');
+      break;
+    case 'assistant_token':
+      if (ev.node === 'respond' && !window._answered) {
+        line('── 最终答复 ──', 'sep'); window._answered = true;
+      }
+      if (window._cur && window._cur.dataset.node === ev.node) {
+        window._cur.textContent += ev.text;
+      } else {
+        window._cur = line(ev.text, 'say');
+        window._cur.dataset.node = ev.node;
+      }
+      log.scrollTop = log.scrollHeight;
+      break;
+    case 'tool_call_started':
+      window._cur = null;
+      line(`→ ${ev.level ? '[' + ev.level + '] ' : ''}${ev.name}: ${ev.summary}`, 'tool');
+      break;
+    case 'tool_call_finished':
+      window._cur = null;
+      if (ev.rejected) line('← 已被安全策略拒绝', 'bad');
+      else if (ev.ok) line('← ✓', 'tool');
+      else line(`← ✗ exit=${ev.exit_code}`, 'warn');
+      break;
+    case 'file_changed':
+      line(`✎ ${ev.action} ${ev.path}  +${ev.added} -${ev.removed}`, 'warn');
+      break;
+    case 'verification':
+      if (ev.status === 'ok') line(`验证通过  ${ev.summary}`, 'ok');
+      else if (ev.status === 'failed') {
+        line(`验证失败  ${ev.summary}`, 'bad');
+        for (const i of ev.issues.slice(0, 5)) line('  · ' + i, 'bad');
+      }
+      break;
+    case 'repair_started':
+      line(`↻ 第 ${ev.attempt}/${ev.limit} 次修复  ${ev.summary}`, 'warn');
+      break;
+    case 'run_failed':
+      window._cur = null;
+      line('运行失败：' + ev.message, 'bad');
+      break;
+    case 'run_finished':
+      window._cur = null;
+      break;
+  }
+}
+
+async function send() {
+  const text = promptEl.value.trim();
+  if (!text || busy) return;
+  promptEl.value = '';
+  line('你 › ' + text, 'you');
+  window._answered = false;
+  window._cur = null;
+  setBusy(true);
+
+  try {
+    const r = await fetch('/api/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: text, thread_id: threadId }),
+    });
+    if (!threadId) {
+      threadId = r.headers.get('X-Thread-Id') || '';
+      threadEl.textContent = `会话 ${threadId}`;
+    }
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const frames = buf.split('\n\n');
+      buf = frames.pop();
+      for (const frame of frames) {
+        const payload = frame.replace(/^data: /, '');
+        if (payload) { try { render(JSON.parse(payload)); } catch (e) {} }
+      }
+    }
+  } catch (e) {
+    line('请求失败：' + e, 'bad');
+  } finally {
+    setBusy(false);
+    loadSessions();
+  }
+}
+
+sendBtn.onclick = send;
+promptEl.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
+document.getElementById('new').onclick = async () => {
+  if (busy) return;
+  threadId = '';
+  threadEl.textContent = '新会话';
+  log.innerHTML = '';
+  await loadSessions();
+  promptEl.focus();
+};
+
+health();
+loadSessions();
+promptEl.focus();
+</script>
+</body>
+</html>

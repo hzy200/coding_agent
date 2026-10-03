@@ -10,39 +10,55 @@
 
 from __future__ import annotations
 
+import posixpath
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.types import Command
 
 from coding_agent.audit import AuditLogger, AuditRecord
 from coding_agent.audit import models as audit_models
 from coding_agent.audit.logger import now_iso, sanitize_args, truncate
 from coding_agent.config import Settings, get_settings
+from coding_agent.diffing import unified_diff
 from coding_agent.events import (
+    ApprovalRequested,
     AssistantToken,
     Event,
     FileChanged,
     PlanCreated,
+    RepairStarted,
     RunFailed,
     RunFinished,
     StepFinished,
     StepStarted,
     ToolCallFinished,
     ToolCallStarted,
+    Verification,
 )
 from coding_agent.graph.build import build_graph
 from coding_agent.memory.checkpointer import CheckpointStore
+from coding_agent.memory.longterm import LongTermMemory
+from coding_agent.memory.sessions import SessionIndex
 from coding_agent.messages import text_of
+from coding_agent.sandbox.fs import SandboxFs
 from coding_agent.sandbox.pathguard import normalize_root
-from coding_agent.sandbox.policy import classify
+from coding_agent.sandbox.policy import APPROVED, DENIED, SessionPolicy, classify
+from coding_agent.sandbox.snapshots import (
+    ACTION_RESTORE,
+    RestoreResult,
+    SnapshotEntry,
+    SnapshotStore,
+)
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
 from coding_agent.tools.artifacts import FileArtifact, ShellArtifact, parse_artifact
 from coding_agent.tools.shell import SHELL_TOOL_NAME
 
-# 只有这几个 action 才真正改动了文件，read 不发 FileChanged
-MUTATING_FILE_ACTIONS = frozenset({"create", "overwrite", "edit"})
+# 只有这几个 action 才真正改动了文件，read 与空回滚不发 FileChanged
+MUTATING_FILE_ACTIONS = frozenset({"create", "overwrite", "edit", ACTION_RESTORE})
 
 # 只有这两个节点的模型输出是给用户看的文本；planner 的结构化调用不流式渲染
 STREAMING_NODES = frozenset({"act", "respond"})
@@ -50,6 +66,14 @@ STREAMING_NODES = frozenset({"act", "respond"})
 _PREVIEW_CHARS = 240
 _FAILURE_MARKERS = ("工具执行异常：", "错误：")
 _SUMMARY_KEYS = ("command", "path", "pattern", "query")
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryMessage:
+    """还原历史会话时用的一轮对话。"""
+
+    role: str  # user | assistant
+    text: str
 
 
 def _last_message(update: dict[str, Any]) -> Any:
@@ -80,12 +104,20 @@ class AgentRuntime:
         allow_write: bool = False,
         checkpointer: Any = None,
         audit: AuditLogger | None = None,
+        approval_mode: str | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.allow_write = allow_write
+        self.policy = SessionPolicy(
+            allow_write=allow_write,
+            approval_mode=approval_mode or self.settings.approval_mode,
+        )
         self._sandbox = WslSandbox(self.settings)
         self._workspace = normalize_root(workspace) if workspace else None
         self._graph: Any = None
+        self._snapshots: SnapshotStore | None = None
+        self._memory: LongTermMemory | None = None
+        self._fs: SandboxFs | None = None
 
         # 显式传入的 checkpointer 由调用方负责生命周期；否则按配置自行管理
         self._external_checkpointer = checkpointer
@@ -108,6 +140,73 @@ class AgentRuntime:
     @property
     def audit_path(self) -> Path:
         return self.audit.path
+
+    def _trace_metadata(self, thread_id: str) -> dict[str, Any]:
+        """挂在 trace 上的运行上下文。
+
+        只放标识与开关，**不放提示词或文件内容** —— 追踪数据会离开本机。
+        """
+        return {
+            "thread_id": thread_id,
+            "workspace": self.workspace,
+            "model": self.settings.deepseek_model,
+            "allow_write": self.allow_write,
+            "approval_mode": self.policy.approval_mode,
+            "verify": self.settings.verify_command or "auto",
+            "persistent": self.persistent,
+        }
+
+    @property
+    def snapshots(self) -> SnapshotStore:
+        """文件快照存储，供 `/undo` `/diff` 使用。"""
+        if self._snapshots is None:
+            self._snapshots = SnapshotStore(
+                self._sandbox, self._sandbox_fs(), self.workspace
+            )
+        return self._snapshots
+
+    @property
+    def memory(self) -> LongTermMemory:
+        """跨会话的项目记忆。"""
+        if self._memory is None:
+            self._memory = LongTermMemory(self._sandbox_fs(), self.workspace)
+        return self._memory
+
+    @property
+    def sessions(self) -> SessionIndex:
+        """历史会话列表（从审计日志归纳）。"""
+        return SessionIndex(self.settings.resolved_audit_dir)
+
+    def remember(self, text: str) -> list[str]:
+        return self.memory.add(text)
+
+    def forget(self, index: int) -> list[str]:
+        return self.memory.remove(index)
+
+    def memories(self) -> list[str]:
+        return self.memory.load()
+
+    async def history(self, thread_id: str) -> list[HistoryMessage]:
+        """从 checkpoint 还原某个会话的对话（供 `/switch` 展示）。
+
+        只取人和助手的自然语言往来；工具调用与工具结果不展示 ——
+        它们是过程噪声，重新渲染只会淹没真正的对话。
+        """
+        graph = await self._ensure_graph()
+        state = await graph.aget_state({"configurable": {"thread_id": thread_id}})
+        messages = (state.values or {}).get("messages") or []
+
+        history: list[HistoryMessage] = []
+        for message in messages:
+            if isinstance(message, HumanMessage):
+                text = text_of(message)
+                if text.strip():
+                    history.append(HistoryMessage("user", text))
+            elif isinstance(message, AIMessage) and not getattr(message, "tool_calls", None):
+                text = text_of(message)
+                if text.strip():
+                    history.append(HistoryMessage("assistant", text))
+        return history
 
     @property
     def persistent(self) -> bool:
@@ -149,6 +248,7 @@ class AgentRuntime:
                 self.effective_settings,
                 checkpointer=checkpointer,
                 allow_write=self.allow_write,
+                policy=self.policy,
             )
         return self._graph
 
@@ -157,17 +257,46 @@ class AgentRuntime:
     # ------------------------------------------------------------------
 
     async def run(self, prompt: str, *, thread_id: str) -> AsyncIterator[Event]:
-        settings = self.settings
-        config = {
-            "configurable": {"thread_id": thread_id},
-            # planner + 每步 (act/tools 对 + advance) + respond 的宽松上界
-            "recursion_limit": settings.max_plan_steps * (2 * settings.max_tool_rounds + 2) + 10,
-        }
+        """跑一轮任务。
+
+        事件流以 `RunFinished` / `RunFailed` 收尾；若以 `ApprovalRequested` 收尾，
+        说明图已挂起等待人工确认，前端应收集答复后调用 `resume()`。
+        """
         inputs = {
             "messages": [HumanMessage(content=prompt)],
             "cwd": self.workspace,
             "tool_rounds": 0,
             "budget_exhausted": False,
+            "approvals": {},
+            # 每轮都从文件重新读：会话中途 /remember 加的事实应当立刻生效
+            "memories": self.memories(),
+        }
+        async for event in self._stream(
+            inputs, thread_id=thread_id, fresh_run=True, prompt=prompt
+        ):
+            yield event
+
+    async def resume(self, thread_id: str, decisions: dict[str, bool]) -> AsyncIterator[Event]:
+        """带着审批结果继续被挂起的图。
+
+        decisions: call_id -> 是否批准。缺失的按拒绝处理（fail closed）。
+        """
+        command = Command(resume=dict(decisions))
+        async for event in self._stream(command, thread_id=thread_id, fresh_run=False):
+            yield event
+
+    async def _stream(
+        self, payload: Any, *, thread_id: str, fresh_run: bool, prompt: str = ""
+    ) -> AsyncIterator[Event]:
+        settings = self.settings
+        config = {
+            "configurable": {"thread_id": thread_id},
+            # planner + 每步 (act/tools 对 + advance) + respond 的宽松上界
+            "recursion_limit": settings.max_plan_steps * (2 * settings.max_tool_rounds + 2) + 10,
+            # 这些会随 trace 一起上报，LangSmith 里可按会话/工作区/权限筛选
+            "run_name": f"agent:{thread_id}",
+            "tags": ["coding-agent", f"mode:{self.policy.approval_mode}"],
+            "metadata": self._trace_metadata(thread_id),
         }
 
         plan: list[str] = []
@@ -175,21 +304,25 @@ class AgentRuntime:
         answer = ""
         streamed: list[str] = []
         pending: dict[str, ToolCallStarted] = {}
-
-        self._audit(
-            AuditRecord(
-                ts=now_iso(),
-                kind=audit_models.RUN_START,
-                thread_id=thread_id,
-                workspace=self.workspace,
-                detail=truncate(prompt),
-            )
-        )
+        interrupted = False
+        # 最近一次验证结果：repair 事件要带上它说明「在修什么」
+        last_verification: dict[str, Any] = {}
 
         try:
+            if fresh_run:
+                self._audit(
+                    AuditRecord(
+                        ts=now_iso(),
+                        kind=audit_models.RUN_START,
+                        thread_id=thread_id,
+                        workspace=self.workspace,
+                        detail=truncate(prompt),
+                    )
+                )
+
             graph = await self._ensure_graph()
             async for mode, data in graph.astream(
-                inputs, config, stream_mode=["messages", "updates"]
+                payload, config, stream_mode=["messages", "updates"]
             ):
                 if mode == "messages":
                     chunk, meta = data
@@ -200,6 +333,13 @@ class AgentRuntime:
                     if node == "respond":
                         streamed.append(text)
                     yield AssistantToken(node=node, text=text)
+                    continue
+
+                suspension = data.get("__interrupt__")
+                if suspension:
+                    interrupted = True
+                    for request in self._interrupt_requests(suspension):
+                        yield request
                     continue
 
                 for node, update in data.items():
@@ -222,7 +362,7 @@ class AgentRuntime:
                         yield StepStarted(
                             index=0,
                             total=max(len(plan), 1),
-                            text=plan[0] if plan else prompt,
+                            text=plan[0] if plan else "",
                         )
 
                     elif node == "advance":
@@ -263,19 +403,65 @@ class AgentRuntime:
                                 self._audit_file_change(changed, thread_id)
                                 yield changed
 
+                    elif node == "verify":
+                        raw = update.get("verification") or {}
+                        if raw:
+                            last_verification = raw
+                            event = self._verification(raw)
+                            self._audit(
+                                AuditRecord(
+                                    ts=now_iso(),
+                                    kind=audit_models.VERIFY,
+                                    thread_id=thread_id,
+                                    ok=raw.get("status") == "ok",
+                                    detail=truncate(
+                                        f"{raw.get('command', '')} → {raw.get('summary', '')}"
+                                    ),
+                                )
+                            )
+                            yield event
+
+                    elif node == "repair":
+                        attempt = int(update.get("retry", 0))
+                        limit = self.settings.max_repair_rounds
+                        summary = str(last_verification.get("summary", ""))
+                        self._audit(
+                            AuditRecord(
+                                ts=now_iso(),
+                                kind=audit_models.REPAIR,
+                                thread_id=thread_id,
+                                detail=truncate(f"第 {attempt}/{limit} 次修复（{summary}）"),
+                            )
+                        )
+                        yield RepairStarted(
+                            attempt=attempt,
+                            limit=limit,
+                            summary=summary,
+                            issues=self._verification(last_verification).issues,
+                        )
+
                     elif node == "respond":
                         answer = text_of(_last_message(update))
 
         except Exception as exc:  # noqa: BLE001 - 编排层异常也要以事件形式报给前端
-            self._audit(
-                AuditRecord(
-                    ts=now_iso(),
-                    kind=audit_models.RUN_ERROR,
-                    thread_id=thread_id,
-                    detail=f"{type(exc).__name__}: {exc}",
+            # 尽力记一笔，但**不能让它顶掉真正的错误**：审计本身坏了的时候
+            # （比如磁盘满、目录被占），这里再抛一次就把原因盖掉了。
+            try:
+                self._audit(
+                    AuditRecord(
+                        ts=now_iso(),
+                        kind=audit_models.RUN_ERROR,
+                        thread_id=thread_id,
+                        detail=f"{type(exc).__name__}: {exc}",
+                    )
                 )
-            )
+            except Exception:  # noqa: BLE001, S110 - 已在错误路径上，不再二次抛出
+                pass
             yield RunFailed(message=f"{type(exc).__name__}: {exc}")
+            return
+
+        if interrupted:
+            # 图已挂起：不发 RunFinished，让前端明确知道要 resume 而不是收工
             return
 
         final = answer or "".join(streamed)
@@ -288,6 +474,96 @@ class AgentRuntime:
             )
         )
         yield RunFinished(thread_id=thread_id, answer=final)
+
+    # ------------------------------------------------------------------
+    # 回滚（用户主动发起，不走审批；审批管的是模型发起的动作）
+    # ------------------------------------------------------------------
+
+    def list_snapshots(self, *, limit: int = 20) -> list[SnapshotEntry]:
+        return self.snapshots.list(limit=limit)
+
+    def restore(
+        self, *, path: str | None = None, snapshot_id: str | None = None
+    ) -> RestoreResult:
+        """回滚文件并记审计。"""
+        store = self.snapshots
+        entry: SnapshotEntry | None = None
+
+        # 解析失败同样要记账：用户以为回滚了但没回滚，审计里不能留空白
+        def _failed(message: str) -> RestoreResult:
+            result = RestoreResult(ok=False, path=path or "", message=message)
+            self._audit_rollback(result, snapshot_id or "")
+            return result
+
+        if snapshot_id:
+            entry = store.find(snapshot_id, path)
+            if entry is None:
+                return _failed(f"找不到快照 {snapshot_id}")
+        elif path:
+            entry = store.latest_for(path)
+            if entry is None:
+                return _failed(f"{path} 没有任何留底，无法回滚。")
+        else:
+            entries = store.list(limit=1)
+            if not entries:
+                return _failed("工作区里还没有任何快照，无法回滚。")
+            entry = entries[0]
+
+        result = store.restore(entry)
+        self._audit_rollback(result, snapshot_id or "")
+        return result
+
+    def _audit_rollback(self, result: RestoreResult, requested_id: str) -> None:
+        self._audit(
+            AuditRecord(
+                ts=now_iso(),
+                kind=audit_models.ROLLBACK,
+                workspace=self.workspace,
+                path=result.path,
+                action=ACTION_RESTORE,
+                added=result.added,
+                removed=result.removed,
+                snapshot_id=result.snapshot_id or requested_id or None,
+                ok=result.ok,
+                detail=truncate(result.message),
+            )
+        )
+
+    def diff_snapshot(self, *, path: str | None = None, snapshot_id: str | None = None) -> str:
+        """展示某个快照与当前内容的差异（即「你都改了什么」）。"""
+        store = self.snapshots
+        entry: SnapshotEntry | None = None
+
+        if snapshot_id:
+            entry = store.find(snapshot_id, path)
+        elif path:
+            entry = store.latest_for(path)
+        else:
+            entries = store.list(limit=1)
+            entry = entries[0] if entries else None
+
+        if entry is None:
+            return ""
+
+        try:
+            original = store.read(entry)
+        except Exception:  # noqa: BLE001 - 快照读不出来时给空 diff，由前端提示
+            return ""
+
+        target = posixpath.join(store.root, entry.path)
+        try:
+            current = self._sandbox_fs().read_text(
+                target, max_bytes=self.settings.max_file_read_bytes
+            )
+        except Exception:  # noqa: BLE001 - 文件已被删除时按空内容比较
+            current = ""
+
+        return unified_diff(original, current, entry.path)
+
+    def _sandbox_fs(self) -> SandboxFs:
+        if self._fs is None:
+            self._fs = SandboxFs(self._sandbox, self.workspace)
+        return self._fs
 
     # ------------------------------------------------------------------
     # 审计
@@ -307,7 +583,11 @@ class AgentRuntime:
         finished: ToolCallFinished,
         thread_id: str,
     ) -> None:
-        if finished.rejected:
+        if finished.decision == DENIED:
+            decision = audit_models.DECISION_DENIED
+        elif finished.decision == APPROVED:
+            decision = audit_models.DECISION_APPROVED
+        elif finished.rejected:
             decision = audit_models.DECISION_REJECTED
         else:
             decision = audit_models.DECISION_AUTO
@@ -345,6 +625,24 @@ class AgentRuntime:
     # 单条更新 → 事件
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _interrupt_requests(suspension: Any) -> list[ApprovalRequested]:
+        """把 approval_gate 挂起时抛出的 payload 翻译成审批事件。"""
+        requests: list[ApprovalRequested] = []
+        for item in suspension or ():
+            payload = getattr(item, "value", None) or {}
+            for raw in payload.get("requests", []) or []:
+                requests.append(
+                    ApprovalRequested(
+                        request_id=str(raw.get("call_id", "")),
+                        tool=str(raw.get("tool", "")),
+                        command=str(raw.get("command", "")),
+                        level=str(raw.get("level", "")),
+                        reason=str(raw.get("reason", "")),
+                    )
+                )
+        return requests
+
     def _tool_started(self, name: str, args: dict[str, Any], call_id: str = "") -> ToolCallStarted:
         # 这里重新判一次等级纯粹是为了给前端着色；真正的放行/拒绝在工具内部，
         # 不存在"UI 判定通过就执行"的路径。
@@ -372,6 +670,7 @@ class AgentRuntime:
                 name=name,
                 ok=artifact.ok,
                 rejected=artifact.rejected,
+                decision=artifact.decision,
                 exit_code=artifact.exit_code,
                 duration_ms=artifact.duration_ms,
                 level=artifact.level_label or None,
@@ -384,6 +683,7 @@ class AgentRuntime:
                 name=name,
                 ok=artifact.ok,
                 rejected=artifact.rejected,
+                decision=artifact.decision,
                 level="文件工具",
                 preview=preview,
             )
@@ -394,6 +694,21 @@ class AgentRuntime:
             name=name,
             ok=not content.startswith(_FAILURE_MARKERS),
             preview=preview,
+        )
+
+    @staticmethod
+    def _verification(raw: dict[str, Any]) -> Verification:
+        status = str(raw.get("status", "skipped"))
+        issues = [
+            " ".join(f"{i.get('location', '')} {i.get('message', '')}".split())
+            for i in (raw.get("issues") or [])
+        ]
+        return Verification(
+            status=status,
+            command=str(raw.get("command", "")),
+            ok=status in ("ok", "skipped", "not_configured"),
+            summary=str(raw.get("summary", "")),
+            issues=issues,
         )
 
     @staticmethod

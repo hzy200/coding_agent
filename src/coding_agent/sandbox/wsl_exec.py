@@ -12,7 +12,15 @@ import time
 from dataclasses import dataclass
 
 from coding_agent.config import Settings, get_settings
+from coding_agent.sandbox.limits import (
+    TIMEOUT_EXIT_CODE,
+    ResourceLimits,
+    wrap_with_limits,
+)
 from coding_agent.sandbox.pathguard import normalize_root
+
+# 外层 subprocess 比沙箱内的 timeout 多留一点余量，正常由内层先触发
+OUTER_TIMEOUT_GRACE = 10
 
 
 class WslUnavailableError(RuntimeError):
@@ -130,6 +138,16 @@ class WslSandbox:
             "-s",
         ]
 
+    @property
+    def limits(self) -> ResourceLimits:
+        settings = self.settings
+        return ResourceLimits(
+            cpu_seconds=settings.shell_cpu_seconds,
+            memory_mb=settings.shell_memory_mb,
+            max_file_mb=settings.shell_max_file_mb,
+            max_processes=settings.shell_max_processes,
+        )
+
     def run(
         self,
         command: str,
@@ -137,8 +155,12 @@ class WslSandbox:
         cwd: str | None = None,
         timeout: int | None = None,
     ) -> ExecResult:
-        script = command if cwd is None else f"cd {shlex.quote(cwd)} && {command}"
-        limit = timeout if timeout is not None else self.settings.shell_timeout
+        body = command if cwd is None else f"cd {shlex.quote(cwd)} && {command}"
+        wall = timeout if timeout is not None else self.settings.shell_timeout
+        # 沙箱内再套一层 timeout：外层的 proc.kill() 只能杀掉 wsl.exe，
+        # Linux 侧的子进程要靠这一层才能确定性清理。
+        script = wrap_with_limits(body, limits=self.limits, wall_seconds=wall, quote=shlex.quote)
+        limit = wall + OUTER_TIMEOUT_GRACE
 
         started = time.perf_counter()
         try:
@@ -155,10 +177,13 @@ class WslSandbox:
         try:
             out, err = proc.communicate(script.encode("utf-8"), timeout=limit)
             exit_code = proc.returncode
+            # 沙箱内的 timeout 到点会返回约定码；外层超时只是兜底，正常不会触发
+            if exit_code == TIMEOUT_EXIT_CODE:
+                timed_out = True
         except subprocess.TimeoutExpired:
             proc.kill()
             out, err = proc.communicate()
-            exit_code = -1
+            exit_code = TIMEOUT_EXIT_CODE
             timed_out = True
 
         return ExecResult(

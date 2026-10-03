@@ -300,6 +300,34 @@ def test_runtime_is_not_persistent_without_a_path(tmp_path) -> None:
     assert not runtime.persistent
 
 
+# ---------------- 验证结果 → 事件 ----------------
+
+def test_verification_maps_failure_with_issues() -> None:
+    event = AgentRuntime._verification(
+        {
+            "status": "failed",
+            "command": "python3 -m pytest -q",
+            "summary": "1 failed",
+            "issues": [{"location": "tests/a.py:3", "message": "assert 1 == 2"}],
+        }
+    )
+    assert event.status == "failed"
+    assert event.ok is False
+    assert event.issues == ["tests/a.py:3 assert 1 == 2"]
+
+
+def test_verification_non_failure_statuses_count_as_ok() -> None:
+    for status in ("ok", "skipped", "not_configured"):
+        assert AgentRuntime._verification({"status": status}).ok is True
+    assert AgentRuntime._verification({"status": "failed"}).ok is False
+
+
+def test_verification_survives_missing_fields() -> None:
+    event = AgentRuntime._verification({})
+    assert event.status == "skipped"
+    assert event.issues == []
+
+
 def test_explicit_workspace_is_normalized_without_touching_wsl() -> None:
     runtime = AgentRuntime(Settings(_env_file=None), workspace="D:\\proj\\ws")
     assert runtime.workspace == "/mnt/d/proj/ws"

@@ -26,23 +26,28 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
+from rich.text import Text
 
 from coding_agent.audit import read_records
-from coding_agent.config import Settings, get_settings
+from coding_agent.config import Settings, get_settings, shadowed_env_keys
 from coding_agent.events import (
+    ApprovalRequested,
     AssistantToken,
     Event,
     FileChanged,
     PlanCreated,
+    RepairStarted,
     RunFailed,
     RunFinished,
     StepFinished,
     StepStarted,
     ToolCallFinished,
     ToolCallStarted,
+    Verification,
 )
 from coding_agent.llm.deepseek import MissingApiKeyError, build_llm
 from coding_agent.llm.prompts import SYSTEM_PROMPT
+from coding_agent.memory.sessions import SessionIndex, format_table_rows
 from coding_agent.messages import text_of
 from coding_agent.runtime import AgentRuntime
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
@@ -102,6 +107,45 @@ def _report(label: str, passed: bool, detail: str = "") -> bool:
     return passed
 
 
+def _warn(label: str, detail: str = "") -> None:
+    """提示性输出：影响使用但不该让自检直接失败。"""
+    suffix = f" — {escape(detail)}" if detail else ""
+    console.print(f"[yellow]WARN[/]  {label}{suffix}")
+
+
+def _check_langsmith(settings: Settings) -> list[bool]:
+    """追踪要么真正可用，要么提前说清楚。
+
+    凭据无效时 langsmith 会在**每次调用后**往 stderr 打一串 ingestion 失败 ——
+    与其让用户在一堆噪音里猜，不如在这里一次性验掉。
+    """
+    if not settings.langsmith_tracing:
+        return [_report("LangSmith 追踪", True, f"关闭 · project={settings.langsmith_project}")]
+
+    if not settings.langsmith_api_key:
+        return [_report("LangSmith 追踪", False, "已开启但缺 LANGSMITH_API_KEY")]
+
+    try:
+        from langsmith import Client
+
+        client = Client()
+        project = next(iter(client.list_projects(limit=1)), None)
+    except Exception as exc:  # noqa: BLE001 - 凭据/网络问题都要给出可读提示
+        return [
+            _report(
+                "LangSmith 追踪",
+                False,
+                f"凭据或网络不可用（{type(exc).__name__}）。"
+                f"追踪会静默失败并往 stderr 打错误，建议先 LANGSMITH_TRACING=false",
+            )
+        ]
+
+    detail = f"可用 · project={settings.langsmith_project}"
+    if project is not None and getattr(project, "name", "") != settings.langsmith_project:
+        detail += f"（该凭据下可见的第一个项目是 {project.name}）"
+    return [_report("LangSmith 追踪", True, detail)]
+
+
 @app.command()
 def doctor() -> None:
     """检查运行环境：Python、依赖、API Key、WSL 沙箱。"""
@@ -109,6 +153,15 @@ def doctor() -> None:
     results: list[bool] = []
 
     console.print("[bold]环境自检[/]\n")
+
+    shadowed = shadowed_env_keys()
+    if shadowed:
+        _warn(
+            "环境变量被 .env 覆盖",
+            f"{', '.join(shadowed)} 在环境变量里也有，但优先级是「.env > 环境变量」，"
+            f"当前生效的是 .env 里那份。若你以为在生效的是环境变量，请改 .env",
+        )
+        console.print()
 
     v = sys.version_info
     results.append(_report("Python 版本", v >= (3, 11), f"{v.major}.{v.minor}.{v.micro}"))
@@ -127,10 +180,7 @@ def doctor() -> None:
             "已配置" if settings.deepseek_api_key else "未配置（agent chat/run 不可用）",
         )
     )
-    tracing = "开启" if settings.langsmith_tracing else "关闭"
-    results.append(
-        _report("LangSmith 追踪", True, f"{tracing} · project={settings.langsmith_project}")
-    )
+    results.extend(_check_langsmith(settings))
 
     distros = WslSandbox.list_distros()
     has_wsl = settings.wsl_distro in distros
@@ -151,6 +201,15 @@ def doctor() -> None:
         user = sandbox.run("whoami").stdout.strip()
         results.append(
             _report("沙箱运行用户", user not in {"", "root"}, f"{user or '未知'}（不应为 root）")
+        )
+
+        backend = sandbox.run("command -v rg").ok
+        results.append(
+            _report(
+                "检索后端",
+                True,
+                "ripgrep" if backend else "grep（未装 ripgrep，大仓库会慢一些）",
+            )
         )
 
         workspace = resolve_workspace(settings, sandbox)
@@ -251,7 +310,7 @@ def _make_renderer() -> Callable[[Event], None]:
 
     这是「前端只消费事件」的一个具体实现；TUI / Web 会各写一份自己的映射表。
     """
-    state: dict[str, Any] = {"plan": [], "total": 1}
+    state: dict[str, Any] = {"plan": [], "total": 1, "answering": False}
 
     def render(event: Event) -> None:
         if isinstance(event, PlanCreated):
@@ -273,6 +332,11 @@ def _make_renderer() -> Callable[[Event], None]:
             _emit(f"\n{suffix}\n")
 
         elif isinstance(event, AssistantToken):
+            # respond 与 act 说的内容常有重叠（架构上就是「每步小结 + 最终汇总」）。
+            # 给最终答复一个明确的起点，读者才不会以为是重复输出。
+            if event.node == "respond" and not state["answering"]:
+                state["answering"] = True
+                console.print("\n[dim]── 最终答复 ──[/]")
             _emit(event.text)
 
         elif isinstance(event, ToolCallStarted):
@@ -281,7 +345,19 @@ def _make_renderer() -> Callable[[Event], None]:
                 f"\n[dim]→ {escape(label)}{escape(event.name)}: {escape(event.summary)}[/]"
             )
 
+        elif isinstance(event, RepairStarted):
+            console.print(
+                f"[yellow]↻ 第 {event.attempt}/{event.limit} 次修复[/] "
+                f"[dim]{escape(event.summary)}[/]"
+            )
+
+        elif isinstance(event, ApprovalRequested):
+            pass  # 由 _run_events 负责提问，渲染层不重复输出
+
         elif isinstance(event, ToolCallFinished):
+            if event.decision == "denied":
+                console.print("[red]← 已被用户拒绝[/]")
+                return
             if event.rejected:
                 console.print("[red]← 已被安全策略拒绝[/]")
                 return
@@ -299,6 +375,18 @@ def _make_renderer() -> Callable[[Event], None]:
             stamp = f" · {event.snapshot_id}" if event.snapshot_id else ""
             console.print(f"[magenta]✎ {escape(event.path)}[/] [dim]{stat}{stamp}[/]")
 
+        elif isinstance(event, Verification):
+            if event.status == "not_configured":
+                console.print("[dim]验证：未检测到可用的测试命令[/]")
+            elif event.status == "skipped":
+                pass
+            elif event.ok:
+                console.print(f"[green]验证通过[/] [dim]{escape(event.summary)}[/]")
+            else:
+                console.print(f"[red]验证失败[/] [dim]{escape(event.summary)}[/]")
+                for issue in event.issues[:5]:
+                    console.print(f"  [red]·[/] {escape(issue)}")
+
         elif isinstance(event, RunFailed):
             console.print(f"\n[red]运行失败：{escape(event.message)}[/]")
 
@@ -308,8 +396,40 @@ def _make_renderer() -> Callable[[Event], None]:
     return render
 
 
+def _ask_approval(requests: list[ApprovalRequested], *, assume_yes: bool) -> dict[str, bool]:
+    """逐条询问审批结果。非交互环境下默认拒绝（fail closed）。"""
+    decisions: dict[str, bool] = {}
+    for request in requests:
+        console.print()
+        console.print(f"[yellow bold]需要确认[/] [dim]({escape(request.level)})[/]")
+        console.print(f"  [bold]{escape(request.command)}[/]")
+        if request.reason:
+            console.print(f"  [dim]理由：{escape(request.reason)}[/]")
+
+        if assume_yes:
+            console.print("  [green]→ 已按 --yes 自动批准[/]")
+            decisions[request.request_id] = True
+            continue
+
+        try:
+            answer = console.input("  执行？[y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n  [red]→ 非交互环境，按拒绝处理[/]")
+            decisions[request.request_id] = False
+            continue
+        decisions[request.request_id] = answer in {"y", "yes"}
+
+    return decisions
+
+
 async def _run_events(
-    settings: Settings, prompt: str, allow_write: bool, thread_id: str, workspace: str
+    settings: Settings,
+    prompt: str,
+    allow_write: bool,
+    thread_id: str,
+    workspace: str,
+    *,
+    assume_yes: bool = False,
 ) -> None:
     runtime = AgentRuntime(settings, workspace=workspace or None, allow_write=allow_write)
     kind = "SQLite 持久化" if runtime.persistent else "进程内"
@@ -317,8 +437,20 @@ async def _run_events(
 
     render = _make_renderer()
     try:
+        queue: list[ApprovalRequested] = []
         async for event in runtime.run(prompt, thread_id=thread_id):
             render(event)
+            if isinstance(event, ApprovalRequested):
+                queue.append(event)
+
+        # 图每次挂起后都要重新续跑，可能连续挂起多次
+        while queue:
+            decisions = _ask_approval(queue, assume_yes=assume_yes)
+            queue = []
+            async for event in runtime.resume(thread_id, decisions):
+                render(event)
+                if isinstance(event, ApprovalRequested):
+                    queue.append(event)
     except KeyboardInterrupt:
         console.print("\n[dim]已中断[/]")
     finally:
@@ -334,15 +466,163 @@ def run(
         "-C",
         help="工作区，WSL 绝对路径（/mnt/d/proj）或 Windows 路径（D:\\\\proj）均可，默认用配置值",
     ),
-    write: bool = typer.Option(False, "--write", help="放开 L1 低风险写命令（mkdir/cp 等）"),
+    write: bool = typer.Option(False, "--write", help="放开 L1 低风险写命令与文件工具写入"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="对 L2/L3 命令一律自动批准（跳过确认）"),
     thread_id: str = typer.Option("", "--thread-id", help="复用已有会话 id"),
 ) -> None:
-    """走 LangGraph 图执行一轮任务（默认仅允许只读命令）。"""
+    """走 LangGraph 图执行一轮任务。
+
+    默认只读；变更类命令（L2/L3）会先停下来请求你确认。
+    """
     asyncio.run(
         _run_events(
-            get_settings(), prompt, write, thread_id or uuid.uuid4().hex[:8], workspace
+            get_settings(),
+            prompt,
+            write,
+            thread_id or uuid.uuid4().hex[:8],
+            workspace,
+            assume_yes=yes,
         )
     )
+
+
+_WORKSPACE_OPTION = typer.Option(
+    "",
+    "--workspace",
+    "-C",
+    help="工作区，WSL 绝对路径（/mnt/d/proj）或 Windows 路径（D:\\\\proj）均可，默认用配置值",
+)
+
+
+@app.command()
+def snapshots(
+    workspace: str = _WORKSPACE_OPTION,
+    limit: int = typer.Option(20, "--limit", "-n", help="显示最近多少条"),
+) -> None:
+    """列出文件快照（每次写入/编辑前的留底）。"""
+    runtime = AgentRuntime(get_settings(), workspace=workspace or None)
+    entries = runtime.list_snapshots(limit=limit)
+    if not entries:
+        console.print(f"[dim]还没有任何快照。工作区 {runtime.workspace}[/]")
+        return
+
+    table = Table(show_header=True, header_style="bold", box=None)
+    for column in ("快照 id", "文件"):
+        table.add_column(column)
+    for entry in entries:
+        table.add_row(entry.snapshot_id, escape(entry.path))
+    console.print(f"[dim]工作区 {runtime.workspace}（最近 {len(entries)} 条）[/]\n")
+    console.print(table)
+
+
+@app.command()
+def undo(
+    workspace: str = _WORKSPACE_OPTION,
+    snapshot_id: str = typer.Option("", "--snapshot", help="指定快照 id，默认回滚最近一次改动"),
+    path: str = typer.Option("", "--path", help="只回滚这个文件"),
+) -> None:
+    """把文件回滚到某次修改前的状态。"""
+    runtime = AgentRuntime(get_settings(), workspace=workspace or None)
+    result = runtime.restore(snapshot_id=snapshot_id or None, path=path or None)
+
+    if not result.ok:
+        console.print(f"[red]{escape(result.message)}[/]")
+        raise typer.Exit(code=1)
+
+    console.print(f"[green]{escape(result.message)}[/]")
+    if result.undo_snapshot_id:
+        console.print(f"[dim]回滚前的状态已留底：{result.undo_snapshot_id}[/]")
+    if result.diff:
+        console.print()
+        console.print(_diff_text(result.diff))
+
+
+@app.command()
+def diff(
+    workspace: str = _WORKSPACE_OPTION,
+    snapshot_id: str = typer.Option("", "--snapshot", help="指定快照 id，默认最近一次改动"),
+    path: str = typer.Option("", "--path", help="只看这个文件"),
+) -> None:
+    """查看某次改动之后文件变成了什么样（快照 → 当前）。"""
+    runtime = AgentRuntime(get_settings(), workspace=workspace or None)
+    text = runtime.diff_snapshot(snapshot_id=snapshot_id or None, path=path or None)
+    if not text:
+        console.print("[dim]没有可显示的快照，或内容与快照一致。[/]")
+        return
+    console.print(_diff_text(text))
+
+
+def _diff_text(raw: str) -> Text:
+    """给 diff 上色：加行绿、删行红、文件头加粗。"""
+    styled = Text()
+    for line in raw.splitlines():
+        if line.startswith(("+++", "---")):
+            styled.append(line + "\n", style="bold")
+        elif line.startswith("+"):
+            styled.append(line + "\n", style="green")
+        elif line.startswith("-"):
+            styled.append(line + "\n", style="red")
+        elif line.startswith("@@"):
+            styled.append(line + "\n", style="cyan")
+        else:
+            styled.append(line + "\n")
+    return styled
+
+
+@app.command()
+def sessions(
+    limit: int = typer.Option(20, "--limit", "-n", help="显示最近多少个会话"),
+) -> None:
+    """列出历史会话（从审计日志归纳）。"""
+    settings = get_settings()
+    index = SessionIndex(settings.resolved_audit_dir)
+    found = index.list(limit=limit)
+
+    if not found:
+        console.print(f"[dim]没有历史会话记录：{settings.resolved_audit_dir}[/]")
+        return
+
+    table = Table(show_header=True, header_style="bold", box=None)
+    for column in ("会话 id", "最近活跃", "提问", "工具调用", "内容"):
+        table.add_column(column)
+    for row in format_table_rows(found):
+        table.add_row(row[0], row[1], row[2], row[3], escape(row[4]))
+    console.print(table)
+    console.print("\n[dim]用 agent run --thread-id <会话 id> \"…\" 继续该会话[/]")
+
+
+@app.command()
+def memory(
+    add: str = typer.Option("", "--add", help="新增一条项目记忆"),
+    forget: int = typer.Option(0, "--forget", help="删除第 N 条（序号从 1 开始）"),
+    clear: bool = typer.Option(False, "--clear", help="清空全部记忆"),
+    workspace: str = _WORKSPACE_OPTION,
+) -> None:
+    """查看或维护跨会话的项目记忆。"""
+    runtime = AgentRuntime(get_settings(), workspace=workspace or None)
+
+    try:
+        if clear:
+            runtime.memory.clear()
+            console.print("[green]已清空项目记忆[/]")
+        elif add:
+            runtime.remember(add)
+            console.print("[green]已记住[/]")
+        elif forget:
+            runtime.forget(forget)
+            console.print(f"[green]已删除第 {forget} 条[/]")
+    except Exception as exc:  # noqa: BLE001 - 记忆文件读写失败要给可读提示
+        console.print(f"[red]{escape(str(exc))}[/]")
+        raise typer.Exit(code=1) from exc
+
+    facts = runtime.memories()
+    if not facts:
+        console.print(f"[dim]当前没有项目记忆。文件位置：{runtime.memory.path}[/]")
+        return
+
+    console.print(f"[dim]{runtime.memory.path}（{len(facts)} 条）[/]\n")
+    for index, fact in enumerate(facts, start=1):
+        console.print(f"  {index}. {escape(fact)}")
 
 
 @app.command()
@@ -367,7 +647,12 @@ def audit(
         table.add_column(column)
 
     for record in records:
-        style = "red" if record.decision == "rejected" or record.kind == "run_error" else ""
+        failed_verify = record.kind == "verify" and record.ok is False
+        bad = (
+            record.decision in ("rejected", "denied")
+            or record.kind == "run_error"
+            or failed_verify
+        )
         table.add_row(
             record.ts[11:19],
             record.kind,
@@ -375,28 +660,58 @@ def audit(
             record.level,
             record.decision,
             _audit_outcome(record),
-            style=style,
+            style="red" if bad else "",
         )
     console.print(table)
 
 
 def _audit_outcome(record) -> str:
     if record.kind == "tool_call":
-        if record.decision == "rejected":
+        if record.decision in ("rejected", "denied"):
+            # denied 是人工拒绝，rejected 是策略/路径守卫拒绝，都没执行
             return "已拒绝"
         if record.ok is None:
             return ""
         if not record.ok:
             # 文件工具没有退出码，失败原因在工具返回文本里，这里只标失败
             return f"失败 exit={record.exit_code}" if record.exit_code is not None else "失败"
-        return f"OK {record.duration_ms}ms" if record.duration_ms is not None else "OK"
-    if record.kind == "file_change":
+        mark = "已批准" if record.decision == "approved" else "OK"
+        return f"{mark} {record.duration_ms}ms" if record.duration_ms is not None else mark
+    if record.kind in ("file_change", "rollback"):
         return f"+{record.added} -{record.removed}"
     if record.kind == "plan":
         return f"{len(record.steps)} 步"
+    if record.kind == "verify":
+        mark = "通过" if record.ok else "失败"
+        return f"{mark} {escape(record.detail[:48])}"
+    if record.kind == "repair":
+        return escape(record.detail[:60])
     if record.kind == "run_error":
         return escape(record.detail[:60])
     return ""
+
+
+@app.command()
+def web(
+    host: str = typer.Option("127.0.0.1", "--host", help="监听地址"),
+    port: int = typer.Option(8765, "--port", help="监听端口"),
+    workspace: str = _WORKSPACE_OPTION,
+) -> None:
+    """启动最小 Web 验证界面（流式对话 + 多会话 + API 联通测试）。"""
+    try:
+        import uvicorn
+    except ImportError as exc:
+        hint = escape('pip install -e ".[web]"')
+        console.print(f"[red]未安装 Web 依赖。请运行：{hint}[/]")
+        raise typer.Exit(code=2) from exc
+
+    from coding_agent.web import create_app
+
+    settings = get_settings()
+    if workspace:
+        settings = settings.model_copy(update={"wsl_workspace": workspace})
+    console.print(f"[dim]打开 http://{host}:{port}（Ctrl+C 停止）[/]")
+    uvicorn.run(create_app(settings), host=host, port=port, log_level="warning")
 
 
 @app.command()
@@ -413,7 +728,10 @@ def tui(
     try:
         from coding_agent.tui import AgentTuiApp
     except ImportError as exc:
-        console.print('[red]未安装 UI 依赖。请运行：pip install -e ".[ui]"[/]')
+        # 必须转义 [ui]：不转义的话 rich 会把它当样式标记吞掉，
+        # 用户看到的是一条坏掉的安装命令
+        hint = escape('pip install -e ".[ui]"')
+        console.print(f"[red]未安装 UI 依赖。请运行：{hint}[/]")
         raise typer.Exit(code=2) from exc
 
     AgentTuiApp(get_settings(), workspace=workspace or None, allow_write=write).run()

@@ -1,7 +1,7 @@
 """路径守卫与 Windows ↔ WSL 路径转换。
 
 当前版本做的是**词法级**防护：归一化后必须落在工作区根目录内。
-符号链接逃逸需要文件系统信息，将在 W3 通过沙箱内 `realpath` 校验补齐。
+符号链接逃逸需要文件系统信息，由 `sandbox/fs.py` 在沙箱内做 `realpath` 二次校验补齐。
 """
 
 from __future__ import annotations

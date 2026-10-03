@@ -1,10 +1,11 @@
 """Shell 工具：把模型输出的"命令意图"交给 WSL2 沙箱执行。
 
-工具的职责边界：**校验 + 执行 + 回报**。
-是否放行由 `sandbox.policy` 决定，工具本身不做安全判断。
+职责边界：**执行 + 路径守卫 + 结果回报**。
 
-返回值是 `artifacts.pack(文本, 产物)` 封装：文本给模型看，
-产物给事件层和审计层用，两边都不必互相将就格式。
+这里**不做**安全分级判定 —— 放行与否由 `graph.nodes.approve`（approval_gate）
+依据 `sandbox.policy.SessionPolicy` 决定，并在 `graph.nodes.tools` 强制执行。
+把判定放在节点而不是工具里，是因为审批结果属于图状态（一次调用一个结果），
+工具是无状态的；节点是所有工具执行的唯一咽喉，检查放在那里不会漏。
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from coding_agent.config import Settings
 from coding_agent.sandbox.pathguard import SandboxPathError, ensure_inside
-from coding_agent.sandbox.policy import CommandLevel, classify
+from coding_agent.sandbox.policy import classify
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
 from coding_agent.tools.artifacts import ShellArtifact, pack
 
@@ -28,7 +29,7 @@ SHELL_TOOL_DESCRIPTION = """\
 
 注意：
 - 命令必须是非交互式的，不能依赖用户输入（避免 git rebase -i、vim 等）。
-- 当前会话允许的最高命令等级为 {max_level}，超出等级的命令会被宿主拒绝。
+- 变更类命令会先请求用户确认；被拒绝时你会收到一条说明，请换更低风险的做法。
 - 一次只跑一条命令，看到结果再决定下一步。
 """
 
@@ -42,37 +43,12 @@ class ShellInput(BaseModel):
     )
 
 
-def _refusal(
-    verdict_level: CommandLevel, reason: str, max_level: CommandLevel, command: str
-) -> str:
-    text = (
-        f"命令被安全策略拒绝。\n"
-        f"判定等级：{verdict_level.label}（{reason}）\n"
-        f"当前会话允许的最高等级：{max_level.label}\n"
-        f"请改用更低风险的方式达成同样目的。"
-    )
-    artifact = ShellArtifact(
-        command=command,
-        ok=False,
-        rejected=True,
-        level=int(verdict_level),
-        level_label=verdict_level.label,
-    )
-    return pack(text, artifact)
-
-
-def build_shell_tool(
-    settings: Settings,
-    sandbox: WslSandbox,
-    *,
-    max_level: CommandLevel = CommandLevel.READ,
-) -> BaseTool:
+def build_shell_tool(settings: Settings, sandbox: WslSandbox) -> BaseTool:
     workspace = resolve_workspace(settings, sandbox)
 
     def _run(command: str, reason: str, cwd: str | None = None) -> str:
-        verdict = classify(command)
-        if verdict.level > max_level:
-            return _refusal(verdict.level, verdict.reason, max_level, command)
+        # 等级只用于回报（前端着色、审计记账），不在这里拦
+        level = classify(command).level
 
         try:
             workdir = ensure_inside(cwd, workspace) if cwd else workspace
@@ -81,27 +57,28 @@ def build_shell_tool(
                 command=command,
                 ok=False,
                 rejected=True,
-                level=int(verdict.level),
-                level_label=verdict.level.label,
+                level=int(level),
+                level_label=level.label,
+                decision="rejected",
             )
             return pack(f"工作目录非法：{exc}", artifact)
 
         result = sandbox.run(command, cwd=workdir)
-        text = f"[{verdict.level.label}] {reason}\n{result.render(settings.max_output_chars)}"
+        text = f"[{level.label}] {reason}\n{result.render(settings.max_output_chars)}"
         artifact = ShellArtifact(
             command=command,
             ok=result.ok,
             exit_code=result.exit_code,
             duration_ms=result.duration_ms,
             timed_out=result.timed_out,
-            level=int(verdict.level),
-            level_label=verdict.level.label,
+            level=int(level),
+            level_label=level.label,
         )
         return pack(text, artifact)
 
     return StructuredTool.from_function(
         func=_run,
         name=SHELL_TOOL_NAME,
-        description=SHELL_TOOL_DESCRIPTION.format(max_level=max_level.label),
+        description=SHELL_TOOL_DESCRIPTION,
         args_schema=ShellInput,
     )
