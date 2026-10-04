@@ -448,6 +448,42 @@ W12 查清了成因，结论是**当前不修，只规避**。
 | W14 | ✅ 完成 | Web 最小验证（SSE 流式 / 多会话 / 联通测试，零构建链）、TUI 打磨、`scripts/demo.py` 四场景演示 |
 | W15 | ✅ 完成 | 文档拆分：`ARCHITECTURE.md`（分层/数据流/不变量/扩展点）、`USAGE.md`（工作流/配置/故障排查）、`DEMO.md`（讲稿） |
 | W16 | ✅ 完成 | 冻结前审计（删死字段、清理过时注释）、需求对照表 `ACCEPTANCE.md`、代码冻结 |
+| 冻结后 | 🚧 进行中 | 缺陷修复：P0×3 + P1×4 已修；阶段 A（缺陷收口）计划见 [PHASE_A.md](PHASE_A.md) |
+
+### 冻结后记录：缺陷收口（P0 / P1 + 阶段 A）
+
+一次完整技术与安全审查后，按"会不会影响正确性/安全/答辩结论"排序修复了一遍。
+计划与逐项状态见 [PHASE_A.md](PHASE_A.md)。
+
+**P0（可静默越权/丢审计，优先修）**
+
+1. shell 只读命令没有文件系统边界：`cat ~/.ssh/id_rsa`、`find / -name '*.key'` 曾被当 L0
+   自动放行。改为对自动放行命令做越界升级（`$()`/变量、`~`/绝对路径/`..`、`find -exec`）→ L2 人工确认。
+2. 审批恢复后审计丢失工具调用参数：配对表原先是 `_stream` 局部变量，挂起/恢复跨了两次 `_stream`。
+   提升为 runtime 实例级、按 `thread_id` 分桶。
+3. 悬空符号链接可写到工作区外：`-e` 对悬空链接为假，跳过了 realpath 校验。判定改为 `-e || -L`。
+
+**P1（可靠性/可用性）**
+
+4. `recursion_limit` 偏小（按每轮 2 个超步算，实际 3 个）→ 系数改 `3*rounds+3`。
+5. 危险模式原始全文匹配误伤（`grep "rm -rf"` 判 L3）→ 引号感知：屏蔽字面量，保留 `$()` 与 `sh -c` 内容。
+6. `budget_exhausted` 不参与路由，空转步骤被静默跳过 → 预算耗尽且无改动时停下如实上报。
+7. 审批 `call_id` 空/重复时串号 → 整批 fail-closed。
+
+**阶段 A（缺陷收口）**：A1 大文件读取上限在读前生效（100MB：6.68s→0.40s，并修出"空文件读不了"）；
+A2 `history()` 解耦建图（无 API Key 可用）；A3 上下文裁剪支持 content blocks；
+A4 shell 变更也置 `dirty`（触发验证）；A5 工程卫生（124 消歧、删空 `main.py`、
+`Makefile` + CI、`RunStarted` 入契约、`.coverage` 出库）；A7 快照 id 提升到微秒+序号（同秒留底排序稳定）。
+
+**阶段 B（安全纵深）**：
+
+- **B3** 词法器边界测试矩阵（16 例）：`$'...'`、嵌套 `$()`、反引号、`sh -c` 包装都验证到位。
+- **B2** `.agent` 在 shell / git 路径的防护：`git add -A`/`.`（整树暂存）与任何 `.agent` 引用 → L2。
+- **B1** 可选内核级隔离 `AGENT_SHELL_SANDBOX=bwrap`：挂载命名空间里 `/home` `/root` `/mnt`
+  不可见、仅工作区可写；配置了 bwrap 却不可用时**拒绝执行**（fail closed）。
+  `agent doctor` 增探测项。
+- **B4** 威胁模型归档 [THREAT_MODEL.md](THREAT_MODEL.md)：明确默认交付是"防误操作"（T1），
+  逐层给出升到"防主动越狱"（T2）的前置条件与代价。
 
 ### W15 记录：文档拆分的取舍
 
@@ -625,8 +661,7 @@ metadata: {"thread_id": "c04ed4f1", "workspace": "/mnt/c/.../agent-w11",
 ## 9. 快速开始
 
 ```bash
-python -m venv .venv
-.venv/Scripts/activate           # Windows
+conda activate agent              # 项目当前使用的 conda 环境（也可用 venv 替代）
 pip install -e ".[dev]"
 cp .env.example .env             # 填入 DEEPSEEK_API_KEY
 agent doctor                     # 环境自检

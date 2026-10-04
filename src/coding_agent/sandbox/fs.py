@@ -73,20 +73,33 @@ class SandboxFs:
             self._real_root = result.stdout.strip()
         return self._real_root
 
-    def _stat_script(self, path: str, *, include_data: bool = False) -> str:
+    def _stat_script(
+        self,
+        path: str,
+        *,
+        include_data: bool = False,
+        max_bytes: int | None = None,
+    ) -> str:
         """一次进程启动里同时拿到 realpath / 类型 / 大小（可选：内容）。
 
         每次 `wsl.exe` 调用都是一次进程启动（实测 0.2–0.3s），
         所以"顺手多查一点"比"多跑一趟"划算得多 —— 早先的实现读一个文件要启动三次。
+
+        `max_bytes` 给了上限时，**脚本内**先比大小再决定是否 `base64`：
+        若放在 Python 侧先读后拒，整份文件已经物化进内存，上限就形同虚设。
         """
+        # 存在性判定用 `-e || -L`：悬空符号链接的 `-e` 为假，若走了 else 分支，
+        # REAL 会退化成链接自身路径（在工作区内），realpath 校验就成了摆设。
         script = f"""\
 p={_quote(path)}
-if [ -e "$p" ]; then
-  echo "EXISTS=1"
+if [ -e "$p" ] || [ -L "$p" ]; then
+  size=$(stat -c %s -- "$p" 2>/dev/null || echo 0)
+  if [ -e "$p" ]; then echo "EXISTS=1"; else echo "EXISTS=0"; fi
   if [ -f "$p" ]; then echo "FILE=1"; else echo "FILE=0"; fi
-  echo "SIZE=$(stat -c %s -- "$p" 2>/dev/null || echo 0)"
+  echo "SIZE=$size"
   echo "REAL=$(realpath -m -- "$p")"
 else
+  size=0
   echo "EXISTS=0"
   echo "FILE=0"
   echo "SIZE=0"
@@ -94,8 +107,10 @@ else
 fi
 """
         if include_data:
-            # 文件不存在或不是普通文件时输出空串，由调用方按状态判断
-            script += 'if [ -f "$p" ]; then echo "DATA=$(base64 -w0 -- "$p")"; fi\n'
+            # 文件不存在 / 不是普通文件 → 不输出 DATA；
+            # 超过上限 → 同样不读（脚本里就不跑 base64）。
+            guard = "" if max_bytes is None else f' && [ "$size" -le {int(max_bytes)} ]'
+            script += f'if [ -f "$p" ]{guard}; then echo "DATA=$(base64 -w0 -- "$p")"; fi\n'
         return script
 
     @staticmethod
@@ -108,8 +123,12 @@ fi
             real_path=data.get("REAL", ""),
         )
         raw = data.get("DATA")
-        if not raw:
+        if raw is None:
+            # 没有 DATA 行：文件不存在 / 非普通文件 / 超过上限未读
             return info, None
+        if raw == "":
+            # DATA= 是「读到了，就是空的」——空文件必须可读，不能当成失败
+            return info, b""
         try:
             return info, base64.b64decode(raw, validate=True)
         except ValueError as exc:
@@ -155,9 +174,14 @@ fi
     # ------------------------------------------------------------------
 
     def read_bytes(self, path: str, *, max_bytes: int) -> bytes:
-        """读文件内容：**一次**进程启动里完成路径校验 + 状态 + 读取。"""
+        """读文件内容：**一次**进程启动里完成路径校验 + 状态 + 读取。
+
+        `max_bytes` 会传进脚本，超限时脚本根本不读内容（见 `_stat_script`）。
+        """
         lexical = ensure_inside(path, self.root, cwd=self.root)
-        result = self._sandbox.run(self._stat_script(lexical, include_data=True))
+        result = self._sandbox.run(
+            self._stat_script(lexical, include_data=True, max_bytes=max_bytes)
+        )
         if not result.ok:
             raise SandboxFsError(f"读取失败：{result.render(500)}")
 
@@ -191,6 +215,9 @@ fi
         校验与写入**合在一次进程启动里**：脚本自己先解析 realpath、
         确认仍在工作区内，再落盘。校验发生在写入之前，所以越界时一个字节都不会写。
         词法校验留在 Python 侧（不需要 I/O），realpath 校验由脚本执行。
+
+        存在性判定用 `-e || -L`：悬空符号链接的 `-e` 为假，只判 `-e` 会跳过校验，
+        再顺着链接把内容写到工作区外。
         """
         lexical = ensure_inside(path, self.root, cwd=self.root)
         payload = base64.b64encode(content.encode("utf-8")).decode("ascii")
@@ -203,7 +230,7 @@ case "$real_dir" in
   "$root"|"$root"/*) ;;
   *) echo "ESCAPED=$real_dir" >&2; exit 9 ;;
 esac
-if [ -e "$p" ]; then
+if [ -e "$p" ] || [ -L "$p" ]; then
   real_p=$(realpath -m -- "$p")
   case "$real_p" in
     "$root"|"$root"/*) ;;

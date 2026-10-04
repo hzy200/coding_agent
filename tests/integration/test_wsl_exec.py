@@ -53,6 +53,14 @@ def test_timeout_kills_command(require_wsl: WslSandbox) -> None:
     assert not result.ok
 
 
+def test_exit_code_124_is_not_mistaken_for_timeout(require_wsl: WslSandbox) -> None:
+    """命令自身以 124 退出是合法的，不能因为码相同就报「超时」。"""
+    require_wsl.run("true", timeout=60)  # 预热
+    result = require_wsl.run("exit 124")
+    assert result.exit_code == 124
+    assert not result.timed_out
+
+
 def test_awkward_quoting_survives(require_wsl: WslSandbox) -> None:
     """命令经 stdin 传递，含引号/重定向的复杂命令不应被 Windows 层破坏。"""
     result = require_wsl.run("""printf '%s\\n' "a 'b' c" | tr -d "'" """)

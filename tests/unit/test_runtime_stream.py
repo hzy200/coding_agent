@@ -377,6 +377,46 @@ def test_resume_does_not_emit_run_start_audit(tmp_path) -> None:
     assert kinds.count("run_start") == 1
 
 
+def test_approved_tool_call_keeps_args_across_resume(tmp_path) -> None:
+    """需要审批的调用跨 run/resume 后，审计仍要记到命令参数。
+
+    这类调用在挂起时结束一次 `_stream`、resume 时才执行，恰恰是风险最高的一批；
+    配对表若只活在 `_stream` 局部，恢复后 args 会退化成空 dict。
+    """
+    request = {"call_id": "c1", "tool": "shell_exec", "command": "pip install x",
+               "level": "L2 变更性", "reason": "装依赖"}
+    run_script = [
+        _updates(act={"messages": [
+            _tool_call("shell_exec", {"command": "pip install x", "reason": "装依赖"}, "c1")
+        ]}),
+        _updates(__interrupt__=(_Interrupt({"requests": [request]}),)),
+    ]
+    resume_script = [
+        _updates(tools={"messages": [ToolMessage(
+            content="installed",
+            tool_call_id="c1",
+            name="shell_exec",
+            artifact=ShellArtifact(
+                command="pip install x", ok=True, decision="approved",
+                exit_code=0, level=2, level_label="L2 变更性",
+            ).model_dump(),
+        )]}),
+        _updates(respond={"messages": [AIMessage(content="好了")]}),
+    ]
+    runtime, _ = _runtime(tmp_path, run_script)
+    _run(_collect(runtime))
+
+    runtime._graph = FakeGraph(resume_script)  # 模拟 resume 进入另一次 _stream
+    _run(_collect_resume(runtime, {"c1": True}))
+
+    call = next(r for r in read_records(runtime.audit_path) if r.kind == "tool_call")
+    assert call.decision == "approved"
+    assert call.call_id == "c1"
+    assert call.args["command"] == "pip install x"
+    assert call.args["reason"] == "装依赖"
+    assert call.level == "L2 变更性"
+
+
 # ---------------- 异常 ----------------
 
 def test_graph_failure_becomes_run_failed(tmp_path) -> None:

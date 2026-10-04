@@ -4,8 +4,9 @@
 
     <工作区>/.agent/backups/<snapshot_id>/<工作区相对路径>
 
-`snapshot_id` 形如 `20261003T024018-a1b2c3`，时间戳前缀让目录名天然按时间排序，
-因此**不需要额外的索引文件** —— 列目录就能按新旧找到某个文件的历史版本。
+`snapshot_id` 形如 `20261003T024018123456-a1b2c3`（时间戳精确到微秒），
+前缀让目录名天然按时间排序，因此**不需要额外的索引文件** ——
+列目录就能按新旧找到某个文件的历史版本。
 
 恢复语义是「先留底再覆盖」：回滚前把当前内容也存一份，
 所以回滚本身也是可回滚的，不会把用户当下的改动直接抹掉。
@@ -13,6 +14,7 @@
 
 from __future__ import annotations
 
+import itertools
 import posixpath
 import shlex
 from dataclasses import dataclass
@@ -28,6 +30,22 @@ AGENT_STATE_DIRNAME = ".agent"
 BACKUP_DIRNAME = f"{AGENT_STATE_DIRNAME}/backups"
 
 ACTION_RESTORE = "restore"
+
+# 同一时钟刻度内生成多个 id 时，用它保证严格递增（进程内有效）
+_SNAPSHOT_SEQ = itertools.count()
+
+
+def _new_snapshot_id() -> str:
+    """按时间排序的快照 id：`YYYYmmddTHHMMSSffffff<seq3>-<uuid6>`。
+
+    必须**严格可排序**：`SnapshotStore.list` 靠 id 的字典序判断新旧。只用秒级
+    时间戳时，同一秒内的多次留底会退化成按随机 uuid 排序，`latest_for` /
+    "最老一次" 会选错版本。因此时间戳精确到微秒，并再追加一个进程内递增序号
+    —— 光靠时间戳不够：系统时钟粒度可能让同一刻度内生成多个相同时间戳。
+    """
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%f")
+    seq = next(_SNAPSHOT_SEQ) % 1000
+    return f"{stamp}{seq:03d}-{uuid4().hex[:6]}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +90,7 @@ class SnapshotStore:
 
     def save(self, path: str, original: str) -> str:
         """把 path 当前的内容留底，返回 snapshot_id。"""
-        snapshot_id = f"{datetime.now(UTC):%Y%m%dT%H%M%S}-{uuid4().hex[:6]}"
+        snapshot_id = _new_snapshot_id()
         self._write(snapshot_id, _relpath(path, self.root), original)
         return snapshot_id
 

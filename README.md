@@ -18,28 +18,73 @@
 四个选题创新点均已落地并有测试守着：双工具架构、可审计的命令安全策略、
 可回滚的修改流程、失败驱动的修复循环。
 
-**当前状态**：687 个测试通过、覆盖率 89%、lint 干净，代码已冻结。
-逐条需求对照与已知限制见 [ACCEPTANCE.md](docs/ACCEPTANCE.md)。
+**当前状态**：749 个测试通过（不含需 API Key 的 LLM 用例）、覆盖率 89%、lint 干净。
+代码冻结后又做了一轮**缺陷收口与安全纵深**：大文件读取上限在读前生效、shell 变更也触发验证、
+只读命令参数越界升级、可选 `bwrap` 内核级隔离等。逐条需求对照与已知限制见
+[ACCEPTANCE.md](docs/ACCEPTANCE.md)，加固记录见 [PLAN.md](docs/PLAN.md) §8 与
+[PHASE_A.md](docs/PHASE_A.md)。
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 分层与依赖方向、一次运行的数据流、图状态生命周期、**9 条不变量**、取舍理由、扩展点 |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 分层与依赖方向、一次运行的数据流、图状态生命周期、**15 条不变量**、取舍理由、扩展点 |
+| [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | **环境配置完整流程**、前置条件、**实测依赖版本快照**、复现与导出、常见问题 |
 | [docs/USAGE.md](docs/USAGE.md) | 常见工作流、配置来源、**故障排查** |
 | [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) | **需求逐条对照**、自检清单、已知限制 |
+| [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | **保护什么、假设对手是谁**、T1（防误操作）/ T2（防越狱）的边界与达标前置条件 |
 | [docs/DEMO.md](docs/DEMO.md) | 答辩演示讲稿（配 `scripts/demo.py`） |
 | [docs/PLAN.md](docs/PLAN.md) | 开发方案、四个月排期、风险与进度 |
 
 ## 快速开始
 
+### 1. 环境准备
+
+本项目当前使用 conda 环境 **`agent`**（Python 3.11）。环境已存在时，激活即可：
+
 ```bash
-python -m venv .venv
-.venv/Scripts/activate            # macOS/Linux 用 source .venv/bin/activate
-pip install -e ".[dev,ui,web]"    # ui=TUI，web=Web 最小版，dev=测试
+conda activate agent
+```
 
+从零复现（在新机器上，或想重建环境时）：
+
+```bash
+conda create -n agent python=3.11 -y
+conda activate agent
+pip install -e ".[dev,ui,web]"     # 可编辑安装 + 各组依赖，见下表
+```
+
+`pip install` 的 extra 组按需取舍：
+
+| extra | 装了它才能用 |
+|---|---|
+| （无） | `agent doctor` / `sandbox-init` / `chat` / `run` 与各子命令（运行时依赖） |
+| `dev` | `pytest` / `ruff` / `pytest-xdist` / `pytest-cov` —— 跑测试与 lint |
+| `ui` | `agent tui`（Textual） |
+| `web` | `agent web`（FastAPI + uvicorn） |
+
+> ⚠️ **必须先激活环境**：`agent` 命令装在环境自己的 `Scripts/` 下
+> （conda 为 `D:\anaconda3\envs\agent\Scripts`），未激活时不在 PATH 上，直接敲 `agent` 会「找不到命令」。
+
+验证安装是否就绪：
+
+```bash
+python -c "import sys, sysconfig; print(sys.executable); print(sysconfig.get_path('scripts'))"
+agent --help
+```
+
+> **用普通 venv 替代 conda 也可以**：`python -m venv .venv` 后激活
+> （Windows `.venv/Scripts/activate`；macOS/Linux `source .venv/bin/activate`），
+> 后续安装与运行命令完全一致。`scripts/demo.py` 会依次在当前环境 / PATH / `.venv`
+> 中定位 `agent` 入口，两种布局都支持。
+
+完整流程（前置条件、实测依赖版本快照、复现与导出、常见问题）见
+[docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)。
+
+### 2. 配置与运行
+
+```bash
 cp .env.example .env              # 填入 DEEPSEEK_API_KEY
-
 agent doctor                      # 环境自检（不需要 API Key）
 agent sandbox-init                # 创建沙箱工作区
 agent run "看看当前工作区有哪些文件"
@@ -50,7 +95,7 @@ agent tui                         # 终端界面
 
 | 命令 | 用途 |
 |---|---|
-| `agent doctor` | 环境自检：Python、依赖、API Key、WSL 沙箱、检索后端 |
+| `agent doctor` | 环境自检：Python、依赖、API Key、WSL 沙箱、检索后端、shell 隔离后端 |
 | `agent sandbox-init` | 创建并校验沙箱工作区 |
 | `agent chat` | 纯流式对话（无工具），验证 API 联通 |
 | `agent run <指令>` | 跑一轮任务；`-C` 指定工作区，`--write` 放开写入，`-y` 跳过确认 |
@@ -87,6 +132,8 @@ TUI 快捷键 `Ctrl+Q` 退出 · `Ctrl+N` 新会话 · `Ctrl+L` 清屏。
                           └──────────────────────────┘
 ```
 
+沙箱以非 root 运行于 WSL2；可选 `AGENT_SHELL_SANDBOX=bwrap` 做挂载命名空间隔离（见「安全模型」）。
+
 **前端只消费事件**，不认识 LangGraph，也拿不到工具与沙箱 ——
 因此 CLI / TUI / Web 都无法绕过命令分级审批。事件是 pydantic 模型，
 `model_dump_json()` 出来即 SSE 数据帧，所以接 Web 不需要动编排层。
@@ -120,6 +167,25 @@ TUI 快捷键 `Ctrl+Q` 退出 · `Ctrl+N` 新会话 · `Ctrl+L` 清屏。
 - **fail closed**：审批记录缺失、答复无法解析、非交互环境（管道 / CI），一律按拒绝处理
 - 审批结果一次性有效，不会跨轮次误放行
 
+### 越界与隐藏命令
+
+**只读命令名不代表参数安全**：`cat ~/.ssh/id_rsa` 是只读命令，却读到工作区外。因此对
+本来会自动放行的命令再做一层升级，命中即降为 L2 人工确认：
+
+- 参数里出现 `~`、工作区外的绝对路径、`..` 穿越
+- 出现 `$()` / 反引号 / 变量替换（会执行隐藏命令）
+- `find -exec/-delete`、`git add -A`（整树暂存会带上 `.agent/`）、任何 `.agent` 引用
+
+危险模式判定是**引号感知**的：`grep "rm -rf" docs/` 只是搜索、不误判；而
+`sh -c "rm -rf /"`、`echo "$(rm -rf /)"` 里的内容会被执行，照常拦截。
+
+### 可选的隔离后端
+
+默认（`AGENT_SHELL_SANDBOX=off`）靠工作区 cwd 约束 + 上面的词法升级。要**内核级**隔离，
+设 `AGENT_SHELL_SANDBOX=bwrap`：命令在挂载命名空间里执行，`/home`、`/root`、`/mnt`
+（Windows 盘）不可见、仅工作区可写；配置了却不可用时**拒绝执行**，不静默降级。
+资产、假设与"从防误操作升到防越狱还差什么"见 [THREAT_MODEL.md](docs/THREAT_MODEL.md)。
+
 ## 工具
 
 | 工具 | 等级 | 说明 |
@@ -143,7 +209,8 @@ Git、依赖、检索做成结构化工具而不是让模型拼 shell 命令，�
 `--index-url=...`、`requests; rm -rf /`、`$(whoami)` 一类输入会在执行前被拒。
 
 另外 `.agent/`（agent 自己的工作目录）**禁止进入版本控制**：
-`git_add` 拒绝暂存、`git_commit` 提交前检查暂存区，用 shell `git add -A` 绕过也拦得住。
+`git_add` 拒绝暂存、`git_commit` 提交前检查暂存区；经 shell 的 `git add -A`（整树暂存）
+也会在策略层升级为需确认，而不是等到提交前才发现。
 
 ## 文件修改与回滚
 
@@ -151,7 +218,7 @@ Git、依赖、检索做成结构化工具而不是让模型拼 shell 命令，�
 内容经 base64 在沙箱内落盘，不经过命令行解释。
 
 - **精确替换**：`old_string` 必须唯一，出现 0 次或多次都拒绝并说明原因，让模型补充上下文
-- **路径双重校验**：词法归一化 + 沙箱内 `realpath`，符号链接指向外部会被拒
+- **路径双重校验**：词法归一化 + 沙箱内 `realpath`；符号链接指向外部（含**悬空链接**）会被拒
 - **写前备份**：覆盖或编辑前存入 `.agent/backups/<快照id>/`
 
 ```bash
@@ -223,11 +290,21 @@ python scripts/demo.py --only 3  # 只跑某个
 
 ## 开发
 
+环境准备（含 `dev` 依赖）见上方「快速开始 §1 环境准备」。注意 `pytest` 的 addopts
+默认带 `-n auto`，缺 `pytest-xdist` 会直接报错 —— 装 `.[dev]` 即可。
+
 ```bash
+conda activate agent  # 先激活项目环境（或 .venv）
+
+make check            # lint + 快反馈测试（推荐）
+make test-all         # 全量（含真实 WSL 沙箱）
+
 pytest -m "not wsl"   # 快反馈循环：单元 + TUI，约 45 秒
 pytest                # 全量（含真实 WSL 沙箱），约 2 分钟
 ruff check .          # lint
 ```
+
+CI（`.github/workflows/ci.yml`）在无 WSL 的托管 runner 上跑 `ruff` + `pytest -m "not wsl and not llm"`。
 
 默认并行（`-n auto`）。集成测试的开销几乎全在 `wsl.exe` 进程启动上（每次约 0.3 秒），
 完全受 I/O 限制，所以并行几乎线性加速 —— 串行跑一遍要十分钟。
@@ -257,6 +334,7 @@ ruff check .          # lint
 | `LANGSMITH_TRACING` / `LANGSMITH_API_KEY` | `false` / — | 调用链追踪 |
 | `AGENT_WSL_DISTRO` | `Ubuntu` | |
 | `AGENT_WSL_WORKSPACE` | 空 = `$HOME/agent-ws` | 沙箱内工作区，支持 Windows 路径写法 |
+| `AGENT_SHELL_SANDBOX` | `off` | `off` / `bwrap`（挂载命名空间隔离：`/home`、`/root`、`/mnt` 不可见，仅工作区可写）；配了 `bwrap` 却不可用时**拒绝执行**，不静默降级 |
 | `AGENT_SHELL_TIMEOUT` | `60` | 单条命令墙钟上限（秒） |
 | `AGENT_SHELL_CPU_SECONDS` / `_MEMORY_MB` / `_MAX_FILE_MB` / `_MAX_PROCESSES` | `600` / `0` / `512` / `1024` | 0 表示不限制 |
 | `AGENT_CHECKPOINT_PATH` | 空 = `<cwd>/.agent/checkpoints.sqlite` | 填 `:memory:` 强制不落盘 |

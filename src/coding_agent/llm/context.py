@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
 
@@ -45,28 +46,99 @@ class TrimReport:
         return self.trimmed > 0
 
 
-def message_chars(message: AnyMessage) -> int:
-    content = message.content
+def _content_text_len(content: Any) -> int:
+    """content 里的**真实文本**长度。
+
+    `str` 直接算；content blocks 列表只累加 `type == "text"` 的文本块
+    —— 用 `len(str(list))` 会连结构符号一起算，虚高得离谱。
+    """
     if isinstance(content, str):
         return len(content)
+    if isinstance(content, list):
+        total = 0
+        for block in content:
+            if isinstance(block, str):
+                total += len(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                total += len(str(block.get("text", "")))
+        return total
     return len(str(content))
+
+
+def message_chars(message: AnyMessage) -> int:
+    return _content_text_len(message.content)
 
 
 def total_chars(messages: list[AnyMessage]) -> int:
     return sum(message_chars(m) for m in messages)
 
 
+def _omission_note(omitted: int) -> str:
+    return f"\n…（此处省略 {omitted} 字符，内容已裁剪以控制上下文长度）"
+
+
+def _truncate_blocks(blocks: list[Any], limit: int) -> list[Any]:
+    """按顺序保留前 `limit` 个字符的文本，其余省略；非文本块原样保留。"""
+    out: list[Any] = []
+    remaining = limit
+    omitted = 0
+    truncated_at: int | None = None
+
+    def keep_text(text: str, is_block: bool, block: Any) -> None:
+        nonlocal remaining, omitted, truncated_at
+        if remaining <= 0:
+            omitted += len(text)
+            return
+        if len(text) <= remaining:
+            out.append(block if is_block else text)
+            remaining -= len(text)
+            return
+        kept = text[:remaining]
+        if is_block:
+            new_block = dict(block)
+            new_block["text"] = kept
+            out.append(new_block)
+        else:
+            out.append(kept)
+        omitted += len(text) - remaining
+        truncated_at = len(out) - 1
+        remaining = 0
+
+    for block in blocks:
+        if isinstance(block, str):
+            keep_text(block, False, block)
+        elif isinstance(block, dict) and block.get("type") == "text":
+            keep_text(str(block.get("text", "")), True, block)
+        else:
+            out.append(block)  # 图片等非文本块原样保留
+
+    if omitted:
+        note = _omission_note(omitted)
+        if truncated_at is None:
+            out.append(note)  # 恰好卡在块边界、没有可附着的文本块
+        elif isinstance(out[truncated_at], str):
+            out[truncated_at] += note
+        else:
+            patched = dict(out[truncated_at])
+            patched["text"] = str(patched.get("text", "")) + note
+            out[truncated_at] = patched
+    return out
+
+
 def _shorten(message: AnyMessage, limit: int) -> tuple[AnyMessage, bool]:
     """把超长的内容换成「开头 + 截断说明」。消息对象本身保留。"""
     content = message.content
-    if not isinstance(content, str) or len(content) <= limit:
-        return message, False
-
-    shortened = (
-        f"{content[:limit]}\n"
-        f"…（此处省略 {len(content) - limit} 字符，内容已裁剪以控制上下文长度）"
-    )
-    return message.model_copy(update={"content": shortened}), True
+    if isinstance(content, str):
+        if len(content) <= limit:
+            return message, False
+        return message.model_copy(
+            update={"content": content[:limit] + _omission_note(len(content) - limit)}
+        ), True
+    if isinstance(content, list):
+        if _content_text_len(content) <= limit:
+            return message, False
+        return message.model_copy(update={"content": _truncate_blocks(content, limit)}), True
+    return message, False
 
 
 def _is_trimmable(message: AnyMessage) -> bool:

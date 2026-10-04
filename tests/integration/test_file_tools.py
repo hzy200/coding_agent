@@ -246,6 +246,32 @@ def test_symlink_escape_is_rejected(tools, require_wsl, workspace) -> None:
         require_wsl.run(f"rm -rf {shlex.quote(outside)}")
 
 
+def test_dangling_symlink_escape_is_rejected(tools, require_wsl, workspace) -> None:
+    """悬空符号链接的逃逸：`-e` 对其为假。
+
+    只按存在性判断会跳过 realpath 校验，再顺着链接把内容写到工作区外 ——
+    这是「只做词法校验不够」的第二个变体，专门守住 `-e || -L` 这条判定。
+    """
+    outside = f"/tmp/agent-outside-{uuid4().hex[:8]}"
+    require_wsl.run(f"mkdir -p {shlex.quote(outside)}")
+    # 目标文件故意不创建，制造悬空链接
+    require_wsl.run(
+        f"ln -s {shlex.quote(outside + '/created.txt')} {shlex.quote(workspace + '/dangling')}"
+    )
+    try:
+        text, artifact = _invoke(
+            tools[WRITE_TOOL_NAME], path="dangling", content="pwned", reason="悬空链接穿透"
+        )
+        assert artifact.rejected, text
+        # 工作区外必须没有被创建出文件
+        leaked = require_wsl.run(
+            f"test -e {shlex.quote(outside + '/created.txt')} && echo leaked || echo safe"
+        )
+        assert "leaked" not in leaked.stdout
+    finally:
+        require_wsl.run(f"rm -rf {shlex.quote(outside)}")
+
+
 def test_symlink_inside_workspace_is_allowed(tools, require_wsl, workspace) -> None:
     """只禁止逃逸，不禁止工作区内部的正常符号链接。"""
     _invoke(tools[WRITE_TOOL_NAME], path="real/a.txt", content="inside", reason="准备")
@@ -277,3 +303,36 @@ def test_fs_read_respects_size_limit(require_wsl, tools, workspace) -> None:
     fs = SandboxFs(require_wsl, workspace)
     with pytest.raises(Exception, match="文件过大"):
         fs.read_text(f"{workspace}/big.txt", max_bytes=100)
+
+
+def test_fs_oversized_file_is_not_read_in_shell(require_wsl, tools, workspace) -> None:
+    """上限要在脚本内生效：超限时 stdout 里根本不能出现 DATA。
+
+    读后拒是不够的 —— base64 已经把整份文件物化进内存了。
+    """
+    _invoke(tools[WRITE_TOOL_NAME], path="big.txt", content="x" * 500, reason="准备")
+    fs = SandboxFs(require_wsl, workspace)
+    path = f"{workspace}/big.txt"
+
+    over = require_wsl.run(fs._stat_script(path, include_data=True, max_bytes=100))
+    assert "DATA=" not in over.stdout
+
+    under = require_wsl.run(fs._stat_script(path, include_data=True, max_bytes=10_000))
+    assert "DATA=" in under.stdout
+
+
+def test_fs_read_empty_file_returns_empty(require_wsl, tools, workspace) -> None:
+    """空文件应当读成空内容，而不是被当成「没取到内容」的失败。
+
+    `file_read` 的「（文件为空）」分支此前是死代码 —— 空文件在 SandboxFs 层就已报错。
+    """
+    require_wsl.run(f": > {shlex.quote(workspace + '/empty.txt')}")
+    fs = SandboxFs(require_wsl, workspace)
+    assert fs.read_text(f"{workspace}/empty.txt", max_bytes=1000) == ""
+
+    text, artifact = _invoke(
+        tools[READ_TOOL_NAME], path="empty.txt", reason="读空文件"
+    )
+    assert artifact.ok, text
+    assert "文件为空" in text
+

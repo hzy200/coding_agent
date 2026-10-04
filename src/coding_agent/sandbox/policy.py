@@ -2,6 +2,12 @@
 
 判定权完全在宿主，不依赖 LLM 的自我申报。复合命令按段分类取最高级别；
 解析失败或无法识别的一律降级为 MUTATE（需要人工确认），而不是放行。
+
+除了「命令名」的风险，还要看「参数是否越界」：`cat` 是只读命令，但
+`cat ~/.ssh/id_rsa` 会把工作区外的私钥读走。因此对本来会直接放行（L0/L1）
+的命令再查一层，出现命令替换/变量展开、工作区外路径、或 `find -exec`
+就升级到 L2，交人工确认。这是**词法级 best-effort 防线，不是内核级隔离** ——
+要做真正的隔离得靠 mount namespace（bwrap），当前不在范围内。
 """
 
 from __future__ import annotations
@@ -239,16 +245,194 @@ def _classify_git(sub: str, segment: str) -> Verdict:
     return Verdict(CommandLevel.READ, "git 无子命令", segment)
 
 
+# --------------------------------------------------------------------------
+# 引号感知：危险模式与重定向检查只看「会被执行」的部分
+#
+# 原始全文匹配会把引号里的普通字符串当成命令 —— `grep -rn "rm -rf" docs/`
+# 只是在搜索，却会被判 L3。这里把引号内的字面量屏蔽掉，但保留真正会执行的
+# 命令替换（$()/反引号）：`echo "$(rm -rf /)"` 里的内容照样会被执行。
+# --------------------------------------------------------------------------
+
+# 把字符串当命令执行的包装（`sh -c "..."`）：其引号内容必须照常扫描
+_SHELL_WRAPPER_RE = re.compile(r"\b(?:ba|z|da|k)?sh\b[^\n]*\s-[A-Za-z]*c\b")
+
+
+def _match_paren(text: str, open_idx: int) -> int:
+    """返回与 text[open_idx]（`(`）配对的 `)` 下标；找不到则返回末尾。"""
+    depth = 0
+    i = open_idx
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return n - 1
+
+
+def _keep_executables(inner: str) -> str:
+    """双引号内只有 $()/反引号会被执行：保留它们，其余字面量换成空格。"""
+    out: list[str] = []
+    i, n = 0, len(inner)
+    while i < n:
+        if inner.startswith("$(", i):
+            end = _match_paren(inner, i + 1)
+            out.append(inner[i : end + 1])
+            i = end + 1
+        elif inner[i] == "`":
+            j = inner.find("`", i + 1)
+            j = n if j == -1 else j + 1
+            out.append(inner[i:j])
+            i = j
+        elif inner[i] == "\\" and i + 1 < n:
+            i += 2
+        else:
+            out.append(" ")
+            i += 1
+    return "".join(out)
+
+
+def _mask_quoted(command: str) -> str:
+    """屏蔽引号内的字面量，保留命令替换内容。
+
+    单引号内一切皆字面量，整段屏蔽；双引号内只有 $()/反引号会执行，保留之。
+    屏蔽后长度与下标仍大致对齐，便于复用既有的正则。
+    """
+    out: list[str] = []
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\" and i + 1 < n:
+            out.append(command[i + 1])
+            i += 2
+        elif ch == "'":
+            j = command.find("'", i + 1)
+            j = n if j == -1 else j
+            out.append(" " * (j - i + 1))
+            i = j + 1
+        elif ch == '"':
+            j = i + 1
+            while j < n and command[j] != '"':
+                j += 2 if command[j] == "\\" else 1
+            out.append('"' + _keep_executables(command[i + 1 : j]) + '"')
+            i = j + 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------
+# 自动放行命令的越界/隐藏命令升级
+#
+# 只读白名单管的是「命令名」，管不了「参数」：cat/find/grep 都是只读命令，
+# 却能读到工作区外。这里是词法级的 best-effort 兜底 —— 不做硬拦截，
+# 而是升级到 L2 交人工确认，既挡住静默越权，又不误杀合法的一次性读取。
+# --------------------------------------------------------------------------
+
+_FIND_COMMANDS = frozenset({"find", "fd"})
+# 这些动作会在工作区里外执行/删除文件，只读命令名兜不住
+_FIND_EXEC_FLAGS = frozenset(
+    {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprintf", "-fls"}
+)
+# 设备/伪文件不是文件系统数据，读写无副作用
+_SAFE_EXTERNAL_PATHS = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"})
+
+# agent 自己的工作目录（备份/审计）。shell 不该碰它，git 也不该把它纳入版本控制。
+# 与 snapshots.AGENT_STATE_DIRNAME 一致；这里不跨模块 import，避免 policy 依赖存储层。
+_AGENT_STATE_DIR = ".agent"
+# `git add` 的整树暂存：会隐式把 .agent/ 一起加进索引
+_GIT_ADD_ALL = frozenset({"-A", "--all", "-a", "."})
+
+# 变量与命令替换：可能藏起真正的路径或命令（`cat $HOME/.ssh/id_rsa`）
+_HIDDEN_EXPANSION_RE = re.compile(r"\$[A-Za-z_{(]|`")
+
+
+def _is_external_path_token(token: str) -> bool:
+    """看起来像「工作区外的路径」。
+
+    相对路径按 cwd（= 工作区）解析，天然在界内，不在此列；只认绝对路径、
+    家目录 `~` 与向上一级穿越 `..`。工作区内的绝对路径也会被算进来 ——
+    这是有意的保守：让模型用相对路径或文件工具，代价只是一次确认。
+    """
+    if not token or token in _SAFE_EXTERNAL_PATHS:
+        return False
+    return (
+        token.startswith("/")
+        or token == "~"
+        or token.startswith("~/")
+        or token == ".."
+        or token.startswith("../")
+        or "/../" in token
+        or token.endswith("/..")
+    )
+
+
+def _escalate_auto_command(command: str) -> Verdict | None:
+    """对会直接放行的命令做越界检查；命中返回升级后的 Verdict，否则 None。"""
+    if _HIDDEN_EXPANSION_RE.search(command):
+        return Verdict(
+            CommandLevel.MUTATE,
+            "命令含变量或命令替换，可能隐藏工作区外的访问，需要人工确认",
+        )
+    for segment in split_segments(command):
+        words = _tokens(segment)
+        if not words:
+            continue
+        name = posixpath.basename(words[0])
+        if name in _FIND_COMMANDS and any(w in _FIND_EXEC_FLAGS for w in words[1:]):
+            return Verdict(
+                CommandLevel.MUTATE,
+                f"{name} 的 -exec/-delete 会在工作区外执行或删除，需要人工确认",
+                segment,
+            )
+        # `git add -A` / `git add .` 会隐式把 .agent/ 纳入索引 ——
+        # git_add 工具有过滤，但经 shell 走的是同一条 git，必须在这里补上
+        if name == "git" and words[1:2] == ["add"] and any(w in _GIT_ADD_ALL for w in words[2:]):
+            return Verdict(
+                CommandLevel.MUTATE,
+                f"git add 整树暂存可能把 {_AGENT_STATE_DIR}/ 纳入，需要人工确认",
+                segment,
+            )
+        for word in words[1:]:
+            # 选项值也可能带路径，例如 --file=/etc/shadow
+            candidate = word.split("=", 1)[1] if word.startswith("-") and "=" in word else word
+            if candidate == _AGENT_STATE_DIR or candidate.startswith(_AGENT_STATE_DIR + "/"):
+                return Verdict(
+                    CommandLevel.MUTATE,
+                    f"引用了 agent 内部目录 {_AGENT_STATE_DIR}/（备份与审计），需要人工确认",
+                    segment,
+                )
+            if _is_external_path_token(candidate):
+                return Verdict(
+                    CommandLevel.MUTATE,
+                    f"只读命令引用了工作区外的路径：{candidate}（需要确认）",
+                    segment,
+                )
+    return None
+
+
 def classify(command: str) -> Verdict:
     """对整条命令给出风险判定，取所有片段中的最高级别。"""
     if not command or not command.strip():
         return Verdict(CommandLevel.READ, "空命令")
 
+    # 危险模式只看会被执行的部分：引号里的普通字符串不算命令。
+    # 但 `sh -c "..."` 会把引号内容当命令执行，这时退回原始全文扫描。
+    masked = _mask_quoted(command)
+    danger_target = command if _SHELL_WRAPPER_RE.search(masked) else masked
     for pattern, desc in _DANGER_RE:
-        if pattern.search(command):
+        if pattern.search(danger_target):
             return Verdict(CommandLevel.DANGER, f"命中危险模式：{desc}")
 
-    stripped = _NOOP_REDIRECT_RE.sub("", command)
+    stripped = _NOOP_REDIRECT_RE.sub("", masked)
     if re.search(r">", stripped):
         return Verdict(CommandLevel.MUTATE, "输出重定向会写入文件，请改用文件工具")
 
@@ -259,4 +443,10 @@ def classify(command: str) -> Verdict:
             worst = verdict
         if worst.level == CommandLevel.DANGER:
             return worst
+
+    # 本来会直接放行的命令，再看参数是否越界（命令名只读 ≠ 参数安全）
+    escalated = _escalate_auto_command(command)
+    if escalated is not None and escalated.level > worst.level:
+        return escalated
     return worst
+

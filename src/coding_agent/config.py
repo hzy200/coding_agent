@@ -87,6 +87,9 @@ class Settings(BaseSettings):
     wsl_distro: str = Field(default="Ubuntu", alias="AGENT_WSL_DISTRO")
     # 留空表示自动使用沙箱内 $HOME/agent-ws，避免与真实用户名不匹配
     wsl_workspace: str = Field(default="", alias="AGENT_WSL_WORKSPACE")
+    # shell 隔离后端：off（默认，仅工作区 cwd 约束）| bwrap（挂载命名空间隔离）
+    # bwrap 模式下若沙箱内不可用，会**拒绝执行**（fail closed），不静默降级
+    shell_sandbox: str = Field(default="off", alias="AGENT_SHELL_SANDBOX")
     shell_timeout: int = Field(default=60, alias="AGENT_SHELL_TIMEOUT")
     # 沙箱资源上限，0 表示不限制
     shell_cpu_seconds: int = Field(default=600, alias="AGENT_SHELL_CPU_SECONDS")

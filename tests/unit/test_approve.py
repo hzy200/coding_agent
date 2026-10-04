@@ -266,3 +266,41 @@ def test_approvals_do_not_leak_into_next_round() -> None:
         assert len(tool.invocations) == 1
 
     _run(scenario())
+
+
+@pytest.mark.parametrize(
+    "tool_calls",
+    [
+        [{"name": "shell_exec", "args": {"command": "pip install requests"}, "id": ""}],  # 空 id
+        [  # 两个调用共用同一个 id
+            {"name": "shell_exec", "args": {"command": "pip install a"}, "id": "dup"},
+            {"name": "shell_exec", "args": {"command": "pip install b"}, "id": "dup"},
+        ],
+    ],
+)
+def test_empty_or_duplicate_call_id_fails_closed(tool_calls: list[dict]) -> None:
+    """id 为空或重复时审批结果无法配对，必须整批拒绝且不进入交互。"""
+
+    async def scenario() -> None:
+        tool = _RecordingTool()
+
+        def act_stub(state: AgentState) -> dict:
+            return {"messages": [AIMessage(content="", tool_calls=tool_calls)]}
+
+        graph = StateGraph(AgentState)
+        graph.add_node("act", act_stub)
+        graph.add_node(APPROVE, make_approval_gate_node(SessionPolicy(approval_mode=APPROVAL_ASK)))
+        graph.add_node(TOOLS, make_tools_node([tool]))
+        graph.add_edge(START, "act")
+        graph.add_edge("act", APPROVE)
+        graph.add_edge(APPROVE, TOOLS)
+        graph.add_edge(TOOLS, END)
+        app = graph.compile(checkpointer=MemorySaver())
+
+        result = await app.ainvoke(_initial(), CONFIG)
+
+        assert "__interrupt__" not in result  # 不该挂起等一个配不上号的答复
+        assert tool.invocations == []
+        assert result["messages"][-1].artifact["decision"] == "denied"
+
+    _run(scenario())

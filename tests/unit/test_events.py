@@ -14,6 +14,7 @@ from coding_agent.events import (
     PlanCreated,
     RunFailed,
     RunFinished,
+    RunStarted,
     StepFinished,
     StepStarted,
     ToolCallFinished,
@@ -37,6 +38,7 @@ def test_events_are_json_serializable_for_sse() -> None:
         StepFinished(index=0, text="done", budget_exhausted=True),
         ToolCallStarted(name="shell_exec", args={"command": "ls"}, level="L0 只读"),
         ToolCallFinished(name="shell_exec", ok=True, exit_code=0),
+        RunStarted(thread_id="t"),
         RunFinished(thread_id="t", answer="ok"),
         RunFailed(message="boom"),
     ):
@@ -46,6 +48,7 @@ def test_events_are_json_serializable_for_sse() -> None:
 
 def test_event_type_discriminator() -> None:
     assert PlanCreated().type == "plan_created"
+    assert RunStarted().type == "run_started"
     assert RunFinished().type == "run_finished"
 
 

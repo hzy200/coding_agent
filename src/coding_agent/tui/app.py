@@ -56,8 +56,8 @@ HELP_TEXT = """\
 快捷键  Ctrl+Q 退出 · Ctrl+N 新会话 · Ctrl+L 清屏
 """
 
-# 快照 id 形如 20261003T024018-a1b2c3；不符合就当路径处理
-_SNAPSHOT_ID_RE = re.compile(r"^\d{8}T\d{6}-[0-9a-f]{6}$")
+# 快照 id 形如 20261003T024018123456-a1b2c3（时间戳精确到微秒）；不符合就当路径处理
+_SNAPSHOT_ID_RE = re.compile(r"^\d{8}T\d{6,18}-[0-9a-f]{6}$")
 
 
 class PlanPanel(Static):

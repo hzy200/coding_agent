@@ -4,17 +4,59 @@
 
 ## 安装
 
+### 环境
+
+本项目当前使用 conda 环境 **`agent`**（Python 3.11）。环境已存在时激活即可：
+
 ```bash
-python -m venv .venv
-.venv/Scripts/activate            # macOS/Linux 用 source .venv/bin/activate
-pip install -e ".[dev,ui,web]"    # ui=TUI，web=Web 最小版，dev=测试
+conda activate agent
+```
+
+从零复现（新机器，或重建环境）：
+
+```bash
+conda create -n agent python=3.11 -y
+conda activate agent
+pip install -e ".[dev,ui,web]"     # 可编辑安装 + 各组依赖，见下表
+```
+
+`pip install` 的 extra 组按需取舍：
+
+| extra | 装了它才能用 |
+|---|---|
+| （无） | `agent doctor` / `sandbox-init` / `chat` / `run` 等运行时命令 |
+| `dev` | `pytest` / `ruff` / `pytest-xdist` / `pytest-cov` —— 跑测试与 lint |
+| `ui` | `agent tui`（Textual） |
+| `web` | `agent web`（FastAPI + uvicorn） |
+
+> ⚠️ **必须先激活环境**：`agent` 命令装在环境自己的 `Scripts/` 下
+> （conda 为 `D:\anaconda3\envs\agent\Scripts`），未激活时不在 PATH 上，
+> 直接敲 `agent` 会「找不到命令」。
+
+验证安装是否就绪：
+
+```bash
+python -c "import sys, sysconfig; print(sys.executable); print(sysconfig.get_path('scripts'))"
+agent --help
+```
+
+> **用普通 venv 替代 conda 也可以**：`python -m venv .venv` 后激活
+> （Windows `.venv/Scripts/activate`；macOS/Linux `source .venv/bin/activate`），
+> 后续安装与运行命令完全一致。`scripts/demo.py` 会依次在当前环境 / PATH / `.venv`
+> 中定位 `agent` 入口，两种布局都支持。
+
+前置条件、**实测依赖版本快照**、复现/导出与常见问题见 [ENVIRONMENT.md](ENVIRONMENT.md)。
+
+### 首次运行
+
+```bash
 cp .env.example .env              # 填入 DEEPSEEK_API_KEY
 agent doctor                      # 环境自检（不需要 API Key）
 agent sandbox-init                # 创建沙箱工作区
 ```
 
 `doctor` 会检查：Python、依赖、API Key、WSL 发行版、沙箱用户是否非 root、
-工作区是否存在、检索后端是 ripgrep 还是 grep。
+工作区是否存在、检索后端（ripgrep / grep）、shell 隔离后端（`off` / `bwrap`）。
 
 ## 权限模型
 
@@ -219,8 +261,14 @@ agent run -C /mnt/d/proj "..."    # WSL 路径写法
 内存默认不限 —— JVM / Node 会索取远超实际使用的虚拟地址空间。
 每次命令还有墙钟上限 `AGENT_SHELL_TIMEOUT`（默认 60s）。
 
+**可选隔离** `AGENT_SHELL_SANDBOX`（默认 `off`）：设为 `bwrap` 时命令在挂载命名空间里执行，
+`/home`、`/root`、`/mnt`（Windows 盘）不可见，仅工作区可写。需要沙箱内装好 bubblewrap
+（`sudo apt install bubblewrap`）；**配了却不可用时会拒绝执行**（fail closed），不静默降级。
+`agent doctor` 会报当前隔离后端是否可用。资产、假设与"从防误操作升到防越狱还差什么"见
+[THREAT_MODEL.md](THREAT_MODEL.md)。
+
 **路径安全**：词法归一化 + 沙箱内 `realpath` 双重校验。工作区里的符号链接
-若指向外部，读写都会被拒。
+若指向外部（含**悬空链接**）读写都会被拒。
 
 ## 会话状态存放在哪
 

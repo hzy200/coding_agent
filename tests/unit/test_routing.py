@@ -108,3 +108,31 @@ def test_zero_budget_disables_the_loop() -> None:
     state["verification"] = {"status": "failed"}
     state["retry"] = 0
     assert strict(state) == RESPOND
+
+
+# ---------------- 工具预算耗尽 ----------------
+
+def test_budget_exhausted_without_changes_stops_to_report() -> None:
+    """预算耗尽且没产生任何改动：不静默跳到下一步，停下来如实上报。"""
+    state = _state([AIMessage(content="停下了")], ["a", "b"], 0)
+    state["budget_exhausted"] = True
+    state["dirty"] = False
+    assert route_after_verify(state) == RESPOND
+
+
+def test_budget_exhausted_with_changes_still_advances() -> None:
+    """改过东西说明这一步有产出，不该被预算标记截断后续步骤。"""
+    state = _state([AIMessage(content="改完了")], ["a", "b"], 0)
+    state["budget_exhausted"] = True
+    state["dirty"] = True
+    assert route_after_verify(state) == ADVANCE
+
+
+def test_budget_exhausted_does_not_override_failed_verification() -> None:
+    """验证失败仍走修复循环，预算标记不能盖过它。"""
+    state = _state([AIMessage(content="x")], ["a"], 0)
+    state["budget_exhausted"] = True
+    state["dirty"] = False
+    state["verification"] = {"status": "failed"}
+    state["retry"] = 0
+    assert route_after_verify(state) == REPAIR

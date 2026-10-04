@@ -14,16 +14,39 @@ from __future__ import annotations
 
 import argparse
 import shlex
+import shutil
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import textwrap
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-AGENT = ROOT / ".venv" / "Scripts" / "agent.exe"
-if not AGENT.exists():  # macOS / Linux
-    AGENT = ROOT / ".venv" / "bin" / "agent"
+
+
+def _find_agent() -> Path | None:
+    """定位 agent 可执行文件。
+
+    优先当前解释器所在环境的入口：用 `sysconfig.get_path("scripts")` 才能同时覆盖
+    venv（`<env>/Scripts`）与 conda（`<env>/Scripts`，而 `python.exe` 在环境根）两种布局。
+    再退到 PATH，最后才回退到项目里的 `.venv`。
+    """
+    candidates: list[Path] = []
+    scripts = sysconfig.get_path("scripts")
+    if scripts:
+        candidates += [Path(scripts) / "agent.exe", Path(scripts) / "agent"]
+    on_path = shutil.which("agent")
+    if on_path:
+        candidates.append(Path(on_path))
+    candidates += [
+        ROOT / ".venv" / "Scripts" / "agent.exe",  # 历史默认（Windows）
+        ROOT / ".venv" / "bin" / "agent",           # 历史默认（macOS/Linux）
+    ]
+    return next((c for c in candidates if c.exists()), None)
+
+
+AGENT = _find_agent()
 
 # 放在 Windows 可见的临时目录下：走 /mnt/c 映射，`-C` 直接吃 Windows 路径，
 # 不必用 wslpath 反查（那条路会被 WSL 自己的诊断输出污染）
@@ -177,6 +200,7 @@ def show_scenario(index: int, scenario: dict) -> None:
 def run_agent(args: list[str], env: dict[str, str]) -> int:
     import os
 
+    assert AGENT is not None  # main() 已在调用前确保找到入口
     merged = os.environ.copy()
     merged.update(env)
     merged.setdefault("DEEPSEEK_MODEL", "deepseek-chat")  # 避开思考模式的 reasoning_content 问题
@@ -198,8 +222,11 @@ def main() -> int:
             show_scenario(i, scenario)
         return 0
 
-    if not AGENT.exists():
-        print(f"找不到 CLI：{AGENT}\n请先 pip install -e \".[dev,ui]\"")
+    if AGENT is None:
+        print(
+            "找不到 agent 可执行文件。请先激活环境（conda activate agent 或 .venv），"
+            '并执行 pip install -e ".[dev,ui]"。'
+        )
         return 2
 
     if not setup():

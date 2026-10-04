@@ -118,6 +118,11 @@ class AgentRuntime:
         self._snapshots: SnapshotStore | None = None
         self._memory: LongTermMemory | None = None
         self._fs: SandboxFs | None = None
+        # thread_id -> {call_id: ToolCallStarted}。
+        # 必须活在实例上而不是 `_stream` 局部：需要审批的调用在挂起时结束一次
+        # `_stream`，resume 时才在另一次 `_stream` 里执行。若只存局部变量，
+        # 审批恢复后的 tool_call 审计会丢掉命令参数（最高风险的那批调用）。
+        self._pending_calls: dict[str, dict[str, ToolCallStarted]] = {}
 
         # 显式传入的 checkpointer 由调用方负责生命周期；否则按配置自行管理
         self._external_checkpointer = checkpointer
@@ -191,10 +196,20 @@ class AgentRuntime:
 
         只取人和助手的自然语言往来；工具调用与工具结果不展示 ——
         它们是过程噪声，重新渲染只会淹没真正的对话。
+
+        刻意**直读 checkpoint 而不建图**：回放历史不该要求 API Key 或可用的沙箱
+        （`_ensure_graph` 会拉起 `build_llm` 与 WSL 探测）。
+        耦合点：直接取 `channel_values["messages"]`，与 `AgentState.messages` 对应。
         """
-        graph = await self._ensure_graph()
-        state = await graph.aget_state({"configurable": {"thread_id": thread_id}})
-        messages = (state.values or {}).get("messages") or []
+        saver = await self._checkpointer()
+        fetch = getattr(saver, "aget_tuple", None)
+        if fetch is None:
+            return []
+        tuple_ = await fetch({"configurable": {"thread_id": thread_id}})
+        if tuple_ is None:
+            return []
+        checkpoint = getattr(tuple_, "checkpoint", None) or {}
+        messages = (checkpoint.get("channel_values") or {}).get("messages") or []
 
         history: list[HistoryMessage] = []
         for message in messages:
@@ -232,6 +247,12 @@ class AgentRuntime:
         """
         return self.settings.model_copy(update={"wsl_workspace": self.workspace})
 
+    async def _checkpointer(self) -> Any:
+        """本次运行用的 checkpoint 后端：外部传入的优先，否则自管 sqlite。"""
+        if self._external_checkpointer is not None:
+            return self._external_checkpointer
+        return await self._store.aopen()
+
     async def _ensure_graph(self) -> Any:
         """编译后的图，首次使用时才构建。
 
@@ -239,14 +260,9 @@ class AgentRuntime:
         前端也会被迫要求 API Key、并做一次无谓的沙箱探测。
         """
         if self._graph is None:
-            checkpointer = (
-                self._external_checkpointer
-                if self._external_checkpointer is not None
-                else await self._store.aopen()
-            )
             self._graph = build_graph(
                 self.effective_settings,
-                checkpointer=checkpointer,
+                checkpointer=await self._checkpointer(),
                 allow_write=self.allow_write,
                 policy=self.policy,
             )
@@ -291,8 +307,8 @@ class AgentRuntime:
         settings = self.settings
         config = {
             "configurable": {"thread_id": thread_id},
-            # planner + 每步 (act/tools 对 + advance) + respond 的宽松上界
-            "recursion_limit": settings.max_plan_steps * (2 * settings.max_tool_rounds + 2) + 10,
+            # planner + 每步 (act→approval_gate→tools 计 3 个超步) + verify/advance + respond
+            "recursion_limit": settings.max_plan_steps * (3 * settings.max_tool_rounds + 3) + 10,
             # 这些会随 trace 一起上报，LangSmith 里可按会话/工作区/权限筛选
             "run_name": f"agent:{thread_id}",
             "tags": ["coding-agent", f"mode:{self.policy.approval_mode}"],
@@ -303,7 +319,10 @@ class AgentRuntime:
         step_idx = 0
         answer = ""
         streamed: list[str] = []
-        pending: dict[str, ToolCallStarted] = {}
+        # 跨 run/resume 的配对表；每次全新 run 清空，resume 时保留（见 __init__ 说明）
+        pending = self._pending_calls.setdefault(thread_id, {})
+        if fresh_run:
+            pending.clear()
         interrupted = False
         # 最近一次验证结果：repair 事件要带上它说明「在修什么」
         last_verification: dict[str, Any] = {}

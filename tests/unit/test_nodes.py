@@ -296,6 +296,44 @@ def test_denied_call_artifact_marks_decision() -> None:
     assert artifact["decision"] == "denied"
 
 
+# ---------------- dirty：变更必须触发验证 ----------------
+
+def test_named_mutation_tool_marks_dirty() -> None:
+    node = make_tools_node([_FakeTool("file_edit")])
+    message = _tool_call("file_edit", {"path": "a.py"})
+    out = node(_approved_state(message), None)
+    assert out["dirty"] is True
+
+
+def test_shell_mutation_marks_dirty() -> None:
+    """经 shell 的变更（sed -i 等）也必须置 dirty，否则 verify 会被跳过。"""
+    node = make_tools_node([_FakeTool("shell_exec")])
+    message = _tool_call("shell_exec", {"command": "sed -i 's/a/b/' f.py", "reason": "r"})
+    out = node(_approved_state(message), None)
+    assert out["dirty"] is True
+
+
+def test_shell_git_add_marks_dirty() -> None:
+    node = make_tools_node([_FakeTool("shell_exec")])
+    message = _tool_call("shell_exec", {"command": "git add src/", "reason": "r"})
+    out = node(_approved_state(message), None)
+    assert out["dirty"] is True
+
+
+def test_shell_read_does_not_mark_dirty() -> None:
+    node = make_tools_node([_FakeTool("shell_exec")])
+    message = _tool_call("shell_exec", {"command": "ls -la", "reason": "r"})
+    out = node(_approved_state(message), None)
+    assert out["dirty"] is False
+
+
+def test_denied_shell_mutation_does_not_mark_dirty() -> None:
+    node = make_tools_node([_FakeTool("shell_exec")])
+    message = _tool_call("shell_exec", {"command": "sed -i 's/a/b/' f.py"}, call_id="c1")
+    out = node({"messages": [message], "approvals": {"c1": "denied"}}, None)
+    assert out["dirty"] is False
+
+
 # ---------------- compose_system_prompt ----------------
 
 @pytest.mark.parametrize("allow_write", [True, False])

@@ -223,6 +223,18 @@ def doctor() -> None:
             )
         )
 
+        if settings.shell_sandbox == "bwrap":
+            available = sandbox.bwrap_available()
+            results.append(
+                _report(
+                    "shell 隔离 (bwrap)",
+                    available,
+                    "可用" if available else "已配置但不可用：agent run 会拒绝执行",
+                )
+            )
+        else:
+            results.append(_report("shell 隔离", True, "off（仅工作区 cwd 约束）"))
+
     console.print()
     if all(results):
         console.print("[green bold]全部通过[/]")

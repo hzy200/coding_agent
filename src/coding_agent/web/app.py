@@ -24,7 +24,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from coding_agent.config import Settings, get_settings
-from coding_agent.events import Event
+from coding_agent.events import Event, RunStarted
 from coding_agent.memory.sessions import SessionIndex, format_table_rows
 from coding_agent.runtime import AgentRuntime
 
@@ -113,7 +113,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async def stream() -> AsyncIterator[str]:
             import asyncio
 
-            yield f"data: {Event(type='run_started').model_dump_json()}\n\n"
+            yield _sse(RunStarted(thread_id=thread_id))
             try:
                 async for event in runtime.run(request.prompt, thread_id=thread_id):
                     yield _sse(event)

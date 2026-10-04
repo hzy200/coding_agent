@@ -51,6 +51,10 @@ def make_route_after_verify(max_repair_rounds: int) -> Callable[[AgentState], st
             if state.get("retry", 0) < max_repair_rounds:
                 return REPAIR
             return RESPOND
+        # 工具轮次耗尽、且这一步一个改动都没产生：多半是卡住了。
+        # 不静默跳到下一步，停下来让收尾如实说明，而不是假装这步已完成。
+        if state.get("budget_exhausted") and not state.get("dirty"):
+            return RESPOND
         return ADVANCE if has_more_steps(state) else RESPOND
 
     return route_after_verify

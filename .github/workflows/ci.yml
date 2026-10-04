@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    # GitHub 托管 runner 没有 WSL，因此只跑不依赖沙箱与 API Key 的用例。
+    # 需要真实 WSL 的集成测试在本地用 `pytest -m wsl` 跑。
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装（含开发依赖）
+        run: pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check src tests
+      - name: 测试
+        run: pytest -m "not wsl and not llm"

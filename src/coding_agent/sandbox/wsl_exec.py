@@ -89,11 +89,52 @@ def parse_distro_list(raw: bytes) -> list[str]:
     return names
 
 
+SHELL_SANDBOX_OFF = "off"
+SHELL_SANDBOX_BWRAP = "bwrap"
+
+# bubblewrap 的挂载布局：系统目录只读、`/home /root /tmp` 用空 tmpfs（真实家目录、
+# 密钥、`/mnt` 下的 Windows 盘都不可见），只把工作区按原路径可写挂回来。
+_BWRAP_RO_BINDS = (
+    ("/usr", "/usr"),
+    ("/bin", "/bin"),
+    ("/lib", "/lib"),
+    ("/etc", "/etc"),
+)
+_BWRAP_RO_BINDS_TRY = (("/lib64", "/lib64"), ("/sbin", "/sbin"))
+_BWRAP_TMPFS = ("/tmp", "/home", "/root")
+
+
+def build_bwrap_script(command: str, *, workdir: str, workspace: str = "") -> str:
+    """把一条命令包进 bubblewrap，返回可直接交给 bash 的脚本片段。
+
+    工作区（及其工作目录）以原路径可写挂回；其余只读或隐藏。`workdir` 必须存在，
+    否则 bwrap 会因为 `--chdir` 目标缺失而失败。
+    """
+    rw: list[str] = []
+    for path in (workdir, workspace):
+        if path and path not in rw:
+            rw.append(path)
+
+    args = ["bwrap", "--die-with-parent", "--unshare-user", "--unshare-pid"]
+    for src, dest in _BWRAP_RO_BINDS:
+        args += ["--ro-bind", src, dest]
+    for src, dest in _BWRAP_RO_BINDS_TRY:
+        args += ["--ro-bind-try", src, dest]
+    args += ["--proc", "/proc", "--dev", "/dev"]
+    for path in _BWRAP_TMPFS:
+        args += ["--tmpfs", path]
+    for path in rw:
+        args += ["--bind", path, path]
+    args += ["--chdir", workdir, "--", "bash", "-lc", command]
+    return " ".join(shlex.quote(part) for part in args)
+
+
 class WslSandbox:
     """在指定 WSL 发行版内执行 bash 命令。"""
 
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
+        self._bwrap_ok: bool | None = None
 
     # ---------------- 环境探测 ----------------
 
@@ -148,6 +189,16 @@ class WslSandbox:
             max_processes=settings.shell_max_processes,
         )
 
+    def bwrap_available(self) -> bool:
+        """沙箱内是否可用 bubblewrap（探测结果缓存）。
+
+        用 `_exec` 直接跑，避免 `run` 的隔离包装导致自举递归。
+        """
+        if self._bwrap_ok is None:
+            probe = self._exec("command -v bwrap >/dev/null 2>&1", wall=self.settings.shell_timeout)
+            self._bwrap_ok = probe.ok
+        return self._bwrap_ok
+
     def run(
         self,
         command: str,
@@ -155,13 +206,33 @@ class WslSandbox:
         cwd: str | None = None,
         timeout: int | None = None,
     ) -> ExecResult:
-        body = command if cwd is None else f"cd {shlex.quote(cwd)} && {command}"
         wall = timeout if timeout is not None else self.settings.shell_timeout
+        if self.settings.shell_sandbox == SHELL_SANDBOX_BWRAP:
+            if not self.bwrap_available():
+                raise WslUnavailableError(
+                    "AGENT_SHELL_SANDBOX=bwrap，但沙箱内 bubblewrap 不可用"
+                    "（未安装或用户命名空间被禁用）。请安装 bubblewrap，"
+                    "或改回 AGENT_SHELL_SANDBOX=off。"
+                )
+            workdir = cwd or self.settings.wsl_workspace
+            if not workdir:
+                raise WslUnavailableError(
+                    "AGENT_SHELL_SANDBOX=bwrap 需要明确的工作区路径（AGENT_WSL_WORKSPACE 或 cwd）"
+                )
+            body = build_bwrap_script(
+                command, workdir=workdir, workspace=self.settings.wsl_workspace
+            )
+        else:
+            body = command if cwd is None else f"cd {shlex.quote(cwd)} && {command}"
+
         # 沙箱内再套一层 timeout：外层的 proc.kill() 只能杀掉 wsl.exe，
         # Linux 侧的子进程要靠这一层才能确定性清理。
         script = wrap_with_limits(body, limits=self.limits, wall_seconds=wall, quote=shlex.quote)
-        limit = wall + OUTER_TIMEOUT_GRACE
+        return self._exec(script, wall=wall, command=command)
 
+    def _exec(self, script: str, *, wall: int, command: str = "") -> ExecResult:
+        """把脚本经 stdin 交给登录 bash 执行（不套隔离包装，供 run/探测复用）。"""
+        limit = wall + OUTER_TIMEOUT_GRACE
         started = time.perf_counter()
         try:
             proc = subprocess.Popen(
@@ -177,13 +248,16 @@ class WslSandbox:
         try:
             out, err = proc.communicate(script.encode("utf-8"), timeout=limit)
             exit_code = proc.returncode
-            # 沙箱内的 timeout 到点会返回约定码；外层超时只是兜底，正常不会触发
-            if exit_code == TIMEOUT_EXIT_CODE:
-                timed_out = True
         except subprocess.TimeoutExpired:
             proc.kill()
             out, err = proc.communicate()
             exit_code = TIMEOUT_EXIT_CODE
+            timed_out = True
+
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        # 沙箱内 timeout 到点返回约定码 124；但命令自身也可能恰好以 124 退出，
+        # 仅凭码会误报。真正的超时一定跑满了整段墙钟时间，据此区分。
+        if not timed_out and exit_code == TIMEOUT_EXIT_CODE and duration_ms >= wall * 1000 * 0.9:
             timed_out = True
 
         return ExecResult(
@@ -191,7 +265,7 @@ class WslSandbox:
             exit_code=exit_code,
             stdout=out.decode("utf-8", errors="replace"),
             stderr=err.decode("utf-8", errors="replace"),
-            duration_ms=int((time.perf_counter() - started) * 1000),
+            duration_ms=duration_ms,
             timed_out=timed_out,
         )
 

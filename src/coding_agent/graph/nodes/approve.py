@@ -80,6 +80,12 @@ def make_approval_gate_node(
         last = state["messages"][-1]
         calls = getattr(last, "tool_calls", None) or []
 
+        # call_id 缺失或重复时，审批结果无法安全地配回具体调用（会串号）→
+        # 一律拒绝，且不进入审批交互。这是 fail closed，不是可恢复的路径。
+        call_ids = [str(call.get("id", "")) for call in calls]
+        if len(call_ids) != len(set(call_ids)) or "" in call_ids:
+            return {"approvals": {call_id: DENIED for call_id in call_ids}}
+
         approvals: dict[str, str] = {}
         pending: list[dict[str, Any]] = []
 

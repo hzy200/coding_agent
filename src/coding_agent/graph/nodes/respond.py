@@ -27,6 +27,11 @@ REPAIRS_EXHAUSTED = (
     "明确指出你认为问题出在哪里、以及需要什么信息或授权才能继续。\n"
 )
 
+BUDGET_EXHAUSTED_NOTE = (
+    "注意：有一步在达到工具调用上限时停下，且没有产生任何文件改动，"
+    "该步骤很可能并没有完成。请在答复中如实说明未完成的部分，不要声称任务已完成。"
+)
+
 
 def make_respond_node(
     llm: BaseChatModel,
@@ -51,6 +56,10 @@ def make_respond_node(
                 issues=listed or "（无结构化信息）",
                 attempts=REPAIRS_EXHAUSTED.format(attempt=attempt) if exhausted else "",
             )
+
+        # 与 routing 的判定对齐：预算耗尽且没改动，说明这一步没做成
+        if state.get("budget_exhausted") and not state.get("dirty"):
+            system += "\n\n" + BUDGET_EXHAUSTED_NOTE
 
         history, _ = trim_messages(state["messages"], budget)
         messages = [

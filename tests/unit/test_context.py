@@ -170,3 +170,51 @@ def test_non_string_content_does_not_crash() -> None:
     tight = ContextBudget(max_chars=100, keep_recent=1, tool_chars=50)
     trimmed, _ = trim_messages(messages, tight)
     assert len(trimmed) == len(messages)
+
+
+# ---------------- content blocks ----------------
+
+def _blocks(*blocks: dict) -> AIMessage:
+    return AIMessage(content=list(blocks))
+
+
+def test_total_chars_counts_text_blocks_not_repr() -> None:
+    """字符预算要按真实文本算，不能按 list 的 repr 长度（会虚高）。"""
+    assert total_chars([_blocks({"type": "text", "text": "abcd"})]) == 4
+
+
+def test_block_content_is_trimmed() -> None:
+    """块内容的超长文本必须被裁剪 —— 否则裁剪不变量在块内容下失效。"""
+    target = _blocks({"type": "text", "text": "H" * 5_000})
+    messages = [HumanMessage(content="q")] * 5 + [target, HumanMessage(content="tail")]
+    tight = ContextBudget(max_chars=100, keep_recent=1, tool_chars=50)
+    trimmed, report = trim_messages(messages, tight)
+
+    content = trimmed[-2].content
+    assert isinstance(content, list)
+    text = content[0]["text"]
+    assert text.startswith("H")
+    assert len(text) < 5_000
+    assert "已裁剪" in text
+    assert report.changed
+
+
+def test_block_content_keeps_non_text_blocks() -> None:
+    """非文本块（图片等）要原样保留：裁剪只针对文本。"""
+    image = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+    target = _blocks({"type": "text", "text": "x" * 5_000}, image)
+    messages = [HumanMessage(content="q")] * 5 + [target, HumanMessage(content="tail")]
+    tight = ContextBudget(max_chars=100, keep_recent=1, tool_chars=50)
+    trimmed, _ = trim_messages(messages, tight)
+
+    assert image in trimmed[-2].content
+
+
+def test_short_block_content_is_untouched() -> None:
+    target = _blocks({"type": "text", "text": "short"})
+    messages = [HumanMessage(content="q")] * 5 + [target, HumanMessage(content="tail")]
+    roomy = ContextBudget(max_chars=10_000_000, keep_recent=1, tool_chars=100)
+    trimmed, report = trim_messages(messages, roomy)
+    assert trimmed[-2].content == target.content
+    assert not report.changed
+

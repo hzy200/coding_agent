@@ -14,6 +14,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from coding_agent.graph.nodes.planner import TaskPlan, make_planner_node
 from coding_agent.graph.nodes.respond import (
+    BUDGET_EXHAUSTED_NOTE,
     REPAIRS_EXHAUSTED,
     VERIFICATION_FAILED_NOTE,
     make_respond_node,
@@ -235,6 +236,19 @@ def test_respond_caps_the_issue_list() -> None:
     system = llm.seen[0].content
     assert "f9.py:1" in system
     assert "f10.py:1" not in system
+
+
+def test_respond_flags_budget_exhaustion_without_changes() -> None:
+    llm = _FakeLLM()
+    make_respond_node(llm)(_respond_state(budget_exhausted=True, dirty=False), None)
+    assert BUDGET_EXHAUSTED_NOTE in llm.seen[0].content
+
+
+def test_respond_does_not_flag_budget_exhaustion_when_changes_were_made() -> None:
+    """有改动时预算标记不代表没做成，不该制造噪音。"""
+    llm = _FakeLLM()
+    make_respond_node(llm)(_respond_state(budget_exhausted=True, dirty=True), None)
+    assert BUDGET_EXHAUSTED_NOTE not in llm.seen[0].content
 
 
 @pytest.mark.parametrize("retry", [0, 1, 3])

@@ -57,8 +57,8 @@
 # 1. 静态检查
 ruff check .
 
-# 2. 全量测试（含真实 WSL 沙箱）
-pytest                       # 期望 687 passed
+# 2. 全量测试（含真实 WSL 沙箱；LLM 用例需 API Key）
+pytest                       # 期望 749 passed（不含 LLM 标记的用例）
 
 # 3. 环境自检
 agent doctor                 # 期望「全部通过」
@@ -72,14 +72,15 @@ python scripts/demo.py --list
 python scripts/demo.py --only 1
 ```
 
-当前状态（2026-10-03 冻结）：
+当前状态（2026-10-04，缺陷收口后）：
 
 | 项 | 结果 |
 |---|---|
-| 测试 | **687 passed**，无跳过、无失败 |
-| 覆盖率 | **89%** |
-| lint | 干净 |
-| 全套耗时 | 约 2 分钟（`-n auto`）；快反馈模式 `pytest -m "not wsl"` 约 45 秒 |
+| 测试 | **749 passed**（不含 LLM 用例），WSL 集成 172，无失败 |
+| 覆盖率 | **89%**（`pytest -m "not llm" --cov`，含真实 WSL） |
+| lint | 干净（`ruff check src tests`） |
+| 快反馈 | `pytest -m "not wsl and not llm"` = **577 passed**，约 40 秒 |
+| CI | `.github/workflows/ci.yml`：`pip install -e ".[dev]"` → ruff → `pytest -m "not wsl and not llm"` |
 
 ## 4. 已知限制
 
@@ -99,6 +100,11 @@ python scripts/demo.py --only 1
 **内存上限默认关闭。**
 `ulimit -v` 默认 0（不限）。JVM / Node / 编译器会索取远超实际使用的
 虚拟地址空间，贸然开启会把正常构建打死。CPU 时间、文件大小、进程数都有限制。
+
+**经 shell 的修改不产生快照。**
+文件修改的正道是 `file_*` 工具（精确替换 + diff + 写前备份）。模型若用 shell
+改文件（`sed -i` 等，属 L2、需确认），会置 `dirty` 触发验证，但**不生成快照、
+不发 `FileChanged`** —— shell 输出无法结构化解析。「可回滚的修改流程」只覆盖文件工具路径。
 
 ### 待办
 
@@ -121,10 +127,13 @@ python scripts/demo.py --only 1
 自动化测试用 Textual 无头驱动（44 个用例），覆盖了事件映射、计划面板、
 审批弹窗、斜杠命令，但**配色、边框、滚动行为需要人工看一眼**。
 
-**沙箱隔离强度只到 WSL 发行版级。**
-非 root 用户 + 工作区限定 + 资源上限，但没有做容器级/命名空间级隔离。
-威胁模型是"防止模型误操作"，不是"防止模型主动越狱"——
-真要对抗性场景需要再加一层。
+**沙箱隔离：默认到 WSL 发行版级，可选用 bwrap 做内核级隔离。**
+默认（`AGENT_SHELL_SANDBOX=off`）是非 root 用户 + 工作区限定 + 资源上限 +
+**命令参数的词法越界升级**（只读命令引用 `~`/工作区外绝对路径/`..`、或含 `$()`/变量替换时
+升级到人工确认）。若要**内核级**隔离，设 `AGENT_SHELL_SANDBOX=bwrap`：命令在挂载命名空间里执行，
+`/home` `/root` `/mnt`（Windows 盘）不可见、仅工作区可写；配置了 bwrap 但沙箱内不可用时会
+**拒绝执行**（fail closed），不静默降级。默认威胁模型仍是"防误操作与静默越权"；
+完整的资产/假设/边界与"从 T1 升到 T2 还差什么"见 [THREAT_MODEL.md](THREAT_MODEL.md)。
 
 ## 5. 冻结
 

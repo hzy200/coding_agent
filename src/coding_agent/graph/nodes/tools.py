@@ -21,7 +21,7 @@ from langchain_core.tools import BaseTool
 
 from coding_agent.graph.nodes.approve import tool_level
 from coding_agent.graph.state import AgentState
-from coding_agent.sandbox.policy import APPROVED, AUTO, DENIED, DENY
+from coding_agent.sandbox.policy import APPROVED, AUTO, DENIED, DENY, CommandLevel
 from coding_agent.tools.artifacts import FileArtifact, ShellArtifact, pack, unpack
 from coding_agent.tools.deps import DEPS_INSTALL
 from coding_agent.tools.files import EDIT_TOOL_NAME, RESTORE_TOOL_NAME, WRITE_TOOL_NAME
@@ -51,6 +51,19 @@ _DENIED_TEXT = (
     "用户拒绝了这条命令，未执行任何操作。\n"
     "请换一种风险更低的方式达成同样的目的，或者直接向用户说明你需要什么授权。"
 )
+
+
+def _mutates_workspace(name: str, args: dict[str, Any]) -> bool:
+    """这次调用是否改动了工作区 —— 决定本步要不要跑验证。
+
+    只认工具名会漏掉经 shell 的修改（`sed -i` / `git add` / `mkdir`…）：
+    那些调用同样改了文件，却不会置 `dirty`，verify 就被跳过了。
+    """
+    if name in MUTATING_TOOLS:
+        return True
+    if name == SHELL_TOOL_NAME:
+        return tool_level(name, args) >= CommandLevel.LOW_WRITE
+    return False
 _POLICY_DENIED_TEXT = (
     "该命令被会话策略拒绝，未执行任何操作。\n"
     "当前会话没有开放这个风险等级，请改用更低风险的方式。"
@@ -140,7 +153,7 @@ def make_tools_node(
             if isinstance(artifact, dict):
                 artifact["decision"] = decision
                 content = pack(content, artifact)
-                if name in MUTATING_TOOLS and artifact.get("ok"):
+                if artifact.get("ok") and _mutates_workspace(name, args):
                     dirty = True
 
             results.append(

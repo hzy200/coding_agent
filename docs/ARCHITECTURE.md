@@ -157,6 +157,12 @@ Web 页面上一个按钮就能跳过命令分级。这条约束是安全属性�
 | 7 | **审计失败显式报出** | 审计有缺口是这个项目不能接受的失败模式 | `test_audit_write_failure_surfaces_as_run_failed` |
 | 8 | **所有写操作先留底** | 回滚本身也要可回滚 | `test_restore_is_itself_undoable` |
 | 9 | **路径校验做两次**（词法 + realpath） | 词法挡不住"先建符号链接再穿透" | `test_symlink_escape_is_rejected` |
+| 10 | **审批结果跨挂起/恢复仍带调用参数** | 挂起与恢复是两次 `_stream`；配对表若只活在局部，恢复后审计会丢掉参数——偏偏是最高风险的 L2/L3 调用 | `test_approved_tool_call_keeps_args_across_resume` |
+| 11 | **悬空符号链接也按目标解析**（`-e` 或 `-L` 都触发） | 悬空链接的 `-e` 为假，只判存在性会顺着链接写到工作区外 | `test_dangling_symlink_escape_is_rejected` |
+| 12 | **只读命令的参数越界升级到人工确认** | 命令名只读 ≠ 参数安全（`cat ~/.ssh/id_rsa`） | `test_external_access_is_escalated_to_confirmation` |
+| 13 | **引号内的字面量不当命令** | 危险模式匹配全文会把 `grep "rm -rf"` 误判；但 `$()` / `sh -c` 里的内容仍要扫 | `test_quoted_literals_are_not_dangerous` |
+| 14 | **读取的大小上限在读取之前生效** | 读完再拒等于先把整份文件物化进内存，上限形同虚设 | `test_fs_oversized_file_is_not_read_in_shell` |
+| 15 | **改了就要验证**：`dirty` 覆盖 shell 变更 | 只按工具名判定会漏掉经 shell 的修改（`sed -i`），verify 被跳过 | `test_shell_mutation_marks_dirty` |
 
 ## 7. 关键取舍
 

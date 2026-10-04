@@ -154,6 +154,13 @@ class ApprovalRequested(Event):
 # 收尾
 # --------------------------------------------------------------------------
 
+class RunStarted(Event):
+    """一轮运行开始。前端用它标记事件流的起点（Web SSE 的第一帧）。"""
+
+    type: Literal["run_started"] = "run_started"
+    thread_id: str = ""
+
+
 class RunFinished(Event):
     type: Literal["run_finished"] = "run_finished"
     thread_id: str = ""
@@ -178,6 +185,7 @@ EventType = (
     | Verification
     | RepairStarted
     | ApprovalRequested
+    | RunStarted
     | RunFinished
     | RunFailed
 )
