@@ -77,7 +77,7 @@ python scripts/demo.py --only 1
 | 项 | 结果 |
 |---|---|
 | 测试 | **805 passed**（不含 LLM 用例），WSL 集成 176，无失败 |
-| 覆盖率 | **89%**（`pytest -m "not llm" --cov`，含真实 WSL） |
+| 覆盖率 | **90%**（`pytest -m "not llm" --cov`，含真实 WSL） |
 | lint | 干净（`ruff check src tests`） |
 | 快反馈 | `pytest -m "not wsl and not llm"` = **629 passed**，约 40 秒 |
 | CI | `.github/workflows/ci.yml`：`pip install -e ".[dev]"` → ruff → `pytest -m "not wsl and not llm"` |
