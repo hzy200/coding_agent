@@ -29,6 +29,7 @@
 | 文档 | 内容 |
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 分层与依赖方向、一次运行的数据流、图状态生命周期、**15 条不变量**、取舍理由、扩展点 |
+| [docs/WORKFLOW.md](docs/WORKFLOW.md) | **三套工作流**（运行 / 开发 / 使用）的设计、路由与状态生命周期、**评价与改进项** |
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | **环境配置完整流程**、前置条件、**实测依赖版本快照**、复现与导出、常见问题 |
 | [docs/USAGE.md](docs/USAGE.md) | 常见工作流、配置来源、**故障排查** |
 | [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) | **需求逐条对照**、自检清单、已知限制 |
