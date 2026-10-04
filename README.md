@@ -335,7 +335,7 @@ CI（`.github/workflows/ci.yml`）在无 WSL 的托管 runner 上跑 `ruff` + `p
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `DEEPSEEK_API_KEY` | — | 必填 |
-| `DEEPSEEK_MODEL` | `deepseek-chat` | |
+| `DEEPSEEK_MODEL` | `deepseek-chat` | 建议保持默认；`deepseek-v4-flash` 有已知 `reasoning_content` 400（见 [USAGE 排查](docs/USAGE.md#模型报-reasoning_content-must-be-passed-back)） |
 | `LANGSMITH_TRACING` / `LANGSMITH_API_KEY` | `false` / — | 调用链追踪 |
 | `AGENT_WSL_DISTRO` | `Ubuntu` | |
 | `AGENT_WSL_WORKSPACE` | 空 = `$HOME/agent-ws` | 沙箱内工作区，支持 Windows 路径写法 |
