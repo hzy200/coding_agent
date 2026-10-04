@@ -50,6 +50,10 @@ class AuditRecord(BaseModel):
     # 提示词与最终答复都可能很长，落库前已截断
     detail: str = ""
 
+    # ---- run_end：模型回报的 token 用量（provider 未提供时为 None）----
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
     # ---- file_change ----
     path: str = ""
     action: str = ""

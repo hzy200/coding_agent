@@ -343,7 +343,7 @@ CI（`.github/workflows/ci.yml`）在无 WSL 的托管 runner 上跑 `ruff` + `p
 | `AGENT_SHELL_TIMEOUT` | `60` | 单条命令墙钟上限（秒） |
 | `AGENT_SHELL_CPU_SECONDS` / `_MEMORY_MB` / `_MAX_FILE_MB` / `_MAX_PROCESSES` | `600` / `0` / `512` / `1024` | 0 表示不限制 |
 | `AGENT_CHECKPOINT_PATH` | 空 = `<cwd>/.agent/checkpoints.sqlite` | 填 `:memory:` 强制不落盘 |
-| `AGENT_AUDIT_ENABLED` / `AGENT_AUDIT_DIR` | `true` / `<cwd>/.agent/audit` | |
+| `AGENT_AUDIT_ENABLED` / `AGENT_AUDIT_DIR` / `AGENT_AUDIT_MAX_MB` | `true` / `<cwd>/.agent/audit` / `0` | 审计日志；超 `MAX_MB` 就轮转（0=不轮转） |
 | `AGENT_APPROVAL_MODE` | `ask` | `ask` / `approve` / `deny` |
 | `AGENT_VERIFY_ENABLED` / `AGENT_VERIFY_COMMAND` | `true` / 空 | 自动验证；命令留空则按清单识别 |
 | `AGENT_CONTEXT_MAX_CHARS` / `_KEEP_RECENT` / `_TOOL_CHARS` | `60000` / `12` / `1500` | 上下文裁剪；max=0 关闭 |

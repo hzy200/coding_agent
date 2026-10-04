@@ -93,6 +93,19 @@ def _summarize_args(args: dict[str, Any]) -> str:
     return ", ".join(f"{k}={v}" for k, v in list(args.items())[:3])
 
 
+def _add_usage(message: Any, input_tokens: int, output_tokens: int) -> tuple[int, int]:
+    """把模型回报的用量累加进来（provider 没给就是 0）。
+
+    用 provider 的 `usage_metadata` 而不是 tokenizer：无需额外依赖，
+    口径也就是实际计费口径。
+    """
+    meta = getattr(message, "usage_metadata", None) or {}
+    return (
+        input_tokens + int(meta.get("input_tokens") or 0),
+        output_tokens + int(meta.get("output_tokens") or 0),
+    )
+
+
 class AgentRuntime:
     """跑一轮任务，产出事件流。"""
 
@@ -138,7 +151,9 @@ class AgentRuntime:
             else CheckpointStore(self.settings.resolved_checkpoint_path)
         )
         self.audit = audit or AuditLogger(
-            self.settings.resolved_audit_dir, enabled=self.settings.audit_enabled
+            self.settings.resolved_audit_dir,
+            enabled=self.settings.audit_enabled,
+            max_bytes=self.settings.audit_max_mb * 1024 * 1024,
         )
 
     @property
@@ -151,6 +166,10 @@ class AgentRuntime:
     @property
     def audit_path(self) -> Path:
         return self.audit.path
+
+    def audit_files(self) -> list[Path]:
+        """当天审计文件的全部片段（含轮转），供 `/audit` 等读取。"""
+        return self.audit.files_today()
 
     def _trace_metadata(self, thread_id: str) -> dict[str, Any]:
         """挂在 trace 上的运行上下文。
@@ -369,6 +388,9 @@ class AgentRuntime:
 
         answer = ""
         streamed: list[str] = []
+        # 模型回报的用量累计（provider 未提供则保持 0，审计里落成 None）
+        input_tokens = 0
+        output_tokens = 0
         # 跨 run/resume 的状态；每次全新 run 清空，resume 时保留（见 __init__ 说明）
         pending = self._pending_calls.setdefault(thread_id, {})
         progress = self._progress.setdefault(thread_id, {})
@@ -452,6 +474,9 @@ class AgentRuntime:
 
                     elif node == "act":
                         last = _last_message(update)
+                        input_tokens, output_tokens = _add_usage(
+                            last, input_tokens, output_tokens
+                        )
                         calls = getattr(last, "tool_calls", None) or []
                         for call in calls:
                             started = self._tool_started(
@@ -519,7 +544,11 @@ class AgentRuntime:
                         )
 
                     elif node == "respond":
-                        answer = text_of(_last_message(update))
+                        last = _last_message(update)
+                        input_tokens, output_tokens = _add_usage(
+                            last, input_tokens, output_tokens
+                        )
+                        answer = text_of(last)
 
         except Exception as exc:  # noqa: BLE001 - 编排层异常也要以事件形式报给前端
             # 尽力记一笔，但**不能让它顶掉真正的错误**：审计本身坏了的时候
@@ -549,6 +578,9 @@ class AgentRuntime:
                 kind=audit_models.RUN_END,
                 thread_id=thread_id,
                 detail=truncate(final),
+                # provider 未回报用量时保持 None（exclude_none 会省略该字段）
+                input_tokens=input_tokens or None,
+                output_tokens=output_tokens or None,
             )
         )
         yield RunFinished(thread_id=thread_id, answer=final)

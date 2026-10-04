@@ -393,6 +393,32 @@ def test_resume_does_not_emit_run_start_audit(tmp_path) -> None:
     assert kinds.count("run_start") == 1
 
 
+def test_run_end_audit_records_token_usage(tmp_path) -> None:
+    """把模型回报的 token 用量累计进 run_end 审计（不引入 tokenizer）。"""
+    script = [
+        _updates(act={"messages": [AIMessage(
+            content="",
+            usage_metadata={"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
+        )]}),
+        _updates(respond={"messages": [AIMessage(
+            content="done",
+            usage_metadata={"input_tokens": 30, "output_tokens": 10, "total_tokens": 40},
+        )]}),
+    ]
+    runtime, _ = _runtime(tmp_path, script)
+    _run(_collect(runtime))
+
+    end = next(r for r in read_records(runtime.audit_path) if r.kind == "run_end")
+    assert (end.input_tokens, end.output_tokens) == (130, 30)
+
+
+def test_run_end_has_no_token_fields_when_provider_omits_usage(tmp_path) -> None:
+    runtime, _ = _runtime(tmp_path, [_updates(respond={"messages": [AIMessage(content="x")]})])
+    _run(_collect(runtime))
+    end = next(r for r in read_records(runtime.audit_path) if r.kind == "run_end")
+    assert end.input_tokens is None and end.output_tokens is None
+
+
 def test_resume_is_capped_per_thread(tmp_path) -> None:
     """恢复次数有上限，防止前端反复 resume 绕开 recursion_limit。"""
     runtime, _ = _runtime(

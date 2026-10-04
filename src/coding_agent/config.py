@@ -116,6 +116,8 @@ class Settings(BaseSettings):
     audit_enabled: bool = Field(default=True, alias="AGENT_AUDIT_ENABLED")
     # 留空表示自动用 <当前目录>/.agent/audit
     audit_dir: str = Field(default="", alias="AGENT_AUDIT_DIR")
+    # 单个审计文件超过该大小（MB）就轮转；0 表示不轮转
+    audit_max_mb: int = Field(default=0, alias="AGENT_AUDIT_MAX_MB")
 
     # ---------- Agent 循环 ----------
     max_repair_rounds: int = Field(default=3, alias="AGENT_MAX_REPAIR_ROUNDS")

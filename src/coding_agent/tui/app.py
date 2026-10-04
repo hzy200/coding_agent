@@ -18,7 +18,7 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Input, RichLog, Static
 
-from coding_agent.audit import read_records
+from coding_agent.audit import read_records_many
 from coding_agent.config import Settings, get_settings
 from coding_agent.events import (
     ApprovalRequested,
@@ -619,7 +619,9 @@ class AgentTuiApp(App[None]):
             return
 
         path = self._runtime.audit_path
-        records = read_records(path, thread_id=self._session_id, limit=limit)
+        records = read_records_many(
+            self._runtime.audit_files(), thread_id=self._session_id, limit=limit
+        )
         if not records:
             self._write(f"本会话还没有审计记录：{path}", "dim")
             return

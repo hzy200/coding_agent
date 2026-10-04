@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 
 import pytest
 
-from coding_agent.audit import AuditError, AuditLogger, AuditRecord, read_records
+from coding_agent.audit import (
+    AuditError,
+    AuditLogger,
+    AuditRecord,
+    read_records,
+    read_records_many,
+)
 from coding_agent.audit.logger import now_iso, sanitize_args, truncate
+
+
+def _today() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%d")
 
 
 def _record(**kwargs) -> AuditRecord:
@@ -88,6 +99,46 @@ def test_corrupt_lines_are_skipped(tmp_path) -> None:
 
 def test_missing_file_returns_empty(tmp_path) -> None:
     assert read_records(tmp_path / "nope.jsonl") == []
+
+
+# ---------------- 按大小轮转 ----------------
+
+def test_rotation_is_off_by_default(tmp_path) -> None:
+    logger = AuditLogger(tmp_path)
+    for i in range(3):
+        logger.write(_record(tool=f"t{i}"))
+    assert logger.files_today() == [logger.path]
+    assert [r.tool for r in read_records(logger.path)] == ["t0", "t1", "t2"]
+
+
+def test_rotation_splits_when_file_exceeds_limit(tmp_path) -> None:
+    logger = AuditLogger(tmp_path, max_bytes=1)  # 每条都超限 → 每条开一片
+    for i in range(3):
+        logger.write(_record(tool=f"t{i}"))
+    files = logger.files_today()
+    assert [p.name for p in files] == [
+        f"{_today()}.jsonl",
+        f"{_today()}.1.jsonl",
+        f"{_today()}.2.jsonl",
+    ]
+
+
+def test_read_records_many_merges_pieces_in_order(tmp_path) -> None:
+    logger = AuditLogger(tmp_path, max_bytes=1)
+    for i in range(3):
+        logger.write(_record(tool=f"t{i}"))
+    merged = read_records_many(logger.files_today())
+    assert [r.tool for r in merged] == ["t0", "t1", "t2"]
+    assert [r.tool for r in read_records_many(logger.files_today(), limit=2)] == ["t1", "t2"]
+
+
+def test_files_today_sorts_numeric_indices(tmp_path) -> None:
+    """片号要按数字排序：字典序会把 .10 排到 .2 前面。"""
+    day = _today()
+    for name in (f"{day}.jsonl", f"{day}.2.jsonl", f"{day}.10.jsonl"):
+        (tmp_path / name).write_text("", encoding="utf-8")
+    names = [p.name for p in AuditLogger(tmp_path).files_today()]
+    assert names == [f"{day}.jsonl", f"{day}.2.jsonl", f"{day}.10.jsonl"]
 
 
 # ---------------- 脱敏 ----------------

@@ -28,4 +28,6 @@ def build_llm(settings: Settings, *, streaming: bool = True) -> ChatOpenAI:
         timeout=settings.llm_timeout,
         max_retries=2,
         streaming=streaming,
+        # 流式响应也带回 usage，运行结束才能在审计里记 token 用量
+        stream_usage=True,
     )

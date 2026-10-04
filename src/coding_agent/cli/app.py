@@ -28,7 +28,7 @@ from rich.markup import escape
 from rich.table import Table
 from rich.text import Text
 
-from coding_agent.audit import read_records
+from coding_agent.audit import AuditLogger, read_records, read_records_many
 from coding_agent.config import Settings, get_settings, shadowed_env_keys
 from coding_agent.events import (
     ApprovalRequested,
@@ -645,15 +645,23 @@ def audit(
 ) -> None:
     """查看审计日志。"""
     settings = get_settings()
-    today = f"{datetime.now(UTC):%Y-%m-%d}.jsonl"
-    target = Path(path) if path else settings.resolved_audit_dir / today
 
-    records = read_records(target, thread_id=thread_id or None, limit=limit)
+    if path:
+        label = str(Path(path))
+        records = read_records(Path(path), thread_id=thread_id or None, limit=limit)
+    else:
+        # 默认看当天全部片段（轮转后一天可能不止一个文件）
+        logger = AuditLogger(settings.resolved_audit_dir)
+        label = f"{settings.resolved_audit_dir}（{datetime.now(UTC):%Y-%m-%d}*.jsonl）"
+        records = read_records_many(
+            logger.files_today(), thread_id=thread_id or None, limit=limit
+        )
+
     if not records:
-        console.print(f"[dim]没有审计记录：{target}[/]")
+        console.print(f"[dim]没有审计记录：{label}[/]")
         return
 
-    console.print(f"[dim]{target}（最近 {len(records)} 条）[/]\n")
+    console.print(f"[dim]{label}（最近 {len(records)} 条）[/]\n")
     table = Table(show_header=True, header_style="bold", box=None)
     for column in ("时间", "类型", "工具/对象", "级别", "判定", "结果"):
         table.add_column(column)

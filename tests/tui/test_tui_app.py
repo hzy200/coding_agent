@@ -103,6 +103,9 @@ class FakeRuntime:
         for event in self._resume_events:
             yield event
 
+    def audit_files(self) -> list[Path]:
+        return [self.audit_path]
+
     def list_snapshots(self, *, limit: int = 20):
         return self._snapshots[:limit]
 

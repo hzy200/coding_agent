@@ -167,11 +167,15 @@ CI（ubuntu，无 WSL）: pip install -e ".[dev,ui,web]" → ruff → pytest -m 
 
 | 优先级 | 改进 | 要点 |
 |---|---|---|
-| P3 | token 级预算 | 引入 tokenizer 或按 `usage` 累计 |
-| P3 | 审计轮转 / 并发说明 | 审计按大小轮转；明确单 runtime 单会话假设 |
+| — | 暂无 | 工作流层面的已知项已全部处理 |
 
-已完成：`recursion_limit` 拓扑推导（W7）、shell 变更"未留底"提示、每 thread 恢复次数上限
-（`AGENT_MAX_RESUMES`）。
+**已完成**：`recursion_limit` 拓扑推导（W7）、shell 变更"未留底"提示、每 thread 恢复次数上限
+（`AGENT_MAX_RESUMES`）、token 用量累计（`usage_metadata` → `run_end` 审计，未引入 tokenizer）、
+审计按大小轮转（`AGENT_AUDIT_MAX_MB`，读取合并当天各片段）。
+
+**并发假设**：单个 `AgentRuntime` 实例按「单会话、单线程」使用；跨 thread 复用靠按 thread
+分桶的状态（`_pending_calls` / `_progress` / `_resume_counts`）。若要并发跑多个会话，
+应为每个会话各建一个 runtime——当前三种前端（CLI/TUI/Web 各请求）都满足这一假设。
 
 ## 7. 相关文档
 

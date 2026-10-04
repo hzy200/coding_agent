@@ -58,7 +58,7 @@
 ruff check .
 
 # 2. 全量测试（含真实 WSL 沙箱；LLM 用例需 API Key）
-pytest                       # 期望 799 passed（不含 LLM 标记的用例）
+pytest                       # 期望 805 passed（不含 LLM 标记的用例）
 
 # 3. 环境自检
 agent doctor                 # 期望「全部通过」
@@ -76,10 +76,10 @@ python scripts/demo.py --only 1
 
 | 项 | 结果 |
 |---|---|
-| 测试 | **799 passed**（不含 LLM 用例），WSL 集成 176，无失败 |
+| 测试 | **805 passed**（不含 LLM 用例），WSL 集成 176，无失败 |
 | 覆盖率 | **89%**（`pytest -m "not llm" --cov`，含真实 WSL） |
 | lint | 干净（`ruff check src tests`） |
-| 快反馈 | `pytest -m "not wsl and not llm"` = **623 passed**，约 40 秒 |
+| 快反馈 | `pytest -m "not wsl and not llm"` = **629 passed**，约 40 秒 |
 | CI | `.github/workflows/ci.yml`：`pip install -e ".[dev]"` → ruff → `pytest -m "not wsl and not llm"` |
 
 ## 4. 已知限制
@@ -118,8 +118,9 @@ python scripts/demo.py --only 1
 沙箱里没装 ripgrep，自动退到 `grep`/`find`。两个后端输出格式一致（grep 分支显式 `-E`），
 但大仓库上 grep 会更慢。`agent doctor` 会显示当前用的是哪个。
 
-**上下文裁剪按字符数，不是 token。**
-够用且不引入 tokenizer 依赖，但不如按 token 精确。
+**上下文裁剪按字符数，不是 token；用量则按 provider 回报累计。**
+裁剪不引入 tokenizer 依赖（按字符，够用）；每次运行的 token 用量取自模型的
+`usage_metadata`，累计写入 `run_end` 审计（provider 未回报时为 `None`）。
 
 ### 未验证
 
