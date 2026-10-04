@@ -119,7 +119,7 @@ START → planner ─→ act ─┬─(有 tool_calls)→ approval_gate ─→ t
 | W4 | 预算按轮次/字符，非 token | 长会话成本不精确 | 设计取舍 |
 | W5 | 单线程假设 | 同一 runtime 跨 thread 复用靠分桶状态 | 被前端单会话使用遮掩 |
 | W6 | `run()` 读记忆是 WSL 硬依赖 | 无沙箱环境不可用 | **已缓解**（失败转事件 + 单测注入） |
-| W7 | `recursion_limit` 系数靠注释解释 | 改拓扑易再次算歪 | 待办：抽 `estimate_recursion_limit()` |
+| W7 | `recursion_limit` 系数靠注释解释 | 改拓扑易再次算歪 | **已修**（`estimate_recursion_limit()`，含单测） |
 
 ---
 
@@ -167,7 +167,6 @@ CI（ubuntu，无 WSL）: pip install -e ".[dev,ui,web]" → ruff → pytest -m 
 
 | 优先级 | 改进 | 要点 |
 |---|---|---|
-| P1 | `estimate_recursion_limit()`（W7） | 从拓扑推导限额并加单测，避免改拓扑后再算歪 |
 | P2 | shell 变更的"未留底"提示 | 经 shell 的改动无快照，工具回灌提示改用 `file_edit` |
 | P2 | 每 thread 的中断/恢复总次数上限 | 防"反复挂起-恢复"绕开 `recursion_limit` |
 | P3 | token 级预算 | 引入 tokenizer 或按 `usage` 累计 |

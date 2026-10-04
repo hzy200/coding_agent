@@ -39,7 +39,7 @@ from coding_agent.events import (
     ToolCallStarted,
     Verification,
 )
-from coding_agent.graph.build import build_graph
+from coding_agent.graph.build import build_graph, estimate_recursion_limit
 from coding_agent.memory.checkpointer import CheckpointStore
 from coding_agent.memory.longterm import LongTermMemory
 from coding_agent.memory.sessions import SessionIndex
@@ -331,8 +331,10 @@ class AgentRuntime:
         settings = self.settings
         config = {
             "configurable": {"thread_id": thread_id},
-            # planner + 每步 (act→approval_gate→tools 计 3 个超步) + verify/advance + respond
-            "recursion_limit": settings.max_plan_steps * (3 * settings.max_tool_rounds + 3) + 10,
+            # 按图拓扑推导，别再把系数算歪（见 estimate_recursion_limit）
+            "recursion_limit": estimate_recursion_limit(
+                settings.max_plan_steps, settings.max_tool_rounds
+            ),
             # 这些会随 trace 一起上报，LangSmith 里可按会话/工作区/权限筛选
             "run_name": f"agent:{thread_id}",
             "tags": ["coding-agent", f"mode:{self.policy.approval_mode}"],

@@ -44,6 +44,20 @@ from coding_agent.sandbox.policy import SessionPolicy
 from coding_agent.sandbox.wsl_exec import WslSandbox
 from coding_agent.tools.registry import build_tools
 
+# planner + respond 各算 1 次，再留少量余量给中断/重入
+_RECURSION_MARGIN = 10
+
+
+def estimate_recursion_limit(max_plan_steps: int, max_tool_rounds: int) -> int:
+    """按图拓扑估算 `recursion_limit`，避免把限额算小导致正常任务误报。
+
+    每步最坏走过的超步：`act` 被调 (轮次+1) 次（末次超预算不产 tool_calls，直接去 verify）
+    + `approval_gate` 与 `tools` 各 轮次 次 + `verify` / `advance` 各 1 次，
+    即 `3×轮次 + 3`。再乘步数，加上 `planner`/`respond` 与少量余量。
+    """
+    per_step = (max_tool_rounds + 1) + 2 * max_tool_rounds + 2
+    return max_plan_steps * per_step + _RECURSION_MARGIN
+
 
 def build_graph(
     settings: Settings | None = None,
