@@ -316,6 +316,10 @@ CI（`.github/workflows/ci.yml`）在无 WSL 的托管 runner 上跑 `ruff` + `p
 `tests/tui` 与 `tests/unit/test_web_app.py`（无头驱动界面，注入假 runtime ——
 不需要 API Key 也不需要 WSL）。
 
+**非 WSL 用例不得真的执行沙箱命令**：`tests/conftest.py` 的守卫会把这类调用换成
+当场失败（任何平台，不只是 Linux CI）。确实要探测宿主 WSL 的用例（如 `doctor`）
+标 `@pytest.mark.wsl_env`；需要真实沙箱的集成用例标 `@pytest.mark.wsl`。
+
 关键回归都有测试守着，完整清单见
 [ARCHITECTURE.md 第 6 节「不变量」](docs/ARCHITECTURE.md#6-不变量)。
 

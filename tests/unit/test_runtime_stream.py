@@ -393,6 +393,37 @@ def test_resume_does_not_emit_run_start_audit(tmp_path) -> None:
     assert kinds.count("run_start") == 1
 
 
+def test_plan_survives_resume_for_step_events(tmp_path) -> None:
+    """挂起恢复后，advance 发出的 StepStarted 仍要带上计划文案。
+
+    否则恢复后的步进事件会退化成 total=0、空文案（前端看不到"第几步、做什么"）。
+    """
+    request = {"call_id": "c1", "tool": "shell_exec", "command": "pip install x",
+               "level": "L2 变更性", "reason": "装依赖"}
+    run_script = [
+        _updates(planner={"plan": ["第一步", "第二步"]}),
+        _updates(act={"messages": [
+            _tool_call("shell_exec", {"command": "pip install x"}, "c1")
+        ]}),
+        _updates(__interrupt__=(_Interrupt({"requests": [request]}),)),
+    ]
+    resume_script = [
+        _updates(tools={"messages": [_shell_result("c1", decision="approved")]}),
+        _updates(verify={"verification": {"status": "ok", "command": "pytest", "summary": "OK"}}),
+        _updates(advance={"step_idx": 1}),
+        _updates(respond={"messages": [AIMessage(content="完成")]}),
+    ]
+    runtime, _ = _runtime(tmp_path, run_script)
+    _run(_collect(runtime))
+
+    runtime._graph = FakeGraph(resume_script)
+    events = _run(_collect_resume(runtime, {"c1": True}))
+
+    steps = [e for e in events if isinstance(e, StepStarted)]
+    assert steps, "恢复后应仍发出 StepStarted"
+    assert (steps[-1].index, steps[-1].total, steps[-1].text) == (1, 2, "第二步")
+
+
 def test_approved_tool_call_keeps_args_across_resume(tmp_path) -> None:
     """需要审批的调用跨 run/resume 后，审计仍要记到命令参数。
 
@@ -434,6 +465,22 @@ def test_approved_tool_call_keeps_args_across_resume(tmp_path) -> None:
 
 
 # ---------------- 异常 ----------------
+
+class _BoomMemory:
+    def load(self) -> list[str]:
+        raise RuntimeError("记忆文件读不了")
+
+
+def test_memory_read_failure_becomes_run_failed(tmp_path) -> None:
+    """启动即失败（读记忆需要 WSL）也要以事件收尾，而不是裸异常外泄给前端。"""
+    runtime, _ = _runtime(tmp_path, [])
+    runtime._memory = _BoomMemory()  # type: ignore[assignment]
+
+    events = _run(_collect(runtime))
+
+    assert isinstance(events[0], RunFailed)
+    assert "RuntimeError" in events[0].message
+
 
 def test_graph_failure_becomes_run_failed(tmp_path) -> None:
     boom = RuntimeError("模型炸了")

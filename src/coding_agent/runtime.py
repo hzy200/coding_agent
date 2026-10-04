@@ -123,6 +123,10 @@ class AgentRuntime:
         # `_stream`，resume 时才在另一次 `_stream` 里执行。若只存局部变量，
         # 审批恢复后的 tool_call 审计会丢掉命令参数（最高风险的那批调用）。
         self._pending_calls: dict[str, dict[str, ToolCallStarted]] = {}
+        # thread_id -> {plan, step_idx, last_verification}。
+        # 同理：挂起与恢复是两次 `_stream`，这些"用于翻译事件"的状态若只存局部，
+        # 恢复后的 StepStarted 会退化成空文案、repair 事件会丢 summary。
+        self._progress: dict[str, dict[str, Any]] = {}
 
         # 显式传入的 checkpointer 由调用方负责生命周期；否则按配置自行管理
         self._external_checkpointer = checkpointer
@@ -278,6 +282,26 @@ class AgentRuntime:
         事件流以 `RunFinished` / `RunFailed` 收尾；若以 `ApprovalRequested` 收尾，
         说明图已挂起等待人工确认，前端应收集答复后调用 `resume()`。
         """
+        # 读记忆（工作区 `.agent/memory.md`）需要沙箱；失败也必须以事件收尾，
+        # 否则异常会在生成器第一步裸抛给前端（CLI 会以 traceback 收场）。
+        try:
+            memories = self.memories()
+        except Exception as exc:  # noqa: BLE001 - 启动即失败同样是编排层错误
+            detail = f"{type(exc).__name__}: {exc}"
+            try:
+                self._audit(
+                    AuditRecord(
+                        ts=now_iso(),
+                        kind=audit_models.RUN_ERROR,
+                        thread_id=thread_id,
+                        detail=detail,
+                    )
+                )
+            except Exception:  # noqa: BLE001, S110 - 已在错误路径上，不再二次抛出
+                pass
+            yield RunFailed(message=detail)
+            return
+
         inputs = {
             "messages": [HumanMessage(content=prompt)],
             "cwd": self.workspace,
@@ -285,7 +309,7 @@ class AgentRuntime:
             "budget_exhausted": False,
             "approvals": {},
             # 每轮都从文件重新读：会话中途 /remember 加的事实应当立刻生效
-            "memories": self.memories(),
+            "memories": memories,
         }
         async for event in self._stream(
             inputs, thread_id=thread_id, fresh_run=True, prompt=prompt
@@ -315,17 +339,19 @@ class AgentRuntime:
             "metadata": self._trace_metadata(thread_id),
         }
 
-        plan: list[str] = []
-        step_idx = 0
         answer = ""
         streamed: list[str] = []
-        # 跨 run/resume 的配对表；每次全新 run 清空，resume 时保留（见 __init__ 说明）
+        # 跨 run/resume 的状态；每次全新 run 清空，resume 时保留（见 __init__ 说明）
         pending = self._pending_calls.setdefault(thread_id, {})
+        progress = self._progress.setdefault(thread_id, {})
         if fresh_run:
             pending.clear()
+            progress.clear()
+        plan: list[str] = progress.setdefault("plan", [])
+        step_idx: int = progress.get("step_idx", 0)
         interrupted = False
         # 最近一次验证结果：repair 事件要带上它说明「在修什么」
-        last_verification: dict[str, Any] = {}
+        last_verification: dict[str, Any] = progress.setdefault("last_verification", {})
 
         try:
             if fresh_run:
@@ -368,6 +394,8 @@ class AgentRuntime:
                     if node == "planner":
                         plan = [s for s in (update.get("plan") or []) if s]
                         step_idx = 0
+                        progress["plan"] = plan
+                        progress["step_idx"] = 0
                         if plan:
                             self._audit(
                                 AuditRecord(
@@ -386,6 +414,7 @@ class AgentRuntime:
 
                     elif node == "advance":
                         step_idx = int(update.get("step_idx", step_idx + 1))
+                        progress["step_idx"] = step_idx
                         yield StepStarted(
                             index=step_idx,
                             total=len(plan),
@@ -426,6 +455,7 @@ class AgentRuntime:
                         raw = update.get("verification") or {}
                         if raw:
                             last_verification = raw
+                            progress["last_verification"] = raw
                             event = self._verification(raw)
                             self._audit(
                                 AuditRecord(

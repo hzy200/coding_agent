@@ -184,6 +184,7 @@ def test_sessions_respects_limit(tmp_path, monkeypatch) -> None:
 
 # ---------------- doctor ----------------
 
+@pytest.mark.wsl_env
 def test_doctor_reports_environment(tmp_path, monkeypatch) -> None:
     _use_settings(monkeypatch, _scoped(tmp_path, langsmith_tracing=False))
     result = runner.invoke(cli_app.app, ["doctor"])
@@ -197,12 +198,14 @@ def test_doctor_reports_environment(tmp_path, monkeypatch) -> None:
     assert result.exit_code in (0, 1)
 
 
+@pytest.mark.wsl_env
 def test_doctor_reports_missing_api_key(tmp_path, monkeypatch) -> None:
     _use_settings(monkeypatch, _scoped(tmp_path, deepseek_api_key=""))
     runner.invoke(cli_app.app, ["doctor"])
     assert "DEEPSEEK_API_KEY" in _text()
 
 
+@pytest.mark.wsl_env
 def test_doctor_warns_on_shadowed_config(tmp_path, monkeypatch) -> None:
     """环境变量被 .env 覆盖这件事必须显式说出来。"""
     env_file = tmp_path / ".env"

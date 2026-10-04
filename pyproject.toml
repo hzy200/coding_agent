@@ -53,6 +53,7 @@ addopts = "-q -n auto --dist loadfile"
 markers = [
     "wsl: 需要本机可用的 WSL2 发行版",
     "llm: 需要 DEEPSEEK_API_KEY",
+    "wsl_env: 显式探测宿主 WSL 环境（如 doctor），允许真实执行沙箱命令",
 ]
 
 [tool.ruff]
