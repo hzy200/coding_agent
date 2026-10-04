@@ -58,7 +58,7 @@
 ruff check .
 
 # 2. 全量测试（含真实 WSL 沙箱；LLM 用例需 API Key）
-pytest                       # 期望 749 passed（不含 LLM 标记的用例）
+pytest                       # 期望 799 passed（不含 LLM 标记的用例）
 
 # 3. 环境自检
 agent doctor                 # 期望「全部通过」
@@ -76,10 +76,10 @@ python scripts/demo.py --only 1
 
 | 项 | 结果 |
 |---|---|
-| 测试 | **749 passed**（不含 LLM 用例），WSL 集成 172，无失败 |
+| 测试 | **799 passed**（不含 LLM 用例），WSL 集成 176，无失败 |
 | 覆盖率 | **89%**（`pytest -m "not llm" --cov`，含真实 WSL） |
 | lint | 干净（`ruff check src tests`） |
-| 快反馈 | `pytest -m "not wsl and not llm"` = **577 passed**，约 40 秒 |
+| 快反馈 | `pytest -m "not wsl and not llm"` = **623 passed**，约 40 秒 |
 | CI | `.github/workflows/ci.yml`：`pip install -e ".[dev]"` → ruff → `pytest -m "not wsl and not llm"` |
 
 ## 4. 已知限制

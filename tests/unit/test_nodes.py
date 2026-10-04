@@ -334,6 +334,28 @@ def test_denied_shell_mutation_does_not_mark_dirty() -> None:
     assert out["dirty"] is False
 
 
+def test_shell_mutation_warns_about_missing_snapshot() -> None:
+    """经 shell 的改动没有留底、无法 file_restore —— 要提示模型改用文件工具。"""
+    node = make_tools_node([_FakeTool("shell_exec")])
+    message = _tool_call("shell_exec", {"command": "sed -i 's/a/b/' f.py", "reason": "r"})
+    out = node(_approved_state(message), None)
+    assert "没有快照留底" in out["messages"][0].content
+
+
+def test_shell_read_has_no_snapshot_warning() -> None:
+    node = make_tools_node([_FakeTool("shell_exec")])
+    message = _tool_call("shell_exec", {"command": "ls -la", "reason": "r"})
+    out = node(_approved_state(message), None)
+    assert "没有快照留底" not in out["messages"][0].content
+
+
+def test_file_edit_has_no_snapshot_warning() -> None:
+    """文件工具本身就有快照，不该出现这条提示。"""
+    node = make_tools_node([_FakeTool("file_edit")])
+    out = node(_approved_state(_tool_call("file_edit", {"path": "a.py"})), None)
+    assert "没有快照留底" not in out["messages"][0].content
+
+
 # ---------------- compose_system_prompt ----------------
 
 @pytest.mark.parametrize("allow_write", [True, False])

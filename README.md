@@ -347,7 +347,7 @@ CI（`.github/workflows/ci.yml`）在无 WSL 的托管 runner 上跑 `ruff` + `p
 | `AGENT_APPROVAL_MODE` | `ask` | `ask` / `approve` / `deny` |
 | `AGENT_VERIFY_ENABLED` / `AGENT_VERIFY_COMMAND` | `true` / 空 | 自动验证；命令留空则按清单识别 |
 | `AGENT_CONTEXT_MAX_CHARS` / `_KEEP_RECENT` / `_TOOL_CHARS` | `60000` / `12` / `1500` | 上下文裁剪；max=0 关闭 |
-| `AGENT_MAX_PLAN_STEPS` / `_TOOL_ROUNDS` / `_REPAIR_ROUNDS` | `5` / `12` / `3` | 循环上限 |
+| `AGENT_MAX_PLAN_STEPS` / `_TOOL_ROUNDS` / `_REPAIR_ROUNDS` / `_MAX_RESUMES` | `5` / `12` / `3` / `50` | 循环与恢复次数上限 |
 
 状态文件位置（宿主侧与沙箱侧是两处，别混淆）见
 [USAGE.md](docs/USAGE.md)。

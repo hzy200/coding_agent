@@ -393,6 +393,30 @@ def test_resume_does_not_emit_run_start_audit(tmp_path) -> None:
     assert kinds.count("run_start") == 1
 
 
+def test_resume_is_capped_per_thread(tmp_path) -> None:
+    """恢复次数有上限，防止前端反复 resume 绕开 recursion_limit。"""
+    runtime, _ = _runtime(
+        tmp_path, [_updates(respond={"messages": [AIMessage(content="x")]})], max_resumes=1
+    )
+    first = _run(_collect_resume(runtime, {"c1": True}))
+    assert not any(isinstance(e, RunFailed) for e in first)
+
+    second = _run(_collect_resume(runtime, {"c1": True}))
+    assert isinstance(second[0], RunFailed)
+    assert "上限" in second[0].message
+
+
+def test_fresh_run_resets_resume_counter(tmp_path) -> None:
+    runtime, _ = _runtime(
+        tmp_path, [_updates(respond={"messages": [AIMessage(content="x")]})], max_resumes=1
+    )
+    _run(_collect_resume(runtime, {"c1": True}))  # 用掉一次
+    _run(_collect(runtime))                        # 新一轮应把计数清零
+
+    again = _run(_collect_resume(runtime, {"c1": True}))
+    assert not any(isinstance(e, RunFailed) for e in again)
+
+
 def test_plan_survives_resume_for_step_events(tmp_path) -> None:
     """挂起恢复后，advance 发出的 StepStarted 仍要带上计划文案。
 

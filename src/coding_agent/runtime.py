@@ -127,6 +127,8 @@ class AgentRuntime:
         # 同理：挂起与恢复是两次 `_stream`，这些"用于翻译事件"的状态若只存局部，
         # 恢复后的 StepStarted 会退化成空文案、repair 事件会丢 summary。
         self._progress: dict[str, dict[str, Any]] = {}
+        # thread_id -> 已 resume 次数（fresh run 归零），用于封顶挂起-恢复循环
+        self._resume_counts: dict[str, int] = {}
 
         # 显式传入的 checkpointer 由调用方负责生命周期；否则按配置自行管理
         self._external_checkpointer = checkpointer
@@ -320,7 +322,31 @@ class AgentRuntime:
         """带着审批结果继续被挂起的图。
 
         decisions: call_id -> 是否批准。缺失的按拒绝处理（fail closed）。
+
+        恢复次数有上限（`AGENT_MAX_RESUMES`）：每次 resume 是一次新的图调用，
+        `recursion_limit` 会重置，所以要在编排层封顶，防止反复挂起-恢复耗不尽。
         """
+        count = self._resume_counts.get(thread_id, 0) + 1
+        self._resume_counts[thread_id] = count
+        if count > self.settings.max_resumes:
+            detail = (
+                f"会话 {thread_id} 的中断/恢复次数已超过上限 "
+                f"{self.settings.max_resumes}，已停止。"
+            )
+            try:
+                self._audit(
+                    AuditRecord(
+                        ts=now_iso(),
+                        kind=audit_models.RUN_ERROR,
+                        thread_id=thread_id,
+                        detail=detail,
+                    )
+                )
+            except Exception:  # noqa: BLE001, S110 - 已在错误路径上，不再二次抛出
+                pass
+            yield RunFailed(message=detail)
+            return
+
         command = Command(resume=dict(decisions))
         async for event in self._stream(command, thread_id=thread_id, fresh_run=False):
             yield event
@@ -349,6 +375,7 @@ class AgentRuntime:
         if fresh_run:
             pending.clear()
             progress.clear()
+            self._resume_counts[thread_id] = 0
         plan: list[str] = progress.setdefault("plan", [])
         step_idx: int = progress.get("step_idx", 0)
         interrupted = False

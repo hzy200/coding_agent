@@ -52,6 +52,12 @@ _DENIED_TEXT = (
     "请换一种风险更低的方式达成同样的目的，或者直接向用户说明你需要什么授权。"
 )
 
+# 经 shell 的改动不会生成快照/FileChanged —— 提示模型改用受控的文件工具
+_SHELL_MUTATION_NOTE = (
+    "\n提示：这条命令改动了工作区，但**没有快照留底**，无法用 file_restore 回滚。"
+    "后续改动请改用 file_write / file_edit，才能被记录并可回滚。"
+)
+
 
 def _mutates_workspace(name: str, args: dict[str, Any]) -> bool:
     """这次调用是否改动了工作区 —— 决定本步要不要跑验证。
@@ -152,9 +158,11 @@ def make_tools_node(
             # 执行过的调用补上审批结果，供审计区分 auto 与 approved
             if isinstance(artifact, dict):
                 artifact["decision"] = decision
-                content = pack(content, artifact)
                 if artifact.get("ok") and _mutates_workspace(name, args):
                     dirty = True
+                    if name == SHELL_TOOL_NAME:
+                        content += _SHELL_MUTATION_NOTE
+                content = pack(content, artifact)
 
             results.append(
                 ToolMessage(

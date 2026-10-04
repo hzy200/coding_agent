@@ -167,10 +167,11 @@ CI（ubuntu，无 WSL）: pip install -e ".[dev,ui,web]" → ruff → pytest -m 
 
 | 优先级 | 改进 | 要点 |
 |---|---|---|
-| P2 | shell 变更的"未留底"提示 | 经 shell 的改动无快照，工具回灌提示改用 `file_edit` |
-| P2 | 每 thread 的中断/恢复总次数上限 | 防"反复挂起-恢复"绕开 `recursion_limit` |
 | P3 | token 级预算 | 引入 tokenizer 或按 `usage` 累计 |
 | P3 | 审计轮转 / 并发说明 | 审计按大小轮转；明确单 runtime 单会话假设 |
+
+已完成：`recursion_limit` 拓扑推导（W7）、shell 变更"未留底"提示、每 thread 恢复次数上限
+（`AGENT_MAX_RESUMES`）。
 
 ## 7. 相关文档
 

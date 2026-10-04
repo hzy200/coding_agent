@@ -121,6 +121,8 @@ class Settings(BaseSettings):
     max_repair_rounds: int = Field(default=3, alias="AGENT_MAX_REPAIR_ROUNDS")
     max_tool_rounds: int = Field(default=12, alias="AGENT_MAX_TOOL_ROUNDS")
     max_plan_steps: int = Field(default=5, alias="AGENT_MAX_PLAN_STEPS")
+    # 同一会话内「挂起→恢复」的总次数上限，防前端反复 resume 绕开 recursion_limit
+    max_resumes: int = Field(default=50, alias="AGENT_MAX_RESUMES")
     # ask（逐条询问）| approve（一律放行）| deny（一律拒绝）
     approval_mode: str = Field(default="ask", alias="AGENT_APPROVAL_MODE")
     llm_temperature: float = Field(default=0.0, alias="AGENT_LLM_TEMPERATURE")
