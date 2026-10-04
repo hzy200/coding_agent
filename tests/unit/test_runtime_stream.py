@@ -39,6 +39,22 @@ from coding_agent.tools.artifacts import FileArtifact, ShellArtifact
 THREAD = "t-1"
 
 
+class _NullMemory:
+    """`run()` 开头会读 `.agent/memory.md`（走 WSL）。
+
+    这些是**无沙箱**的单元测试：图已被 FakeGraph 顶替，记忆也一并屏蔽，
+    否则在 Linux CI（无 wsl.exe）上会因读记忆文件而失败。
+    """
+
+    def load(self) -> list[str]:
+        return []
+
+
+def _no_wsl(runtime: AgentRuntime) -> AgentRuntime:
+    runtime._memory = _NullMemory()  # type: ignore[assignment]
+    return runtime
+
+
 class FakeGraph:
     """按脚本回放 LangGraph 的流；可选在某个位置抛异常。"""
 
@@ -88,7 +104,7 @@ def _runtime(tmp_path, script: list, *, error: Exception | None = None, **overri
     )
     graph = FakeGraph(script, error=error)
     runtime._graph = graph  # 绕开建图（建图需要 API Key）
-    return runtime, graph
+    return _no_wsl(runtime), graph
 
 
 async def _collect(runtime: AgentRuntime, prompt: str = "干活") -> list[Event]:
@@ -440,6 +456,7 @@ def test_audit_write_failure_surfaces_as_run_failed(tmp_path) -> None:
         settings, workspace="/mnt/d/proj", audit=AuditLogger(blocker / "audit")
     )
     runtime._graph = FakeGraph([_updates(respond={"messages": [AIMessage(content="x")]})])
+    _no_wsl(runtime)
 
     events = _run(_collect(runtime))
     assert isinstance(events[-1], RunFailed)

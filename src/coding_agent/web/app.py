@@ -77,7 +77,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         try:
             payload["workspace"] = runtime.workspace
         except Exception as exc:  # noqa: BLE001 - 沙箱不可用也要如实报出来
-            payload["error"] = f"{type(exc).__name__}: {exc}"
+            # 不要覆盖已有诊断（如"未配置 API Key"）：两处问题都应可见
+            detail = f"{type(exc).__name__}: {exc}"
+            payload["error"] = f"{payload['error']}；{detail}" if payload["error"] else detail
         finally:
             await runtime.aclose()
         return payload
