@@ -145,6 +145,64 @@ TUI 快捷键 `Ctrl+Q` 退出 · `Ctrl+N` 新会话 · `Ctrl+L` 清屏。
 
 细节见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
+## 项目结构
+
+```
+CodingAgent/
+├─ src/coding_agent/           # 全部源码（依赖方向自上而下，见「架构」）
+│  ├─ runtime.py               # 唯一编排入口：图 + 沙箱 + 策略 + 审计 → 领域事件
+│  ├─ events.py                # 前端契约：领域事件（CLI/TUI/Web 共用）
+│  ├─ config.py                # 配置（.env > 环境变量 > 默认值）
+│  ├─ messages.py              # 消息取文本（str / content blocks 统一）
+│  ├─ diffing.py               # unified diff 生成与统计
+│  ├─ graph/                   # LangGraph 编排
+│  │  ├─ state.py              #   跨节点状态（生命周期见 ARCHITECTURE §5）
+│  │  ├─ routing.py            #   条件边（纯函数）
+│  │  ├─ build.py              #   组装图 + recursion_limit 推导
+│  │  └─ nodes/                #   planner·act·approve·tools·verify·repair·advance·respond
+│  ├─ sandbox/                 # 执行安全层
+│  │  ├─ wsl_exec.py           #   WSL2 执行（脚本经 stdin）+ 可选 bwrap 隔离
+│  │  ├─ limits.py             #   ulimit / timeout 资源上限
+│  │  ├─ policy.py             #   命令分级、越界升级、引号感知、fail-closed
+│  │  ├─ pathguard.py          #   词法路径守卫 + Windows↔WSL 转换
+│  │  ├─ fs.py                 #   沙箱内文件读写（词法 + realpath 双重校验）
+│  │  └─ snapshots.py          #   写前快照（回滚；回滚本身可回滚）
+│  ├─ tools/                   # 能力层：模型可调用的结构化工具
+│  │  ├─ registry.py           #   工具注册（决定暴露哪些）
+│  │  ├─ artifacts.py          #   结构化产物封装（事件/审计据此，不解析文本）
+│  │  ├─ shell.py              #   shell_exec（按命令内容分级）
+│  │  ├─ files.py              #   file_read/write/edit/restore（精确替换 + 备份）
+│  │  ├─ git.py  deps.py       #   git_* / deps_*（参数逐条 quote、包名白名单）
+│  │  ├─ search.py             #   search_code / find_files（rg 优先，grep 兜底）
+│  │  └─ testrun.py            #   run_tests + 验证输出结构化解析
+│  ├─ llm/                     # DeepSeek 客户端 · 提示词 · 上下文裁剪
+│  ├─ memory/                  # checkpoint(SQLite) · 会话索引(归纳审计) · 长期记忆
+│  ├─ audit/                   # JSONL 审计（按天分文件，可按大小轮转）
+│  └─ cli/ tui/ web/           # 三种前端：只消费事件，不得导入 tools/sandbox
+├─ tests/                      # 测试（三层，见「开发」）
+│  ├─ unit/                    #   纯逻辑（含假图驱动的 runtime 事件流）
+│  ├─ integration/             #   真实 WSL 沙箱（无环境自动跳过）
+│  └─ tui/                     #   无头驱动界面
+├─ docs/                       # 9 份文档（见上表）
+├─ scripts/demo.py             # 四场景演示脚本（对应四个创新点）
+├─ .github/workflows/ci.yml    # CI：ruff + `pytest -m "not wsl and not llm"`
+├─ Makefile                    # `make check` / `make test-all`
+├─ pyproject.toml              # 依赖与打包（extras: dev/ui/web）
+└─ README.md
+```
+
+**想改什么，看哪里**：
+
+| 想改… | 落点 |
+|---|---|
+| 命令分级 / 安全规则 | `sandbox/policy.py`（新工具记得在 `graph/nodes/approve.py::tool_level` 登记等级） |
+| 加一个工具 | `tools/` 写 builder → `tools/registry.py` 注册 → `approve.tool_level` 登记 |
+| 加一个图节点 | `graph/nodes/` 写节点 → `graph/build.py` 接线 → `graph/routing.py` 加边 → `runtime._stream` 翻译事件 |
+| 加一个前端 | 只依赖 `runtime.AgentRuntime` + `events`，**不要**导入 `tools/`/`sandbox/` |
+| 配置项 | `config.py` 加字段 → `.env.example` / README 配置表同步 |
+
+**不纳入版本控制**：`.env`（密钥）、`.agent/`（审计、checkpoint、快照、记忆）、`.venv/`。
+
 ## 安全模型
 
 命令按风险分四级，判定**完全在宿主侧完成**，不依赖模型自我申报：
