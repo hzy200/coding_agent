@@ -709,12 +709,30 @@ def test_the_baseline_file_itself_does_not_count_as_dirty() -> None:
     少了这条会有个很别扭的死结：第一次写 baseline 把树弄脏，于是"再测另一个
     套件"永远被拒。踩过一次，白跑一轮（约 550 万 token）。
     """
-    from harness import _dirty_entries, baseline_path
+    from harness import _dirty_entries
 
-    target = str(baseline_path("long"))
+    # **夹具必须与 git 的真实输出同格式**：仓库相对、posix 分隔。
+    # 第一版这里用的是绝对 Windows 路径，而真实输出是 `?? tests/eval/...` ——
+    # 「绝对路径 endswith 绝对路径」恰好为真，于是**测试通过而功能是坏的**。
+    target = "tests/eval/baseline_long.json"
     porcelain = "\n".join([" M src/coding_agent/runtime.py", f"?? {target}", ""])
 
     assert _dirty_entries(porcelain) != []  # 默认算脏
     # 只忽略目标文件，其余照旧
     assert _dirty_entries(porcelain, ignore=(target,)) == [" M src/coding_agent/runtime.py"]
     assert _dirty_entries(f"?? {target}\n", ignore=(target,)) == []
+
+
+def test_repo_relative_normalises_absolute_paths_for_the_guard() -> None:
+    """守卫传进来的是绝对路径，而 git 输出是仓库相对 —— 中间必须换算。
+
+    少了这一步 `ignore` 会**静默失效**（匹配永远为假），而失败形态只是"守卫仍在
+    拒绝"，看起来像别的地方脏了（实际白跑过一轮）。
+    """
+    from harness import _repo_relative, baseline_path
+
+    assert _repo_relative((str(baseline_path("long")),)) == (
+        "tests/eval/baseline_long.json",
+    )
+    # 仓库外的路径原样返回，不参与过滤（也不该因此炸掉）
+    assert _repo_relative(("D:/somewhere/else.json",)) == ("D:/somewhere/else.json",)

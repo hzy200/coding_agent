@@ -852,14 +852,45 @@ def eval_audit_dir() -> Path:
 def _dirty_entries(porcelain: str, *, ignore: tuple[str, ...] = ()) -> list[str]:
     """从 `git status --porcelain` 的输出里挑出"算脏"的条目。
 
+    **`ignore` 用仓库相对、posix 分隔的路径** —— 与 porcelain 输出同口径。
+    这里踩过一次：拿**绝对 Windows 路径**去 `str.endswith` 匹配，而那行实际是
+    `?? tests/eval/baseline_long.json`，永远匹配不上；偏偏测试夹具也照绝对路径
+    构造，于是**测试通过而功能是坏的**。夹具必须与真实输出同格式。
+
     纯函数，便于直接测（否则只能在某棵树的具体状态上断言 —— 那种用例在干净的
     检出上会失败）。
     """
-    return [
-        line
-        for line in porcelain.splitlines()
-        if line.strip() and not any(line.endswith(path) for path in ignore)
-    ]
+    skipped = {entry.replace("\\", "/").lstrip("/") for entry in ignore}
+    kept: list[str] = []
+    for line in porcelain.splitlines():
+        if not line.strip():
+            continue
+        # 前两个字符是状态码，第三格是空格；重命名形如 `R  old -> new`
+        path = line[3:].strip().strip('"')
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        if path.replace("\\", "/").lstrip("/") in skipped:
+            continue
+        kept.append(line)
+    return kept
+
+
+def _repo_relative(paths: tuple[str, ...]) -> tuple[str, ...]:
+    """把（可能是绝对的）路径换算成仓库相对、posix 分隔的形式。"""
+    root = Path(__file__).resolve().parents[2]
+    relatives: list[str] = []
+    for raw in paths:
+        candidate = Path(raw)
+        try:
+            resolved = (
+                candidate.resolve()
+                if candidate.is_absolute()
+                else (root / candidate).resolve()
+            )
+            relatives.append(resolved.relative_to(root).as_posix())
+        except (OSError, ValueError):
+            relatives.append(str(raw).replace("\\", "/"))
+    return tuple(relatives)
 
 
 def git_state(*, ignore: tuple[str, ...] = ()) -> dict[str, object]:
@@ -889,7 +920,9 @@ def git_state(*, ignore: tuple[str, ...] = ()) -> dict[str, object]:
             return ""
         return proc.stdout.strip()
 
-    changed = _dirty_entries(_git("status", "--porcelain"), ignore=ignore)
+    changed = _dirty_entries(
+        _git("status", "--porcelain"), ignore=_repo_relative(ignore)
+    )
     return {
         "git_commit": _git("rev-parse", "--short", "HEAD"),
         "git_dirty": bool(changed),
