@@ -974,7 +974,8 @@ def test_sidebar_shows_session_workspace_and_permission() -> None:
             info = _widget_text(app, "#session-info")
             assert app.session_id in info
             assert "/mnt/d/proj" in info
-            assert "L0 只读" in info
+            # 标签不能把只读会话说成"什么都执行不了" —— 变更类命令仍会拦下来问一次
+            assert "只读" in info and "确认" in info
 
     _run(scenario())
 

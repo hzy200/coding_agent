@@ -280,3 +280,14 @@ def test_thread_history_reports_unavailable(monkeypatch, settings) -> None:
     resp = TestClient(web.create_app(settings)).get("/api/thread/abc")
     assert resp.status_code == 503
     assert "checkpoint 打不开" in resp.json()["detail"]
+
+
+def test_importing_the_module_does_not_build_an_app() -> None:
+    """A10：`web.app` 不应有模块级 `app = create_app()`。
+
+    import 就建 app 并读 settings 是副作用 —— `cli web` 导入 `create_app` 时
+    会凭空多造一个默认 app（那个 app 永远不会被用到，却已经读了配置）。
+    """
+    import coding_agent.web.app as module
+
+    assert not hasattr(module, "app"), "模块级不该有 app 对象（用 create_app 自己建）"

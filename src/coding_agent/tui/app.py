@@ -226,7 +226,9 @@ class AgentTuiApp(App[None]):
         """
         if workspace is None:
             workspace = getattr(self._runtime, "workspace", "") or ""
-        level = "L1 可写" if self._allow_write else "L0 只读"
+        # 与 `llm/prompts.py` 的权限叙述保持一致：只读会话**不是**什么都执行不了，
+        # L2/L3 仍会拦下来问一次。写死「L0 只读」会让人以为变更类命令一律被拒。
+        level = "L1 可写 · 变更需确认" if self._allow_write else "只读 · 变更需确认"
         self._session_workspace = workspace
         info = Text()
         info.append(f"{self._session_id}\n", style="")

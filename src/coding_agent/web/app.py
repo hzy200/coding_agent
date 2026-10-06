@@ -1,5 +1,9 @@
 """Web 最小验证界面。
 
+**模块级不再有 `app = create_app()`**（A10）：import 就建 app 并读 settings 是
+副作用 —— `cli web` 导入 `create_app` 时会凭空多造一个默认 app。支持的用法是
+调用方自己建：`uvicorn.run(create_app(settings), ...)`。
+
 定位是**最小验证**，不是主要交付界面（TUI 才是）。这里只证明三件事：
 
 1. 流式对话能跑通（事件流直接变成 SSE 帧）
@@ -152,6 +156,3 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"messages": [{"role": m.role, "text": m.text} for m in history]}
 
     return app
-
-
-app = create_app()

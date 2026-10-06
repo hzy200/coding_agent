@@ -221,3 +221,24 @@ def test_git_failure_is_reported_not_raised(require_wsl, settings) -> None:
         assert "not a git repository" in text.lower()
     finally:
         require_wsl.run(f"rm -rf {shlex.quote(plain)}")
+
+
+def test_add_refuses_dot_and_the_workspace_root(tools, require_wsl, repo) -> None:
+    """A7：目标**是 `.agent/` 的祖先**时也要拒。
+
+    `git_add(".")` 经 `ensure_inside(".")` 正好归一化成工作区根，而
+    `git add -- <工作区根>` 会把 `.agent/` 里的备份与审计一并暂存 ——
+    原先只判"路径在 `.agent/` 里"，`.` 与工作区根整个绕过了过滤。
+    """
+    _write(require_wsl, repo, "app.py", "x = 1\n")
+    require_wsl.run(f"mkdir -p {shlex.quote(repo + '/.agent/backups')}")
+    _write(require_wsl, repo, ".agent/backups/bak", "备份内容\n")
+
+    for path in (".", repo):
+        text, artifact = _invoke(tools[GIT_ADD], paths=[path], reason="整树暂存")
+        assert not artifact.ok, f"{path!r} 应当被拒绝"
+        assert "agent 自己的工作目录" in text
+
+    # 明确列出文件仍然可以
+    _, ok = _invoke(tools[GIT_ADD], paths=["app.py"], reason="只加源码")
+    assert ok.ok

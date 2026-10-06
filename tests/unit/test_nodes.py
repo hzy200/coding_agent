@@ -464,6 +464,22 @@ def test_compose_states_readonly_permission() -> None:
     assert "L1 低风险写" in compose_system_prompt(allow_write=True)
 
 
+def test_the_permission_narrative_does_not_contradict_the_policy() -> None:
+    """提示词不能"说反话"（A6）。
+
+    原先只读会话写的是「变更类命令会被宿主拒绝」，而默认 `ask` 模式下 L2/L3
+    返回的是 **ASK** —— 逐条确认一次就能执行（包括 `git commit`）。模型据此会
+    以为自己做不到，用户也会对"到底拦不拦"产生错误预期。
+
+    这里钉的是**性质**而不是字面量：不能声称变更类命令一律被拒。
+    """
+    readonly = compose_system_prompt(allow_write=False)
+
+    assert "会被宿主拒绝" not in readonly, "只读会话并非一律拒绝变更类命令（默认是逐条确认）"
+    for word in ("确认", "L2", "L3"):
+        assert word in readonly, f"权限叙述里应当说明 L2/L3 的真实机制（缺 {word}）"
+
+
 def test_compose_with_empty_memories_omits_section() -> None:
     assert "长期记忆" not in compose_system_prompt(memories=[])
     assert "长期记忆" not in compose_system_prompt(memories=None)

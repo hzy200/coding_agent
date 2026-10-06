@@ -76,7 +76,16 @@ def build_git_tools(settings: Settings, sandbox: WslSandbox) -> list[BaseTool]:
     agent_state = posixpath.join(workspace, AGENT_STATE_DIRNAME)
 
     def _is_agent_state(path: str) -> bool:
-        return is_within(path, agent_state)
+        """这个暂存目标会不会把 `.agent/` 一起带进去。
+
+        两种情形都要认（A7）：
+
+        1. 目标就在 `.agent/` 里；
+        2. 目标**是 `.agent/` 的祖先** —— `git_add(".")` 经 `ensure_inside(".")`
+           正好归一化成工作区根，而 `git add -- <工作区根>` 会把备份与审计一并
+           暂存。原先只判第一种，于是 `.` 与工作区根整个绕过了过滤。
+        """
+        return is_within(path, agent_state) or is_within(agent_state, path)
 
     def _reject(message: str, level: CommandLevel) -> str:
         return pack(
@@ -151,8 +160,9 @@ def build_git_tools(settings: Settings, sandbox: WslSandbox) -> list[BaseTool]:
         intruding = [t for t in targets if _is_agent_state(t)]
         if intruding:
             return _reject(
-                f"拒绝暂存 agent 自己的工作目录：{', '.join(intruding)}。\n"
-                f"`{AGENT_STATE_DIRNAME}/` 存放备份与审计，不应纳入版本控制。",
+                f"拒绝暂存 agent 自己的工作目录（或它的上层目录）：{', '.join(intruding)}。\n"
+                f"`{AGENT_STATE_DIRNAME}/` 存放备份与审计，不应纳入版本控制 —— "
+                f"暂存它的上层目录会把它一并带进去。请逐个列出要暂存的文件。",
                 CommandLevel.LOW_WRITE,
             )
         return _invoke(["add", "--", *targets], reason, cwd)

@@ -172,15 +172,15 @@
 | # | 级别 | 缺陷 | 位置 | 证据 / 触发条件 | 状态 |
 | --- | --- | --- | --- | --- | --- |
 | A1 | 🔴 | `file_edit` 空 `old_string` 会**逐字符插入**内容，破坏文件 | `tools/files.py`（`EditInput` / `_edit`） | `"abc".count("") == 4` → 唯一性校验对空串天然失效；`replace("", "X")` → `XaXbXcX`；空文件上 `"".count("") == 1` 直接放行 | ✅ 已修 |
-| A2 | 🔴 | 架构守卫（**安全属性测试**）可被相对导入绕过 | `tests/unit/test_architecture.py:34` | 实测 `from ..sandbox import policy` 抽出**空集**；`from coding_agent import sandbox` 只抽出 `coding_agent`，两者都不触发断言 | ⬜ 待修 |
+| A2 | 🔴 | 架构守卫（**安全属性测试**）可被相对导入绕过 | `tests/unit/test_architecture.py:34` | 实测 `from ..sandbox import policy` 抽出**空集**；`from coding_agent import sandbox` 只抽出 `coding_agent`，两者都不触发断言 | ✅ **已修**（2026-10-06）：`_is_agent_state` 同时判「在 `.agent/` 里」与「**是 `.agent/` 的祖先**」—— 后者正是 `git_add(".")` 的形态 |
 | A3 | 🟠 | TUI 同一会话**第二轮起**丢失「最终答复」分界 | `tui/app.py`（`_answering` 只在 `/new`、`/switch` 复位，`_execute` 不复位） | 分界只在「本轮首个 respond token」打一次，跨轮不复位就永久消失，respond 文本与 act 小结混成一片 | ✅ 已修 |
 | A4 | 🟠 | 非文件工具被拒时产出 `FileArtifact`，事件层标成「文件工具」 | `graph/nodes/tools.py` `_denied_artifact`、`runtime.py` `_tool_finished` | 只读 / `deny` 会话下 `git_commit` / `deps_install` / `run_tests` 被拒即触发；审计里 `level` 跟着错 | ✅ 已修 |
 | A5 | 🟠 | `file_read` 越界 offset **谎报「文件为空」** | `tools/files.py` `_read` | `offset` 超过行数时 window 为空，原实现一律返回「（文件为空）」—— 模型据此可能整份覆盖写入 | ✅ 已修 |
-| A6 | 🔴 | 只读会话的系统提示与 UI 标签**说反话** | `llm/prompts.py:179-183`、`tui/app.py:227` vs `sandbox/policy.py:79-92` | 提示词称「变更类命令会被宿主拒绝」，而默认 `ask` 模式下 L2/L3 返回 **ASK**，按一次 y 就能执行 `git commit`（实测确认） | ⬜ 待修（与 P3-10 同源） |
-| A7 | 🟠 | `git_add` 传 `.` 或工作区根时，`.agent/` 过滤失效 | `tools/git.py:143-158` | `ensure_inside(".")` 归一化为工作区根 → `_is_agent_state(root)` 为假 → `git add -- <root>` 把备份与审计一并暂存；仅靠 `_commit` 兜底 | ⬜ 待修 |
+| A6 | 🔴 | 只读会话的系统提示与 UI 标签**说反话** | `llm/prompts.py:179-183`、`tui/app.py:227` vs `sandbox/policy.py:79-92` | 提示词称「变更类命令会被宿主拒绝」，而默认 `ask` 模式下 L2/L3 返回 **ASK**，按一次 y 就能执行 `git commit`（实测确认） | ✅ **已修**（2026-10-06）：**只改描述、不改判定**（受第五部分范围边界约束）。只读会话改为「自动执行的只有 L0 只读；L1 会被拒绝；**L2/L3 会拦下来交给你确认或直接拒绝**（取决于审批模式）」；TUI 侧栏标签同步为「只读 · 变更需确认」。刻意不写死审批模式 —— `compose_system_prompt` 拿不到 policy，硬写一个模式就会在另一种模式下又说反话 |
+| A7 | 🟠 | `git_add` 传 `.` 或工作区根时，`.agent/` 过滤失效 | `tools/git.py` | `ensure_inside(".")` 归一化为工作区根 → `_is_agent_state(root)` 为假 → `git add -- <root>` 把备份与审计一并暂存；仅靠 `_commit` 兜底 | ✅ **已修**（2026-10-06）：`_is_agent_state` 同时判「在 `.agent/` 里」与「**是 `.agent/` 的祖先**」—— 后者正是 `git_add(".")` 归一化后的形态 |
 | A8 | 🟠 | `RunStarted` 定义了却**从不发出** | `events.py:170-174`、`runtime.py` | 只有 `web/app.py` 自行伪造；CLI/TUI 收不到，按契约实现的新前端会永久等待 | ✅ 已修 |
-| A9 | 🟡 | `estimate_recursion_limit` 过度膨胀（当前配置算出 **2350**） | `graph/build.py:86-92` | 把**任务级**的 `replan` 额度按**每步**相乘；这条防线因此失去约束意义，真正收敛靠 `replan_count` / `retry` | ⬜ 待修 |
-| A10 | 🟡 | `web` 模块级 `app = create_app()` 副作用 | `web/app.py:156` | import 即建 app 并读 settings；`cli web` 导入时凭空多造一个默认 app | ⬜ 待修 |
+| A9 | 🟡 | `estimate_recursion_limit` 过度膨胀（当前默认 **2420**，长程任务预算下 **10010**） | `graph/build.py` | 把**任务级**的 `replan` 额度按**每步**相乘，确实高估（`(重规划+1)×阶段` 应收敛为 `阶段 + 重规划×阶段`）。<br>**已评估：不收紧**（2026-10-06）。理由三条：① **偏高的上限是"松"不是"错"** —— 它只决定"撞墙前还能跑多少"，而这个项目的收敛靠 `replan_count` / `retry` 的硬上限；② **收紧的方向是危险的那一侧**：该公式算歪过**四次，每次都是算小**，收紧就有 `GraphRecursionError` 打断正常路径的回归风险；③ 真正想防的"跑飞了烧 token"现在由**单任务墙钟护栏**（`EvalTask.agent_timeout`）挡住，那是更直接的一道闸。<br>结论：**改文档不改公式**。若将来要靠它当成本闸，再连同图级最坏路径用例一起收紧 |
+| A10 | 🟡 | `web` 模块级 `app = create_app()` 副作用 | `web/app.py` | import 即建 app 并读 settings；`cli web` 导入时凭空多造一个默认 app | ✅ **已修**（2026-10-06）：去掉模块级 `app = create_app()`。支持用法是调用方自建（`uvicorn.run(create_app(settings))`，`cli web` 本来就是这么做的）—— 那个默认 app 从没被用过，却已经读了配置 |
 
 **已修记录与教训**
 
@@ -298,7 +298,11 @@
 > | A10 去掉 `web` 模块级副作用 | W11 | 与「按 policy 收敛工具暴露集合」同批 |
 > | Q1 收尾：在 CI 里**真正执行**沙箱层 | 待定 | 需 `windows-latest` runner + 安装 WSL2（`Vampire/setup-wsl`）。代价是 CI 变慢且引入不确定性；**要先把「11 个百分点的覆盖只在本地守得住」这件事接受下来**，还是补上这个 job，是个取舍 |
 >
-> 已完成（本轮，无需再排）：**A1 / A2 / A3 / A4 / A5 / A8 / Q2 / Q4**；
+> **2026-10-06 追加完成**：**A6 / A7 / A10**（提前于原排期 W4 / W3 / W11 落掉），
+> **A9 评估后决定不改**（理由见该行）。至此「独立复核新增」里只剩 **Q1 收尾**
+> （在 CI 里真正执行沙箱层）与两个**已知遗留**（B6、工具仍同步执行）。
+>
+> 已完成（本轮，无需再排）：**A1 / A2 / A3 / A4 / A5 / A6 / A7 / A8 / A10 / Q2 / Q4**；
 > **Q1 的「加覆盖率 + 让缺口可见」部分已完成**，仅剩「在 CI 中执行沙箱层」待定。
 
 ### 3.3 阶段二（W5–W8）：理解深度 + 结果可信度
