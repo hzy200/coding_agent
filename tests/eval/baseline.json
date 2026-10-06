@@ -1,34 +1,54 @@
 {
-  "passed": 18,
+  "passed": 19,
   "total": 29,
-  "pass_rate": 0.6207,
+  "pass_rate": 0.6724,
   "by_category": {
     "single_file": {
       "passed": 5,
-      "total": 7
+      "total": 7,
+      "pass_rate": 0.7143
     },
     "cross_file": {
       "passed": 4,
-      "total": 8
+      "total": 8,
+      "pass_rate": 0.5
     },
     "debug": {
       "passed": 8,
-      "total": 11
+      "total": 11,
+      "pass_rate": 0.7727
     },
     "spec": {
-      "passed": 1,
-      "total": 3
+      "passed": 2,
+      "total": 3,
+      "pass_rate": 0.6667
     }
   },
   "by_tier": {
     "basic": {
       "passed": 13,
-      "total": 20
+      "total": 20,
+      "pass_rate": 0.65
     },
     "deep": {
-      "passed": 5,
-      "total": 9
+      "passed": 6,
+      "total": 9,
+      "pass_rate": 0.7222
     }
+  },
+  "mechanism": {
+    "runs": 2,
+    "verifications": {
+      "failed": 74,
+      "ok": 45
+    },
+    "tasks_with_verification": 46,
+    "repairs": 56,
+    "tasks_with_repair": 7,
+    "replans": 24,
+    "tasks_reporting_tokens": 58,
+    "input_tokens": 3752519,
+    "output_tokens": 95042
   },
   "tasks": [
     {
@@ -36,20 +56,36 @@
       "category": "single_file",
       "tier": "basic",
       "verdict": "passed",
-      "tool_calls": 7,
-      "steps": 4,
+      "tool_calls": 9,
+      "steps": 3,
       "replans": 0,
-      "agent_seconds": 20.4
+      "verifications": {
+        "ok": 1
+      },
+      "repairs": 0,
+      "input_tokens": 55065,
+      "output_tokens": 1137,
+      "agent_seconds": 18.7,
+      "passes": 2,
+      "repeats": 2
     },
     {
       "id": "single_file/mutable_default",
       "category": "single_file",
       "tier": "basic",
-      "verdict": "failed",
-      "tool_calls": 5,
+      "verdict": "flaky",
+      "tool_calls": 7,
       "steps": 3,
       "replans": 1,
-      "agent_seconds": 12.7
+      "verifications": {
+        "ok": 1
+      },
+      "repairs": 0,
+      "input_tokens": 46662,
+      "output_tokens": 969,
+      "agent_seconds": 16.2,
+      "passes": 1,
+      "repeats": 2
     },
     {
       "id": "single_file/port_validation",
@@ -59,27 +95,51 @@
       "tool_calls": 7,
       "steps": 3,
       "replans": 0,
-      "agent_seconds": 16.9
+      "verifications": {
+        "ok": 1
+      },
+      "repairs": 0,
+      "input_tokens": 47825,
+      "output_tokens": 1045,
+      "agent_seconds": 15.7,
+      "passes": 2,
+      "repeats": 2
     },
     {
       "id": "single_file/todo_stub",
       "category": "single_file",
       "tier": "basic",
       "verdict": "passed",
-      "tool_calls": 3,
-      "steps": 4,
+      "tool_calls": 6,
+      "steps": 3,
       "replans": 0,
-      "agent_seconds": 13.6
+      "verifications": {
+        "ok": 1
+      },
+      "repairs": 0,
+      "input_tokens": 40388,
+      "output_tokens": 917,
+      "agent_seconds": 14.7,
+      "passes": 2,
+      "repeats": 2
     },
     {
       "id": "single_file/slugify",
       "category": "single_file",
       "tier": "basic",
       "verdict": "passed",
-      "tool_calls": 7,
+      "tool_calls": 6,
       "steps": 3,
       "replans": 0,
-      "agent_seconds": 18.9
+      "verifications": {
+        "ok": 1
+      },
+      "repairs": 0,
+      "input_tokens": 43945,
+      "output_tokens": 1134,
+      "agent_seconds": 15.0,
+      "passes": 2,
+      "repeats": 2
     },
     {
       "id": "single_file/money_rounding",
@@ -89,27 +149,49 @@
       "tool_calls": 7,
       "steps": 2,
       "replans": 3,
-      "agent_seconds": 34.7
+      "verifications": {
+        "failed": 12
+      },
+      "repairs": 9,
+      "input_tokens": 117052,
+      "output_tokens": 1869,
+      "agent_seconds": 29.3,
+      "passes": 0,
+      "repeats": 2
     },
     {
       "id": "single_file/email_validation",
       "category": "single_file",
       "tier": "basic",
-      "verdict": "passed",
-      "tool_calls": 5,
+      "verdict": "flaky",
+      "tool_calls": 4,
       "steps": 4,
       "replans": 0,
-      "agent_seconds": 15.8
+      "verifications": {},
+      "repairs": 0,
+      "input_tokens": 31951,
+      "output_tokens": 721,
+      "agent_seconds": 10.8,
+      "passes": 1,
+      "repeats": 2
     },
     {
       "id": "cross_file/rename_function",
       "category": "cross_file",
       "tier": "basic",
-      "verdict": "failed",
-      "tool_calls": 7,
+      "verdict": "passed",
+      "tool_calls": 15,
       "steps": 3,
       "replans": 0,
-      "agent_seconds": 14.0
+      "verifications": {
+        "ok": 1
+      },
+      "repairs": 0,
+      "input_tokens": 53010,
+      "output_tokens": 2164,
+      "agent_seconds": 22.9,
+      "passes": 2,
+      "repeats": 2
     },
     {
       "id": "cross_file/extract_helper",
@@ -119,37 +201,67 @@
       "tool_calls": 8,
       "steps": 2,
       "replans": 3,
-      "agent_seconds": 34.1
+      "verifications": {
+        "failed": 12
+      },
+      "repairs": 9,
+      "input_tokens": 118410,
+      "output_tokens": 2553,
+      "agent_seconds": 30.0,
+      "passes": 0,
+      "repeats": 2
     },
     {
       "id": "cross_file/move_class",
       "category": "cross_file",
       "tier": "basic",
-      "verdict": "passed",
-      "tool_calls": 11,
-      "steps": 4,
-      "replans": 0,
-      "agent_seconds": 25.2
+      "verdict": "failed",
+      "tool_calls": 10,
+      "steps": 2,
+      "replans": 3,
+      "verifications": {
+        "failed": 12
+      },
+      "repairs": 9,
+      "input_tokens": 133473,
+      "output_tokens": 3232,
+      "agent_seconds": 36.2,
+      "passes": 0,
+      "repeats": 2
     },
     {
       "id": "cross_file/signature_change",
       "category": "cross_file",
       "tier": "basic",
-      "verdict": "passed",
-      "tool_calls": 10,
+      "verdict": "flaky",
+      "tool_calls": 6,
       "steps": 4,
       "replans": 0,
-      "agent_seconds": 22.7
+      "verifications": {},
+      "repairs": 0,
+      "input_tokens": 35739,
+      "output_tokens": 1247,
+      "agent_seconds": 12.9,
+      "passes": 1,
+      "repeats": 2
     },
     {
       "id": "cross_file/split_module",
       "category": "cross_file",
       "tier": "basic",
       "verdict": "passed",
-      "tool_calls": 6,
+      "tool_calls": 9,
       "steps": 4,
       "replans": 0,
-      "agent_seconds": 15.4
+      "verifications": {
+        "ok": 2
+      },
+      "repairs": 0,
+      "input_tokens": 64664,
+      "output_tokens": 1517,
+      "agent_seconds": 21.8,
+      "passes": 2,
+      "repeats": 2
     },
     {
       "id": "cross_file/config_single_source",
@@ -159,173 +271,319 @@
       "tool_calls": 11,
       "steps": 3,
       "replans": 0,
-      "agent_seconds": 21.3
+      "verifications": {
+        "ok": 1
+      },
+      "repairs": 0,
+      "input_tokens": 69579,
+      "output_tokens": 1397,
+      "agent_seconds": 20.3,
+      "passes": 2,
+      "repeats": 2
     },
     {
       "id": "cross_file/shape_mismatch",
       "category": "cross_file",
       "tier": "basic",
-      "verdict": "failed",
-      "tool_calls": 10,
-      "steps": 3,
-      "replans": 3,
-      "agent_seconds": 43.5
+      "verdict": "flaky",
+      "tool_calls": 8,
+      "steps": 5,
+      "replans": 0,
+      "verifications": {},
+      "repairs": 0,
+      "input_tokens": 56233,
+      "output_tokens": 1363,
+      "agent_seconds": 18.0,
+      "passes": 1,
+      "repeats": 2
     },
     {
       "id": "debug/misleading_error",
       "category": "debug",
       "tier": "basic",
-      "verdict": "failed",
+      "verdict": "flaky",
       "tool_calls": 6,
-      "steps": 4,
+      "steps": 3,
       "replans": 0,
-      "agent_seconds": 15.2
+      "verifications": {},
+      "repairs": 0,
+      "input_tokens": 34081,
+      "output_tokens": 844,
+      "agent_seconds": 11.2,
+      "passes": 1,
+      "repeats": 2
     },
     {
       "id": "debug/circular_import",
       "category": "debug",
       "tier": "basic",
-      "verdict": "failed",
-      "tool_calls": 7,
-      "steps": 1,
-      "replans": 3,
-      "agent_seconds": 39.8
+      "verdict": "flaky",
+      "tool_calls": 5,
+      "steps": 3,
+      "replans": 0,
+      "verifications": {},
+      "repairs": 0,
+      "input_tokens": 26047,
+      "output_tokens": 1075,
+      "agent_seconds": 11.7,
+      "passes": 1,
+      "repeats": 2
     },
     {
       "id": "debug/leaked_counter",
       "category": "debug",
       "tier": "basic",
       "verdict": "passed",
-      "tool_calls": 6,
+      "tool_calls": 7,
       "steps": 3,
       "replans": 0,
-      "agent_seconds": 15.9
+      "verifications": {
+        "ok": 1
+      },
+      "repairs": 0,
+      "input_tokens": 46916,
+      "output_tokens": 1044,
+      "agent_seconds": 16.1,
+      "passes": 2,
+      "repeats": 2
     },
     {
       "id": "debug/output_order",
       "category": "debug",
       "tier": "basic",
       "verdict": "passed",
-      "tool_calls": 7,
+      "tool_calls": 6,
       "steps": 3,
       "replans": 0,
-      "agent_seconds": 15.8
+      "verifications": {
+        "ok": 1
+      },
+      "repairs": 0,
+      "input_tokens": 33953,
+      "output_tokens": 932,
+      "agent_seconds": 13.9,
+      "passes": 2,
+      "repeats": 2
     },
     {
       "id": "debug/unflushed_write",
       "category": "debug",
       "tier": "basic",
-      "verdict": "passed",
-      "tool_calls": 10,
+      "verdict": "flaky",
+      "tool_calls": 6,
       "steps": 3,
       "replans": 0,
-      "agent_seconds": 21.2
+      "verifications": {},
+      "repairs": 0,
+      "input_tokens": 36206,
+      "output_tokens": 1199,
+      "agent_seconds": 13.1,
+      "passes": 1,
+      "repeats": 2
     },
     {
       "id": "debug/empty_edge_case",
       "category": "debug",
       "tier": "basic",
-      "verdict": "passed",
-      "tool_calls": 11,
+      "verdict": "flaky",
+      "tool_calls": 4,
       "steps": 3,
       "replans": 0,
-      "agent_seconds": 21.5
+      "verifications": {},
+      "repairs": 0,
+      "input_tokens": 26614,
+      "output_tokens": 807,
+      "agent_seconds": 10.6,
+      "passes": 1,
+      "repeats": 2
     },
     {
       "id": "deep/config_precedence",
       "category": "debug",
       "tier": "deep",
       "verdict": "passed",
-      "tool_calls": 12,
+      "tool_calls": 14,
       "steps": 4,
       "replans": 0,
-      "agent_seconds": 23.3
+      "verifications": {
+        "ok": 1
+      },
+      "repairs": 0,
+      "input_tokens": 71240,
+      "output_tokens": 1886,
+      "agent_seconds": 21.0,
+      "passes": 2,
+      "repeats": 2
     },
     {
       "id": "deep/import_chain",
       "category": "debug",
       "tier": "deep",
       "verdict": "passed",
-      "tool_calls": 12,
+      "tool_calls": 15,
       "steps": 4,
       "replans": 0,
-      "agent_seconds": 29.3
+      "verifications": {
+        "ok": 1
+      },
+      "repairs": 0,
+      "input_tokens": 112587,
+      "output_tokens": 3188,
+      "agent_seconds": 32.8,
+      "passes": 2,
+      "repeats": 2
     },
     {
       "id": "deep/spec_pagination",
       "category": "spec",
       "tier": "deep",
       "verdict": "passed",
-      "tool_calls": 11,
+      "tool_calls": 10,
       "steps": 4,
       "replans": 0,
-      "agent_seconds": 31.7
+      "verifications": {
+        "ok": 3
+      },
+      "repairs": 0,
+      "input_tokens": 90176,
+      "output_tokens": 2872,
+      "agent_seconds": 28.6,
+      "passes": 2,
+      "repeats": 2
     },
     {
       "id": "deep/spec_idempotent",
       "category": "spec",
       "tier": "deep",
-      "verdict": "failed",
+      "verdict": "flaky",
       "tool_calls": 6,
       "steps": 3,
       "replans": 0,
-      "agent_seconds": 14.9
+      "verifications": {},
+      "repairs": 0,
+      "input_tokens": 34230,
+      "output_tokens": 953,
+      "agent_seconds": 12.7,
+      "passes": 1,
+      "repeats": 2
     },
     {
       "id": "deep/request_payload",
       "category": "spec",
       "tier": "deep",
-      "verdict": "failed",
+      "verdict": "flaky",
       "tool_calls": 5,
       "steps": 3,
       "replans": 0,
-      "agent_seconds": 13.2
+      "verifications": {},
+      "repairs": 0,
+      "input_tokens": 32437,
+      "output_tokens": 977,
+      "agent_seconds": 12.9,
+      "passes": 1,
+      "repeats": 2
     },
     {
       "id": "deep/field_propagation",
       "category": "cross_file",
       "tier": "deep",
       "verdict": "failed",
-      "tool_calls": 9,
-      "steps": 5,
+      "tool_calls": 8,
+      "steps": 4,
       "replans": 0,
-      "agent_seconds": 21.4
+      "verifications": {},
+      "repairs": 0,
+      "input_tokens": 45564,
+      "output_tokens": 2028,
+      "agent_seconds": 17.0,
+      "passes": 0,
+      "repeats": 2
     },
     {
       "id": "replan/many_symptoms_one_cause",
       "category": "debug",
       "tier": "deep",
-      "verdict": "failed",
-      "tool_calls": 6,
+      "verdict": "flaky",
+      "tool_calls": 5,
       "steps": 1,
       "replans": 3,
-      "agent_seconds": 33.6
+      "verifications": {
+        "failed": 12
+      },
+      "repairs": 9,
+      "input_tokens": 104597,
+      "output_tokens": 2191,
+      "agent_seconds": 27.7,
+      "passes": 1,
+      "repeats": 2
     },
     {
       "id": "replan/stale_todo_list",
       "category": "debug",
       "tier": "deep",
       "verdict": "passed",
-      "tool_calls": 14,
-      "steps": 5,
-      "replans": 2,
-      "agent_seconds": 28.6
+      "tool_calls": 19,
+      "steps": 4,
+      "replans": 0,
+      "verifications": {
+        "ok": 1
+      },
+      "repairs": 0,
+      "input_tokens": 144341,
+      "output_tokens": 2942,
+      "agent_seconds": 30.6,
+      "passes": 2,
+      "repeats": 2
     },
     {
       "id": "replan/misdirected_request",
       "category": "debug",
       "tier": "deep",
       "verdict": "passed",
-      "tool_calls": 9,
-      "steps": 4,
+      "tool_calls": 8,
+      "steps": 5,
       "replans": 1,
-      "agent_seconds": 21.0
+      "verifications": {
+        "ok": 1
+      },
+      "repairs": 0,
+      "input_tokens": 63176,
+      "output_tokens": 1507,
+      "agent_seconds": 19.6,
+      "passes": 2,
+      "repeats": 2
     }
   ],
-  "recorded_at": "2026-10-05T05:15:35+00:00",
+  "recorded_at": "2026-10-06T04:50:08+00:00",
   "model": "deepseek-chat",
-  "git_commit": "a88c822",
-  "git_dirty": true,
+  "git_commit": "811636e",
+  "git_dirty": false,
+  "aggregation": "mean_over_repeats",
+  "noise": {
+    "repeats": 2,
+    "pass_rate_per_run": [
+      0.5172,
+      0.8276
+    ],
+    "min": 0.5172,
+    "max": 0.8276,
+    "spread": 0.3104,
+    "flipped": [
+      "cross_file/shape_mismatch",
+      "cross_file/signature_change",
+      "debug/circular_import",
+      "debug/empty_edge_case",
+      "debug/misleading_error",
+      "debug/unflushed_write",
+      "deep/request_payload",
+      "deep/spec_idempotent",
+      "replan/many_symptoms_one_cause",
+      "single_file/email_validation",
+      "single_file/mutable_default"
+    ],
+    "resolution": 0.0345,
+    "note": "观测到的逐次波动，不是置信区间；重复次数少时无统计效力。"
+  },
   "sandbox_capabilities": {
     "python3": true,
     "pytest": true,
@@ -334,5 +592,8 @@
     "cargo": false,
     "go": false
   },
-  "max_replans": 2
+  "max_replans": 2,
+  "review_enabled": true,
+  "comparable": true,
+  "comparable_reason": ""
 }

@@ -398,6 +398,51 @@ def mechanism_summary(results: list[TaskResult]) -> dict:
     }
 
 
+def merge_mechanisms(runs: list[dict]) -> dict:
+    """把 K 轮的机制指标合成一份。
+
+    **求和，并在块里写明 `runs`** —— "总共跑了多少次验证"是个能直接读的事实，
+    读者不必去猜口径。这一点踩过一次：聚合时漏了合并 mechanism，于是那份
+    baseline 里通过率是两轮的均值、mechanism 却只是第 1 轮的，两个数字口径不同
+    却长得一样。数不清口径的指标比没有指标更糟。
+    """
+    statuses: Counter[str] = Counter()
+    totals = {
+        "tasks_with_verification": 0,
+        "repairs": 0,
+        "tasks_with_repair": 0,
+        "replans": 0,
+        "tasks_reporting_tokens": 0,
+    }
+    input_tokens = 0
+    output_tokens = 0
+    saw_tokens = False
+
+    for run in runs:
+        mechanism = run.get("mechanism") or {}
+        statuses.update(mechanism.get("verifications") or {})
+        for key in totals:
+            totals[key] += int(mechanism.get(key) or 0)
+        for key, bucket in (("input_tokens", "in"), ("output_tokens", "out")):
+            value = mechanism.get(key)
+            if value is None:
+                continue
+            saw_tokens = True
+            if bucket == "in":
+                input_tokens += int(value)
+            else:
+                output_tokens += int(value)
+
+    return {
+        "runs": len(runs),
+        "verifications": dict(sorted(statuses.items())),
+        **totals,
+        # 一条都没回报时是 None，不是 0 —— 「没量到」与「量到零」含义不同
+        "input_tokens": input_tokens if saw_tokens else None,
+        "output_tokens": output_tokens if saw_tokens else None,
+    }
+
+
 def summarize(results: list[TaskResult]) -> dict:
     """汇总成可直接写进 baseline 的结构。
 
@@ -449,8 +494,14 @@ def noise_summary(runs: list[dict]) -> dict:
     噪声套上科学的壳。这里只报告观测到的范围与翻转过哪些任务，让读者自己
     判断某次改动是否落在噪声里。
 
-    `resolution` 是这把尺子的**分辨率**：翻一个任务相当于多少个百分点。
-    29 个任务时它是 3.4% —— 比它更小的"提升"在单次运行里根本不可分辨。
+    `one_task_flip` 与 `spread` 是**两件不同的事**，别混：
+
+    - `one_task_flip` 只是算术粒度：29 个任务时翻一个是 3.4 个百分点。
+    - `spread` 是**观测到的运行间波动**，也就是这把尺子实际能分辨的量级。
+
+    实测过一组：同一份代码跑两遍是 52% 与 83%（`spread` = 31 个百分点，
+    29 个任务里 11 个翻转）。那种情况下小于 31 个百分点的「提升」与噪声
+    完全无法区分 —— 盯着 3.4 个百分点去读变化，读到的全是运气。
     """
     rates = [run["pass_rate"] for run in runs]
     per_task: dict[str, list[str]] = {}
@@ -463,11 +514,16 @@ def noise_summary(runs: list[dict]) -> dict:
         "pass_rate_per_run": [round(rate, 4) for rate in rates],
         "min": round(min(rates), 4) if rates else 0.0,
         "max": round(max(rates), 4) if rates else 0.0,
+        # 有效分辨率的量级由它决定，不是由 one_task_flip 决定
         "spread": round(max(rates) - min(rates), 4) if rates else 0.0,
         # 同一任务在不同次之间结果不一致 —— 这些就是"噪声"的具体成员
         "flipped": sorted(tid for tid, vs in per_task.items() if len(set(vs)) > 1),
-        "resolution": round(1 / total, 4) if total else 0.0,
-        "note": "观测到的逐次波动，不是置信区间；重复次数少时无统计效力。",
+        "one_task_flip": round(1 / total, 4) if total else 0.0,
+        "note": (
+            "观测到的逐次波动，不是置信区间；重复次数少时无统计效力。"
+            "能分辨的最小差异由 spread 决定，不是由 one_task_flip 决定 —— "
+            "后者只是翻一个任务的算术粒度。"
+        ),
     }
 
 
@@ -494,6 +550,7 @@ def aggregate_runs(runs: list[dict]) -> dict:
     if len(runs) == 1:
         summary = dict(runs[0])
         summary["aggregation"] = "single_run"
+        summary["mechanism"] = merge_mechanisms(runs)
         summary["noise"] = noise_summary(runs)
         return summary
 
@@ -530,6 +587,7 @@ def aggregate_runs(runs: list[dict]) -> dict:
         for task in runs[0]["tasks"]
     ]
     summary["noise"] = noise_summary(runs)
+    summary["mechanism"] = merge_mechanisms(runs)
     return summary
 
 

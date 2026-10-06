@@ -318,15 +318,38 @@ def _run_with(verdicts: dict[str, list[str]]) -> list[dict]:
     ]
 
 
-def test_noise_counts_repeats_and_resolution() -> None:
-    """分辨率 = 翻一个任务相当于多少个百分点。比它小的"提升"不可分辨。"""
+def test_noise_counts_repeats_and_one_task_granularity() -> None:
+    """`one_task_flip` 是算术粒度，**不是**分辨率 —— 两者别混。"""
     runs = _run_with({"a": ["passed", "passed"], "b": ["failed", "failed"]})
     noise = noise_summary(runs)
 
     assert noise["repeats"] == 2
     assert noise["pass_rate_per_run"] == [0.5, 0.5]
     assert noise["flipped"] == []
-    assert noise["resolution"] == 0.5  # 2 个任务
+    assert noise["one_task_flip"] == 0.5  # 2 个任务
+    assert noise["spread"] == 0.0
+
+
+def test_noise_floor_is_the_spread_not_the_task_granularity() -> None:
+    """能分辨的最小差异由**波动**决定，而不是"翻一个任务"。
+
+    实测过的那组：同一份代码两遍是 52% 与 83%。29 个任务时 one_task_flip 只有
+    3.4 个百分点，看着尺子很精细；但真实波动是 31 个百分点 —— 拿 3.4 去读变化，
+    读到的全是运气。把这两个数放在一起报，才不会误读。
+    """
+    runs = _run_with({
+        # 前 11 个任务第 1 轮挂、第 2 轮过 —— 与实测那组的形状一致
+        f"t{i}": (["failed", "passed"] if i < 11 else ["passed", "passed"])
+        for i in range(29)
+    })
+    noise = noise_summary(runs)
+
+    assert noise["one_task_flip"] == round(1 / 29, 4)
+    # 第 1 轮 18/29（62%），第 2 轮 29/29（100%）
+    assert noise["pass_rate_per_run"] == [round(18 / 29, 4), 1.0]
+    assert noise["spread"] == round(11 / 29, 4)
+    assert noise["spread"] > noise["one_task_flip"] * 5
+    assert len(noise["flipped"]) == 11
 
 
 def test_noise_exposes_flips_that_cancel_out() -> None:
@@ -348,6 +371,34 @@ def test_aggregate_single_run_stays_comparable_with_old_schema() -> None:
     summary = aggregate_runs([_run_with({"a": ["passed"]})[0]])
     assert summary["aggregation"] == "single_run"
     assert summary["pass_rate"] == 1.0
+
+
+def test_aggregate_merges_mechanism_across_runs() -> None:
+    """机制指标也必须跨轮合并 —— 这条踩过。
+
+    聚合时漏了 `mechanism`，于是那份 baseline 里**通过率是两轮的均值、机制却只是
+    第 1 轮的**：两个数字口径不同却长得一样。数不清口径的指标比没有指标更糟。
+    """
+    runs = [
+        summarize([_result("a", verifications={"ok": 1, "failed": 2}, repairs=3,
+                           input_tokens=100, output_tokens=10)]),
+        summarize([_result("a", verifications={"ok": 4}, repairs=1,
+                           input_tokens=50, output_tokens=5)]),
+    ]
+    merged = aggregate_runs(runs)["mechanism"]
+
+    assert merged["runs"] == 2
+    assert merged["verifications"] == {"failed": 2, "ok": 5}  # 求和，不是取平均
+    assert merged["repairs"] == 4
+    assert merged["input_tokens"] == 150
+    assert merged["output_tokens"] == 15
+
+
+def test_single_run_mechanism_carries_its_run_count() -> None:
+    """k=1 也带 `runs`，两种口径形状一致 —— 消费方不必分情况处理。"""
+    merged = aggregate_runs(_run_with({"a": ["passed"]}))["mechanism"]
+    assert merged["runs"] == 1
+    assert merged["input_tokens"] is None  # 一条都没回报时是 None，不是 0
 
 
 def test_aggregate_marks_flaky_tasks_as_their_own_verdict() -> None:
