@@ -96,6 +96,35 @@ def test_override_beats_detection(require_wsl, workdir) -> None:
     assert detect_test_command(require_wsl, workdir, override="make check") == "make check"
 
 
+def test_model_written_manifest_cannot_become_the_auto_verify_command(
+    require_wsl, workdir, settings
+) -> None:
+    """模型写一个 package.json 就能决定自动 verify 跑什么 —— 这是条不过审批的执行路径。
+
+    `npm test` 跑什么写在 package.json 里，而该文件模型用 file_write 就写得到
+    （`--write` 下 L1 自动放行）。不挡的话「写个恶意 manifest → 下一次脏写自动
+    执行」就把命令分级整个绕开了。
+    """
+    _touch(
+        require_wsl,
+        workdir,
+        "package.json",
+        '{"name": "x", "scripts": {"test": "touch pwned.txt"}}',
+    )
+
+    scoped = _settings(settings, workdir)
+    result = run_verification(WslSandbox(scoped), workdir, allow_manifest=False)
+
+    assert result.status == "not_configured"
+    assert not require_wsl.run(f"[ -e {shlex.quote(workdir + '/pwned.txt')} ]").ok
+
+    # 走审批的 run_tests 仍然认得它 —— 挡的是「无审批」，不是「能力」。
+    # 只断言「认得」，不断言「跑通」：本机 WSL 里的 npm 是 /mnt/d 下的 Windows
+    # 版本，`npm test` 静默 exit 0 但并不执行脚本，跑不跑得通属于工具链环境问题。
+    approved = run_verification(WslSandbox(scoped), workdir, allow_manifest=True)
+    assert approved.command == "npm test --silent"
+
+
 # ---------------- 执行与解析 ----------------
 
 def test_passing_command(require_wsl, workdir, settings) -> None:

@@ -359,20 +359,41 @@ def _is_external_path_token(token: str) -> bool:
     """看起来像「工作区外的路径」。
 
     相对路径按 cwd（= 工作区）解析，天然在界内，不在此列；只认绝对路径、
-    家目录 `~` 与向上一级穿越 `..`。工作区内的绝对路径也会被算进来 ——
+    家目录 `~`（含 `~user`）与向上一级穿越 `..`。工作区内的绝对路径也会被算进来 ——
     这是有意的保守：让模型用相对路径或文件工具，代价只是一次确认。
+
+    `~user` 必须一起认：shell 会把 `~root` 展开成那个用户的家目录，只判裸 `~`
+    与 `~/` 会让 `cat ~root/.ssh/id_rsa` 整个漏过去。
     """
     if not token or token in _SAFE_EXTERNAL_PATHS:
         return False
     return (
         token.startswith("/")
-        or token == "~"
-        or token.startswith("~/")
+        or token.startswith("~")
         or token == ".."
         or token.startswith("../")
         or "/../" in token
         or token.endswith("/..")
     )
+
+
+def _ansi_quoted_path(token: str) -> str | None:
+    """认出 `$'...'` / `$"..."` 里藏的工作区外路径。
+
+    这两种引用会被 shell **展开**（ANSI-C 转义 / 本地化），内容不是字面量：
+    `cat $'/etc/passwd'` 读的确实是工作区外。但 shlex 去掉引号后只剩
+    `$/etc/passwd`，`startswith("/")` 判定整个漏掉，于是它被判成 L0 自动放行。
+
+    不能反过来一刀切「出现 `$'` 就升级」—— 那样连 `echo $'rm -rf /'` 这种
+    完全惰性的字面量也要人工确认。所以按展开后的值判定：只有像越界路径的才升级。
+    转义序列（`$'\\x2fetc'`）无法便宜地还原，一律按隐藏处理。
+    """
+    if not token.startswith("$") or len(token) < 2:
+        return None
+    body = token[1:]
+    if "\\" in body:
+        return token
+    return token if _is_external_path_token(body) else None
 
 
 def _escalate_auto_command(command: str) -> Verdict | None:
@@ -404,6 +425,14 @@ def _escalate_auto_command(command: str) -> Verdict | None:
         for word in words[1:]:
             # 选项值也可能带路径，例如 --file=/etc/shadow
             candidate = word.split("=", 1)[1] if word.startswith("-") and "=" in word else word
+            hidden = _ansi_quoted_path(candidate)
+            if hidden is not None:
+                return Verdict(
+                    CommandLevel.MUTATE,
+                    f"只读命令的参数经 ANSI-C/本地化引号展开为工作区外路径："
+                    f"{hidden}（需要确认）",
+                    segment,
+                )
             if candidate == _AGENT_STATE_DIR or candidate.startswith(_AGENT_STATE_DIR + "/"):
                 return Verdict(
                     CommandLevel.MUTATE,

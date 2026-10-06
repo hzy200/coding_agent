@@ -207,11 +207,15 @@ def _probe_script(files: tuple[str, ...]) -> str:
     )
 
 
-def detect_test_command(sandbox: WslSandbox, root: str, *, override: str = "") -> str:
-    """推导出该项目的验证命令；没有可用的返回空串。"""
-    if override.strip():
-        return override.strip()
+def _detect(sandbox: WslSandbox, root: str, *, allow_manifest: bool) -> str:
+    """真的去沙箱里探一次（一次 wsl.exe），返回命令或空串。
 
+    `allow_manifest=False` 时只认**命令文本完全由宿主确定**的那几条：
+    `make test` 跑什么写在 Makefile 里、`npm test` 跑什么写在 package.json 里，
+    而这两个文件模型可以用 file_write 改（`--write` 下 L1 自动放行）——
+    于是「写个恶意 Makefile → 下一次脏写自动执行」就成了一条绕过命令分级的
+    执行路径。带上 `allow_manifest=True` 的只有走审批的 `run_tests` 工具。
+    """
     result = sandbox.run(_probe_script(_PROBE_FILES), cwd=root)
     lines = {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
@@ -219,8 +223,6 @@ def detect_test_command(sandbox: WslSandbox, root: str, *, override: str = "") -
         return "cargo test"
     if "FILE go.mod" in lines:
         return "go build ./... && go test ./..."
-    if "NPM test" in lines:
-        return "npm test --silent"
 
     has_python_tests = (
         "HAS pytest" in lines
@@ -234,10 +236,47 @@ def detect_test_command(sandbox: WslSandbox, root: str, *, override: str = "") -
     if has_python_tests:
         return "python3 -m pytest -q"
 
+    if not allow_manifest:
+        return ""
+
+    if "NPM test" in lines:
+        return "npm test --silent"
     if "MAKE test" in lines:
         return "make test"
 
     return ""
+
+
+def detect_test_command(
+    sandbox: WslSandbox,
+    root: str,
+    *,
+    override: str = "",
+    allow_manifest: bool = True,
+) -> str:
+    """推导出该项目的验证命令；没有可用的返回空串。
+
+    探测结果按工作区缓存：一次运行里验证会跑很多遍（每步一遍、修复后再一遍），
+    而项目清单不会变，每次重探都是白跑一次 wsl.exe（约 0.3s）。
+
+    **只缓存"探到了"，不缓存"没探到"** —— 任务很可能是先建目录、写好
+    pyproject.toml 才第一次出现可识别的测试命令；把空结果也记住，后面就再
+    也发现不了它了，验证会一直停在 `not_configured`。
+
+    缓存键带上 `allow_manifest`：两种口径答案可能不同（Makefile-only 的项目
+    在只读口径下是空串、在审批口径下是 `make test`），共用一个键会让先跑的
+    那次把答案灌给另一次 —— 审批口径的结果漏进无人审批的自动 verify 是最坏的方向。
+    """
+    if override.strip():
+        return override.strip()
+
+    key = f"test_command:{root}:{int(allow_manifest)}"
+    found = sandbox.cached_probe(
+        key, lambda: _detect(sandbox, root, allow_manifest=allow_manifest)
+    )
+    if not found:
+        sandbox.forget_probe(key)
+    return found
 
 
 def run_verification(
@@ -245,14 +284,22 @@ def run_verification(
     root: str,
     *,
     command: str = "",
+    allow_manifest: bool = True,
 ) -> VerifyResult:
     """执行一次验证并解析结果。
 
     只接受 sandbox 一个配置源 —— 超时、资源上限、verify_command 都从
     `sandbox.settings` 读，避免出现"传进来的 settings 和沙箱实际用的不一致"。
+
+    `allow_manifest=False` 供**自动 verify** 使用：它不过审批，因此不能执行
+    命令文本来自工作区文件的命令（见 `_detect`）。模型主动调 `run_tests`
+    走的是默认的 True —— 那条路径有审批兜着。
     """
     resolved = detect_test_command(
-        sandbox, root, override=command or sandbox.settings.verify_command
+        sandbox,
+        root,
+        override=command or sandbox.settings.verify_command,
+        allow_manifest=allow_manifest,
     )
     if not resolved:
         return VerifyResult(status="not_configured")

@@ -123,6 +123,11 @@ def test_auto_allowed_only_for_read_and_low_write() -> None:
         "echo $(cat /etc/hostname)",  # 命令替换
         "echo `id`",                  # 反引号
         "find . -name '*.py' -exec cat {} +",  # -exec 逃出只读语义
+        "cat $'/etc/passwd'",         # ANSI-C 引号：会被展开，不是字面量
+        'cat $"/etc/passwd"',         # 本地化引号同理
+        "cat $'\\x2fetc\\x2fpasswd'",  # 转义写法，解出来仍是绝对路径
+        "cat ~root/.ssh/id_rsa",      # ~user 展开成该用户家目录
+        "grep -rn x ~user/",
     ],
 )
 def test_external_access_is_escalated_to_confirmation(command: str) -> None:
@@ -130,6 +135,25 @@ def test_external_access_is_escalated_to_confirmation(command: str) -> None:
     verdict = classify(command)
     assert verdict.level is CommandLevel.MUTATE, verdict
     assert not verdict.auto_allowed
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo $'rm -rf /'",        # 展开后是没有空格的单个参数，不是路径
+        "echo $'just text'",
+        "grep -rn $'todo' src/",
+    ],
+)
+def test_ansi_c_quoting_is_only_escalated_when_it_hides_a_path(command: str) -> None:
+    """`$'...'` 本身不是罪证。
+
+    升级的判据是「展开后像工作区外路径」，不是「出现了 `$'`」—— 否则
+    `echo $'rm -rf /'` 这种完全惰性的字面量也要人工确认，把防线变成噪声。
+    """
+    verdict = classify(command)
+    assert verdict.level <= CommandLevel.LOW_WRITE, verdict
+    assert verdict.auto_allowed, verdict
 
 
 @pytest.mark.parametrize(

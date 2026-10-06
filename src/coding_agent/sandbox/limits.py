@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 # GNU coreutils 的 timeout 在超时时返回这个码
@@ -61,22 +60,40 @@ class ResourceLimits:
         return " ; ".join(flags)
 
 
+# 内层脚本经 heredoc 传给 `bash -s`，**不能走 argv**。
+# 单条 argv 有内核硬上限 MAX_ARG_STRLEN（Linux 上 128 KiB），超出即
+# `Argument list too long`（exit 126）。而宿主会往脚本里内联大块 payload：
+# `fs.write_text` 把整份内容 base64 后直接写进脚本，膨胀 4/3 —— 于是
+# `bash -c <body>` 形式下内容超过约 96 KB 就必然失败，而读上限却宣称 2 MB。
+_HEREDOC_DELIMITER = "__AGENT_SCRIPT_EOF__"
+
+
+def _heredoc_delimiter(body: str) -> str:
+    """挑一个不会与脚本体撞行的 heredoc 结束标记。"""
+    delimiter = _HEREDOC_DELIMITER
+    while delimiter in body:
+        delimiter += "_"
+    return delimiter
+
+
 def wrap_with_limits(
     script: str,
     *,
     limits: ResourceLimits,
     wall_seconds: int | None,
-    quote: Callable[[str], str],
 ) -> str:
     """把命令包上资源限制与超时。
 
-    quote 传入 `shlex.quote`，避免本模块自己拼 shell 引号。
+    内层用 `bash -s` + heredoc 而不是 `bash -c`：脚本体改经 **stdin** 传递，
+    既绕开 argv 的长度上限，也顺带保持「脚本体不被外层 shell 二次解释」这条性质
+    （heredoc 内容一律按字面量处理）。
     """
     body = script
     if wall_seconds and wall_seconds > 0:
+        delimiter = _heredoc_delimiter(body)
         body = (
             f"timeout --kill-after={KILL_AFTER_SECONDS} {wall_seconds} "
-            f"bash -c {quote(body)}"
+            f"bash -s <<'{delimiter}'\n{body}\n{delimiter}"
         )
 
     preamble = limits.ulimit_preamble()

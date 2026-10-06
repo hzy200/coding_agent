@@ -9,7 +9,9 @@ from __future__ import annotations
 import shlex
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TypeVar, cast
 
 from coding_agent.config import Settings, get_settings
 from coding_agent.sandbox.limits import (
@@ -21,6 +23,10 @@ from coding_agent.sandbox.pathguard import normalize_root
 
 # 外层 subprocess 比沙箱内的 timeout 多留一点余量，正常由内层先触发
 OUTER_TIMEOUT_GRACE = 10
+# kill() 之后回收输出最多再等这么久：清理不该比一次命令本身更久
+KILL_GRACE = 5
+
+_T = TypeVar("_T")
 
 
 class WslUnavailableError(RuntimeError):
@@ -135,6 +141,25 @@ class WslSandbox:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self._bwrap_ok: bool | None = None
+        # 探测类结果的缓存。每探测一次就要启动一次 wsl.exe（约 0.3s），而这些值
+        # 在一次运行内不会变。挂在实例上而不是模块级，这样每个沙箱（也就是每次
+        # 运行、每个测试）各记各的，不会跨运行串味。
+        self._probe_cache: dict[str, object] = {}
+
+    # ---------------- 探测缓存 ----------------
+
+    def cached_probe(self, key: str, producer: Callable[[], _T]) -> _T:
+        """记住一次探测的结果：`producer` 只在第一次调用时真正执行。
+
+        `producer` 抛异常时什么都不记 —— 失败不该被缓存成"这个人没有 $HOME"。
+        """
+        if key not in self._probe_cache:
+            self._probe_cache[key] = producer()
+        return cast(_T, self._probe_cache[key])
+
+    def forget_probe(self, key: str) -> None:
+        """丢掉一条探测缓存，用于「这次的结果不算数，下次重新探测」的情形。"""
+        self._probe_cache.pop(key, None)
 
     # ---------------- 环境探测 ----------------
 
@@ -159,7 +184,14 @@ class WslSandbox:
     # ---------------- 执行 ----------------
 
     def home(self) -> str:
-        """沙箱内当前用户的 $HOME。"""
+        """沙箱内当前用户的 $HOME（探测结果缓存）。
+
+        默认配置下（没显式设 `AGENT_WSL_WORKSPACE`）`resolve_workspace` 要走这里，
+        而建图时每个工具构造器都会各调一次 —— 缓存之后这 9 次进程启动只剩 1 次。
+        """
+        return self.cached_probe("home", self._probe_home)
+
+    def _probe_home(self) -> str:
         result = self.run('printf "%s" "$HOME"')
         home = result.stdout.strip()
         if not result.ok or not home:
@@ -227,7 +259,7 @@ class WslSandbox:
 
         # 沙箱内再套一层 timeout：外层的 proc.kill() 只能杀掉 wsl.exe，
         # Linux 侧的子进程要靠这一层才能确定性清理。
-        script = wrap_with_limits(body, limits=self.limits, wall_seconds=wall, quote=shlex.quote)
+        script = wrap_with_limits(body, limits=self.limits, wall_seconds=wall)
         return self._exec(script, wall=wall, command=command)
 
     def _exec(self, script: str, *, wall: int, command: str = "") -> ExecResult:
@@ -250,7 +282,13 @@ class WslSandbox:
             exit_code = proc.returncode
         except subprocess.TimeoutExpired:
             proc.kill()
-            out, err = proc.communicate()
+            # 收尾这一次也必须有 timeout：kill 只保证 wsl.exe 收到信号，
+            # 若它卡在不可中断状态（网络挂载、驱动），无参 communicate() 会永久挂住。
+            try:
+                out, err = proc.communicate(timeout=KILL_GRACE)
+            except subprocess.TimeoutExpired:
+                # 拖不住就放弃回收，照样按超时返回 —— 不能让清理拖垮整轮运行
+                out, err = b"", b""
             exit_code = TIMEOUT_EXIT_CODE
             timed_out = True
 

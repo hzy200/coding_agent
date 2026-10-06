@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import shlex
-
 from coding_agent.sandbox.limits import ResourceLimits, wrap_with_limits
 
 
@@ -49,36 +47,55 @@ def test_individual_ulimit_failures_do_not_abort_the_command() -> None:
 # ---------------- wrap_with_limits ----------------
 
 def test_wraps_with_inner_timeout() -> None:
-    wrapped = wrap_with_limits(
-        "echo hi", limits=ResourceLimits(), wall_seconds=30, quote=shlex.quote
-    )
+    wrapped = wrap_with_limits("echo hi", limits=ResourceLimits(), wall_seconds=30)
     assert "timeout --kill-after=" in wrapped
     assert " 30 " in wrapped
-    assert wrapped.rstrip().endswith("bash -c 'echo hi'")
+    # 脚本体经 heredoc 走 stdin，不作为 argv 传给内层 bash
+    assert "bash -s <<'__AGENT_SCRIPT_EOF__'" in wrapped
+    assert wrapped.rstrip().endswith("__AGENT_SCRIPT_EOF__")
+    assert "\necho hi\n" in wrapped
 
 
 def test_no_timeout_when_wall_seconds_falsy() -> None:
     for wall in (None, 0):
-        wrapped = wrap_with_limits(
-            "echo hi", limits=ResourceLimits(), wall_seconds=wall, quote=shlex.quote
-        )
+        wrapped = wrap_with_limits("echo hi", limits=ResourceLimits(), wall_seconds=wall)
         assert "timeout" not in wrapped
         assert "echo hi" in wrapped
 
 
 def test_preamble_precedes_the_command() -> None:
     wrapped = wrap_with_limits(
-        "echo hi",
-        limits=ResourceLimits(cpu_seconds=5),
-        wall_seconds=None,
-        quote=shlex.quote,
+        "echo hi", limits=ResourceLimits(cpu_seconds=5), wall_seconds=None
     )
     assert wrapped.index("ulimit") < wrapped.index("echo hi")
 
 
-def test_command_is_quoted_so_it_cannot_escape() -> None:
-    """命令整体交给 bash -c，由宿主负责引用，模型无法拼出第二条命令。"""
+def test_body_travels_over_stdin_not_argv() -> None:
+    """脚本体不能出现在内层 bash 的 argv 里。
+
+    单条 argv 有内核上限 MAX_ARG_STRLEN（128 KiB），而 `fs.write_text` 会把整份
+    文件内容 base64 后内联进脚本（膨胀 4/3）—— 一旦走 argv，写入约 96 KB 以上
+    必然 `Argument list too long`（exit 126），而读上限却宣称 2 MB。
+    """
+    body = "x = '" + "y" * 400_000 + "'"
+    wrapped = wrap_with_limits(body, limits=ResourceLimits(), wall_seconds=10)
+
+    header = next(line for line in wrapped.splitlines() if "bash -s" in line)
+    assert body not in header  # 关键：大块内容不在命令行上
+    assert body in wrapped  # 但它确实在脚本里（只是经 stdin 传入）
+
+
+def test_heredoc_delimiter_moves_when_the_body_contains_it() -> None:
+    """脚本体里出现结束标记时换一个，否则 heredoc 会提前收尾。"""
+    body = "echo __AGENT_SCRIPT_EOF__\necho after"
+    wrapped = wrap_with_limits(body, limits=ResourceLimits(), wall_seconds=10)
+    assert "bash -s <<'__AGENT_SCRIPT_EOF___'" in wrapped
+    assert wrapped.rstrip().endswith("__AGENT_SCRIPT_EOF___")
+
+
+def test_body_is_not_reinterpreted_by_an_outer_shell() -> None:
+    """模型拼出的第二条命令仍在脚本体里，不会变成宿主 shell 的第二条命令。"""
     wrapped = wrap_with_limits(
-        "echo hi; rm -rf /", limits=ResourceLimits(), wall_seconds=10, quote=shlex.quote
+        "echo hi; rm -rf /", limits=ResourceLimits(), wall_seconds=10
     )
-    assert "'echo hi; rm -rf /'" in wrapped
+    assert "\necho hi; rm -rf /\n" in wrapped
