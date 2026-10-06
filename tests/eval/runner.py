@@ -53,28 +53,48 @@ from harness import (  # noqa: E402
     task_root,
 )
 from tasks import TASKS  # noqa: E402
+from tasks_long import LONG_TASKS  # noqa: E402
 
 from coding_agent.config import get_settings  # noqa: E402
 from coding_agent.sandbox.fs import SandboxFs  # noqa: E402
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace  # noqa: E402
 
+# 两个套件各有各的 canonical 基线。
+#
+# 长程档必须分开跑：它的单任务成本是前两档的若干倍，混在一起会让全量变得
+# 不可承受；而且它的波动量级也不同（任务更少、每个更长），混着报会掩盖差异。
+# 分成套件之后，"是不是子集"变成**相对本套件**而言 —— 所以 `--suite long`
+# 跑全集时仍然 comparable，不需要 --force。
+SUITES: dict[str, tuple[EvalTask, ...]] = {
+    "default": TASKS,
+    "long": LONG_TASKS,
+}
 
-def _select(only: str | None) -> list[EvalTask]:
+
+def _suite_tasks(suite: str) -> tuple[EvalTask, ...]:
+    if suite not in SUITES:
+        raise SystemExit(f"未知套件：{suite}（可用：{sorted(SUITES)}）")
+    return SUITES[suite]
+
+
+def _select(only: str | None, suite: str = "default") -> list[EvalTask]:
+    tasks = _suite_tasks(suite)
     if not only:
-        return list(TASKS)
-    # 支持按类别（single_file）、档位（deep）或任务 id 筛选
-    chosen = [t for t in TASKS if t.category == only or t.tier == only or t.id == only]
+        return list(tasks)
+    # 支持按类别（single_file）、档位（deep/long）或任务 id 筛选
+    chosen = [t for t in tasks if t.category == only or t.tier == only or t.id == only]
     if not chosen:
-        chosen = [t for t in TASKS if only in t.id]
+        chosen = [t for t in tasks if only in t.id]
     if not chosen:
         raise SystemExit(f"没有匹配的任务：{only}")
     return chosen
 
 
-def _list() -> None:
-    print(f"共 {len(TASKS)} 个任务\n")
+def _list(suite: str = "default") -> None:
+    tasks = _suite_tasks(suite)
+    print(f"[{suite}] 共 {len(tasks)} 个任务\n")
     for category in CATEGORIES:
-        rows = [t for t in TASKS if t.category == category]
+        rows = [t for t in tasks if t.category == category]
         print(f"[{category}] {CATEGORY_LABELS[category]}（{len(rows)}）")
         for task in rows:
             print(f"  - {task.id}")
@@ -246,6 +266,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="端到端能力评测")
     parser.add_argument("--list", action="store_true", help="列出任务")
     parser.add_argument(
+        "--suite",
+        default="default",
+        choices=sorted(SUITES),
+        help="跑哪个套件：default（29 个短任务）| long（几十文件的长程任务，成本高得多）",
+    )
+    parser.add_argument(
         "--verify-seeds", action="store_true", help="只跑判定，确认种子都未解决（不需要 API Key）"
     )
     parser.add_argument("--only", help="只看/只跑某个类别（single_file）、档位（deep）或任务 id")
@@ -273,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.list:
-        _list()
+        _list(args.suite)
         return 0
 
     settings = get_settings()
@@ -283,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
     sandbox = WslSandbox(settings)
     fs = SandboxFs(sandbox, resolve_workspace(settings, sandbox))
     base = eval_root(settings, sandbox)
-    tasks = _select(args.only)
+    tasks = _select(args.only, args.suite)
 
     # 先证明判定能通过，再谈任何通过率。否则可能得到一个"看上去干净、
     # 实际什么都没测出来"的结果（沙箱缺 pytest 时就会这样）。
@@ -369,10 +395,15 @@ def main(argv: list[str] | None = None) -> int:
     # 配置戳：review 会改变 repairs / replans 这些机制指标，开关两态的数字不可比。
     # 与 max_replans 一样属于"必须一起报"的元信息。
     summary["review_enabled"] = settings.review_enabled
+    # 同样是会改变 agent 行为、从而改变机制指标的开关 —— 开与关的数字不可比
+    summary["nudge_empty_steps"] = settings.nudge_empty_steps
+    # 口径戳：这份数字属于哪个套件、有没有被 --only 收窄
+    summary["suite"] = args.suite
+    summary["subset_filter"] = args.only or ""
     summary["comparable"] = not reasons
     summary["comparable_reason"] = "；".join(reasons)
 
-    target = args.baseline or baseline_path()
+    target = args.baseline or baseline_path(args.suite)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nbaseline 已写入 {target}")

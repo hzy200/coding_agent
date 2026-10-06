@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import posixpath
 import re
 import shlex
@@ -44,6 +45,11 @@ from coding_agent.events import (
 from coding_agent.runtime import AgentRuntime
 from coding_agent.sandbox.fs import SandboxFs
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
+from coding_agent.tools.files import (
+    EDIT_TOOL_NAME,
+    RESTORE_TOOL_NAME,
+    WRITE_TOOL_NAME,
+)
 
 # 判定用 **stdlib 的 unittest**，不用 pytest。这不是口味问题：
 # 沙箱里 python3 是有的，但 pip / ensurepip / pytest 都没有（Ubuntu 默认如此），
@@ -65,6 +71,10 @@ EVAL_DIRNAME = ".agent/eval"
 # 真实项目通常至少有一个，所以统一补上。
 #
 # 判定用的是 stdlib unittest（见 DEFAULT_JUDGE），不受这个文件影响。
+# 「动了手没有」的判据：写工作区的工具。shell 不算 —— 它改了文件也不会置 dirty
+# 以外的痕迹，而且把 shell 算进来会让"只跑测试"看起来像"改过代码"。
+_WRITE_TOOLS = frozenset({WRITE_TOOL_NAME, EDIT_TOOL_NAME, RESTORE_TOOL_NAME})
+
 PYTEST_INI_PATH = "pytest.ini"
 PYTEST_INI = "[pytest]\ntestpaths = .\n"
 
@@ -86,11 +96,16 @@ CATEGORY_LABELS = {
 
 BASIC = "basic"
 DEEP = "deep"
-TIERS = (BASIC, DEEP)
+# 长程档：几十个文件的仓库、需要贯通多层的修改。单独成套件与基线 ——
+# 它的单任务成本是前面两档的若干倍，混在一起跑会让全量变得不可承受，
+# 而且它的波动量级也与前两档不同，混着报会掩盖差异。
+LONG = "long"
+TIERS = (BASIC, DEEP, LONG)
 
 TIER_LABELS = {
     BASIC: "基础",
     DEEP: "进阶",
+    LONG: "长程",
 }
 
 
@@ -115,6 +130,14 @@ class EvalTask:
     tier: str = BASIC
     judge: str = DEFAULT_JUDGE
     timeout: int = 300
+    # 单任务的 agent 侧墙钟上限。长程任务的成本是前面两档的若干倍，而
+    # `runner` 是**串行**跑任务的 —— 一个挂死的任务会把整轮评测钉住。
+    # 超时后仍然照常判定（那正是"有没有做完"的答案），只是把原因写进 detail。
+    agent_timeout: int = 600
+    # 本任务覆盖的 agent 预算。**只给长程任务用**：改全局默认会让现有 29 个
+    # 任务的基线作废（行为会变），而它们的可比性正是 per-task 覆盖要保的东西。
+    # 键名与 `Settings` 字段一致（max_plan_steps / max_tool_rounds …）。
+    budget: dict[str, int] | None = None
 
     @property
     def seed_files(self) -> dict[str, str]:
@@ -154,9 +177,20 @@ class TaskResult:
     # 不发事件，所以"每步都过 verify"不等于这里计数 ≥ 步数。
     verifications: dict[str, int] = field(default_factory=dict)
     repairs: int = 0
+    # 改动了工作区的工具调用次数（file_write / file_edit / file_restore）。
+    #
+    # 为什么要单列这一个数：实测里出现了一种**与"做了但没做对"完全不同**的失败 ——
+    # 模型全程只读不写、计划照常推进到最后一步（`dirty` 一直是 False，verify 与
+    # review 都短路）。两种失败在通过率上长得一模一样，但含义天差地别：
+    # 前者是"能力不足"，后者是"根本没动手"。没有这个数就分不开。
+    writes: int = 0
     # provider 未回报用量时为 None。**不要当 0** —— 那会把缺失算成"没花钱"。
     input_tokens: int | None = None
     output_tokens: int | None = None
+    # 本任务实际用的 agent 预算覆盖（None = 用全局默认）。
+    # 必须进 baseline：不然"这个任务为什么用了 40 次工具调用"无从解释，
+    # 也无法判断它到底是被预算卡住还是自己停下的。
+    budget: dict[str, int] | None = None
 
     @property
     def solved(self) -> bool:
@@ -197,17 +231,19 @@ def clean_workspace(sandbox: WslSandbox, root: str, *, base: str) -> None:
 
 
 def materialize(task: EvalTask, fs: SandboxFs, root: str) -> None:
-    """把种子写进工作区（测试文件也在内，让智能体能自己跑）。"""
+    """把种子写进工作区（测试文件也在内，让智能体能自己跑）。
+
+    **一次批量写**（`write_many`）而不是逐文件：长程档的工作区有 38 个文件，
+    逐个写就是 38 次 `wsl.exe` 进程启动（约 10s），而每次跑都要付这笔钱。
+    """
     files = dict(task.seed_files)
     files.setdefault(PYTEST_INI_PATH, PYTEST_INI)
-    for relpath, content in files.items():
-        fs.write_text(f"{root}/{relpath}", content)
+    fs.write_many({f"{root}/{relpath}": content for relpath, content in files.items()})
 
 
 def apply_reference(task: EvalTask, fs: SandboxFs, root: str) -> None:
     """把参考解覆盖到种子上，用于验证任务可满足。"""
-    for relpath, content in task.reference.items():
-        fs.write_text(f"{root}/{relpath}", content)
+    fs.write_many({f"{root}/{relpath}": c for relpath, c in task.reference.items()})
 
 
 def prepare_for_judging(task: EvalTask, sandbox: WslSandbox, fs: SandboxFs, root: str) -> None:
@@ -218,10 +254,14 @@ def prepare_for_judging(task: EvalTask, sandbox: WslSandbox, fs: SandboxFs, root
     1. 删掉根目录下**不属于本任务**的 `test_*.py` —— 智能体自己写的临时测试
        不该参与判定（它可能本来就是正在调试的、失败的）。
     2. 写回纯净的可见测试，并加入隐藏测试。智能体改测试文件因此没有收益。
+
+    第 1 步只删**根目录**，不是漏了递归：判定走的是显式模块名（长程档）或
+    根目录下的 discover（前两档），`tests/` 里的事轮不到它管。真正让"智能体写的
+    测试影响不到判定"的，是长程档把判定收窄到指定模块 —— 那是结构性的，比
+    删文件更可靠。
     """
     sandbox.run(f"rm -f {shlex.quote(root)}/test_*.py")
-    for relpath, content in task.judge_files.items():
-        fs.write_text(f"{root}/{relpath}", content)
+    fs.write_many({f"{root}/{relpath}": c for relpath, c in task.judge_files.items()})
 
 
 _NO_TESTS_RE = re.compile(r"^Ran 0 tests", re.MULTILINE)
@@ -264,8 +304,9 @@ async def run_task(
 
     # 评测里没有人在场，审批必须预先给定。这是 **harness 的显式选择**，
     # 不是智能体绕过了审批：审批链路本身仍原样生效，只是答案由 harness 给出。
+    scoped = settings.model_copy(update=task.budget) if task.budget else settings
     runtime = AgentRuntime(
-        settings,
+        scoped,
         workspace=root,
         allow_write=True,
         approval_mode="approve",
@@ -274,6 +315,7 @@ async def run_task(
     )
 
     tool_calls = 0
+    writes = 0
     steps = 0
     replans = 0
     verifications: Counter[str] = Counter()
@@ -284,24 +326,32 @@ async def run_task(
     agent_error = ""
     started = time.perf_counter()
     try:
-        async for event in runtime.run(task.prompt, thread_id=f"eval-{task.id}"):
-            if isinstance(event, ToolCallStarted):
-                tool_calls += 1
-            elif isinstance(event, StepStarted):
-                steps = max(steps, event.index + 1)
-            elif isinstance(event, PlanRevised):
-                replans += 1
-            elif isinstance(event, Verification):
-                verifications[event.status] += 1
-            elif isinstance(event, RepairStarted):
-                repairs += 1
-            elif isinstance(event, RunFinished):
-                answer = event.answer
-                input_tokens, output_tokens = event.input_tokens, event.output_tokens
-            elif isinstance(event, RunFailed):
-                agent_error = event.message
-                # 失败路径的用量同样入账：失败的任务往往花费最多
-                input_tokens, output_tokens = event.input_tokens, event.output_tokens
+        # 墙钟上限是**护栏**不是判定：超时同样要往下走去判定（"做没做完"
+        # 由判定回答），只是把原因记进 detail。没有它，一个卡住的长程任务
+        # 会把串行的整轮评测钉死。
+        async with asyncio.timeout(task.agent_timeout):
+            async for event in runtime.run(task.prompt, thread_id=f"eval-{task.id}"):
+                if isinstance(event, ToolCallStarted):
+                    tool_calls += 1
+                    if event.name in _WRITE_TOOLS:
+                        writes += 1
+                elif isinstance(event, StepStarted):
+                    steps = max(steps, event.index + 1)
+                elif isinstance(event, PlanRevised):
+                    replans += 1
+                elif isinstance(event, Verification):
+                    verifications[event.status] += 1
+                elif isinstance(event, RepairStarted):
+                    repairs += 1
+                elif isinstance(event, RunFinished):
+                    answer = event.answer
+                    input_tokens, output_tokens = event.input_tokens, event.output_tokens
+                elif isinstance(event, RunFailed):
+                    agent_error = event.message
+                    # 失败路径的用量同样入账：失败的任务往往花费最多
+                    input_tokens, output_tokens = event.input_tokens, event.output_tokens
+    except TimeoutError:
+        agent_error = f"agent 超过墙钟上限 {task.agent_timeout}s 被中止"
     except Exception as exc:  # noqa: BLE001 - 编排层崩了也要留下记录，而不是中断整轮评测
         agent_error = f"{type(exc).__name__}: {exc}"
     finally:
@@ -323,8 +373,10 @@ async def run_task(
             replans=replans,
             verifications=dict(verifications),
             repairs=repairs,
+            writes=writes,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            budget=task.budget,
         )
 
     if agent_error:
@@ -343,8 +395,10 @@ async def run_task(
         answer=answer,
         verifications=dict(verifications),
         repairs=repairs,
+        writes=writes,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        budget=task.budget,
     )
 
 
@@ -478,6 +532,8 @@ def summarize(results: list[TaskResult]) -> dict:
                 "replans": r.replans,
                 "verifications": r.verifications,
                 "repairs": r.repairs,
+                "writes": r.writes,
+                "budget": r.budget,
                 "input_tokens": r.input_tokens,
                 "output_tokens": r.output_tokens,
                 "agent_seconds": round(r.agent_seconds, 1),
@@ -527,6 +583,43 @@ def noise_summary(runs: list[dict]) -> dict:
     }
 
 
+_SUMMED_TASK_FIELDS = ("tool_calls", "steps", "replans", "repairs", "writes")
+_TOKEN_FIELDS = ("input_tokens", "output_tokens")
+
+
+def _merge_task_rows(rows: list[dict], repeats: int) -> dict:
+    """把同一个任务各轮的行合成一行。
+
+    计数类**求和**，`verdict` 走 `_aggregate_verdict`。这条踩过一次：原先只覆盖了
+    `verdict` / `passes`，其余数值字段留着**第 1 轮**的 —— 于是一份 `--repeat 2` 的
+    baseline 里，通过率是两轮聚合、逐任务的 token / 验证次数却是第 1 轮的，
+    两个口径不同却长得一样。这和 `mechanism` 那次是同一个错，当时只修了后者。
+    """
+    merged = dict(rows[0])
+    for name in _SUMMED_TASK_FIELDS:
+        merged[name] = sum(int(row.get(name) or 0) for row in rows)
+
+    statuses: Counter[str] = Counter()
+    for row in rows:
+        statuses.update(row.get("verifications") or {})
+    merged["verifications"] = dict(sorted(statuses.items()))
+
+    for name in _TOKEN_FIELDS:
+        values = [row.get(name) for row in rows]
+        # 一条都没回报时保持 None —— 「没量到」与「量到零」含义不同
+        merged[name] = (
+            sum(int(v) for v in values if v is not None)
+            if any(v is not None for v in values)
+            else None
+        )
+
+    merged["agent_seconds"] = round(sum(float(r.get("agent_seconds") or 0) for r in rows), 1)
+    merged["verdict"] = _aggregate_verdict([r["verdict"] for r in rows], repeats)
+    merged["passes"] = sum(1 for r in rows if r["verdict"] == "passed")
+    merged["repeats"] = repeats
+    return merged
+
+
 def _aggregate_verdict(verdicts: list[str], repeats: int) -> str:
     """逐任务在 k 次里的合成结论。
 
@@ -555,10 +648,10 @@ def aggregate_runs(runs: list[dict]) -> dict:
         return summary
 
     total = runs[0]["total"]
-    per_task: dict[str, list[str]] = {}
+    rows_by_id: dict[str, list[dict]] = {}
     for run in runs:
         for task in run["tasks"]:
-            per_task.setdefault(task["id"], []).append(task["verdict"])
+            rows_by_id.setdefault(task["id"], []).append(task)
 
     mean_rate = sum(run["pass_rate"] for run in runs) / len(runs)
     summary = dict(runs[0])
@@ -578,12 +671,7 @@ def aggregate_runs(runs: list[dict]) -> dict:
             }
         summary[key] = merged
     summary["tasks"] = [
-        {
-            **task,
-            "verdict": _aggregate_verdict(per_task[task["id"]], len(runs)),
-            "passes": per_task[task["id"]].count("passed"),
-            "repeats": len(runs),
-        }
+        _merge_task_rows(rows_by_id[task["id"]], len(runs))
         for task in runs[0]["tasks"]
     ]
     summary["noise"] = noise_summary(runs)
@@ -699,8 +787,14 @@ def sandbox_capabilities(sandbox: WslSandbox) -> dict[str, bool]:
     return {name: sandbox.run(command).ok for name, command in probes.items()}
 
 
-def baseline_path() -> Path:
-    return Path(__file__).resolve().parent / "baseline.json"
+def baseline_path(suite: str = "default") -> Path:
+    """套件各自的 canonical 基线。
+
+    分开存是有意的：长程档的通任务成本与波动量级都与前两档不同，
+    混在一个文件里报会让人以为它们是可比的同一把尺子。
+    """
+    name = "baseline.json" if suite == "default" else f"baseline_{suite}.json"
+    return Path(__file__).resolve().parent / name
 
 
 def eval_audit_dir() -> Path:

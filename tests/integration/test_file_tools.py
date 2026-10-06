@@ -392,3 +392,65 @@ def test_fs_read_empty_file_returns_empty(require_wsl, tools, workspace) -> None
     assert artifact.ok, text
     assert "文件为空" in text
 
+
+
+# ---------------- 批量物化（write_many） ----------------
+#
+# 评测任务的种子有几十个文件，而 write_text 是"一个文件一次 wsl.exe"。
+# 这里钉住两件事：**一次调用能写完一整批**，以及**越界时一个字节都不写**
+# （逐个写做不到后者：写到第 7 个才发现越界时，前 6 个已经落盘了）。
+
+def test_write_many_creates_a_whole_batch_in_one_call(
+    require_wsl: WslSandbox, workspace: str
+) -> None:
+    fs = SandboxFs(require_wsl, workspace)
+    files = {
+        f"{workspace}/app/models.py": "class Item:\n    pass\n",
+        f"{workspace}/app/handlers/orders.py": "def handle():\n    return 1\n",
+        f"{workspace}/tests/__init__.py": "",
+        f"{workspace}/deep/deeper/note.txt": "中文内容\n",
+    }
+
+    written = fs.write_many(files)
+
+    assert written == sum(len(c.encode("utf-8")) for c in files.values())
+    for path, content in files.items():
+        assert fs.read_text(path, max_bytes=100_000) == content
+    # 空文件确实被创建了，而不是被跳过
+    assert require_wsl.run(f"[ -f {shlex.quote(workspace + '/tests/__init__.py')} ]").ok
+
+
+def test_write_many_refuses_the_whole_batch_when_any_path_escapes(
+    require_wsl: WslSandbox, workspace: str
+) -> None:
+    """全有或全无：越界时不能留下半成品工作区。"""
+    from coding_agent.sandbox.pathguard import SandboxPathError
+
+    fs = SandboxFs(require_wsl, workspace)
+
+    with pytest.raises(SandboxPathError):
+        fs.write_many({f"{workspace}/innocent.py": "x = 1\n", "/etc/agent-evil": "boom\n"})
+
+    assert not require_wsl.run(f"[ -e {shlex.quote(workspace + '/innocent.py')} ]").ok
+
+
+def test_write_many_rejects_a_symlinked_escape(
+    require_wsl: WslSandbox, workspace: str
+) -> None:
+    """宿主侧的词法校验挡不住符号链接，必须由脚本内的 realpath 校验兜住。"""
+    from coding_agent.sandbox.pathguard import SandboxPathError
+
+    fs = SandboxFs(require_wsl, workspace)
+    require_wsl.run(f"ln -sfn /etc {shlex.quote(workspace + '/link')}")
+
+    with pytest.raises(SandboxPathError):
+        fs.write_many({f"{workspace}/link/agent-evil.conf": "boom\n"})
+
+    assert not require_wsl.run("[ -e /etc/agent-evil.conf ]").ok
+
+
+def test_write_many_with_nothing_to_do_is_a_noop(
+    require_wsl: WslSandbox, workspace: str
+) -> None:
+    fs = SandboxFs(require_wsl, workspace)
+    assert fs.write_many({}) == 0

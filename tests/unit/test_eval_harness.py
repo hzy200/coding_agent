@@ -29,6 +29,7 @@ from harness import (  # noqa: E402
     DEEP,
     DEFAULT_JUDGE,
     EVAL_DIRNAME,
+    LONG,
     SPEC,
     TIERS,
     TaskResult,
@@ -41,7 +42,15 @@ from harness import (  # noqa: E402
     noise_summary,
     summarize,
 )
+from repogen import (  # noqa: E402
+    RepoSpec,
+    build_repo,
+    build_variant,
+    changed_sources,
+    file_stats,
+)
 from tasks import TASKS  # noqa: E402
+from tasks_long import LONG_TASKS  # noqa: E402
 
 IDS = [task.id for task in TASKS]
 
@@ -78,11 +87,16 @@ def test_every_category_has_tasks() -> None:
 
 
 def test_the_baseline_is_wide_enough_to_mean_something() -> None:
-    """太小的集合上，一个任务的成败就是好几个百分点。"""
+    """太小的集合上，一个任务的成败就是好几个百分点。
+
+    注意默认套件里**没有** long 档 —— 长程任务单独成套件（成本高得多，
+    而且波动量级不同），所以这里是 `<=` 而不是 `==`。
+    """
     assert len(TASKS) >= 26, "任务总量太少"
     per_tier = Counter(task.tier for task in TASKS)
-    assert set(per_tier) == set(TIERS), f"分层覆盖不全：{dict(per_tier)}"
+    assert set(per_tier) <= set(TIERS), f"有未登记的档位：{dict(per_tier)}"
     assert per_tier[BASIC] >= 20 and per_tier[DEEP] >= 6
+    assert LONG not in per_tier, "长程档不该混进默认套件"
     per_category = Counter(task.category for task in TASKS)
     assert set(per_category) == set(CATEGORIES), f"类别覆盖不全：{dict(per_category)}"
     assert min(per_category.values()) >= 2, f"某一类任务太少：{dict(per_category)}"
@@ -460,3 +474,201 @@ def test_comparability_lists_every_reason_not_just_the_first() -> None:
         full_set=False, capabilities={"pytest": False}, git={"git_dirty": True}
     )
     assert len(reasons) == 3
+
+
+# --------------------------------------------------------------------------
+# 长程档：几十个文件的仓库
+#
+# 这一档的判定走**显式模块名**而不是 `unittest discover`。discover 在多层包的
+# 大仓库上会踩一串问题（同名 basename、子目录可导入性、收集顺序），最要命的是
+# **智能体写在 tests/ 里的临时测试会被一并收进来** —— 而 prepare_for_judging
+# 只删根级 test_*.py。收窄到指定模块，这一整类风险就结构性地消失了。
+# --------------------------------------------------------------------------
+
+LONG_IDS = [task.id for task in LONG_TASKS]
+GENERATOR_SPEC = RepoSpec()
+
+
+def _judge_modules(task) -> list[str]:
+    """从判定命令里取出模块名（把 `python3` 换成当前解释器）。"""
+    return [part for part in task.judge.split() if part.startswith("tests.")]
+
+
+def _run_judge(
+    task, root: Path, *, modules: list[str] | None = None
+) -> subprocess.CompletedProcess:
+    args = [sys.executable, "-m", "unittest", "-v", *(modules or _judge_modules(task))]
+    return subprocess.run(
+        args, cwd=root, capture_output=True, text=True, timeout=180, check=False
+    )
+
+
+@pytest.mark.parametrize("task", LONG_TASKS, ids=LONG_IDS)
+def test_long_tasks_are_well_formed(task) -> None:
+    assert task.tier == LONG
+    assert task.prompt.strip() and task.sources and task.tests
+    # 长程档必须能证明可满足 —— 多文件改动最容易写出自相矛盾的任务
+    assert task.reference, f"{task.id} 长程档必须提供参考解"
+    assert task.agent_timeout > 0, "长程任务必须有墙钟护栏"
+    keys = [set(task.sources), set(task.tests), set(task.hidden_tests)]
+    assert not (keys[0] & keys[1]) and not (keys[1] & keys[2])
+
+
+@pytest.mark.parametrize("task", LONG_TASKS, ids=LONG_IDS)
+def test_long_tasks_judge_by_explicit_modules(task) -> None:
+    """判定必须显式列模块，且零依赖。"""
+    assert "discover" not in task.judge, f"{task.id} 不该用 discover 判定大仓库"
+    assert "pytest" not in task.judge
+    assert _judge_modules(task), f"{task.id} 的判定命令里没有 tests.* 模块"
+
+
+def test_the_long_repo_is_actually_large() -> None:
+    """「几十个文件」是这个档位存在的理由，不是装饰。"""
+    stats = file_stats(build_variant(GENERATOR_SPEC))
+    assert stats["files"] >= 30, f"仓库只有 {stats['files']} 个文件，量级不够"
+    assert stats["lines"] >= 800, f"仓库只有 {stats['lines']} 行"
+
+
+def test_the_generator_is_deterministic() -> None:
+    """同一份规格必须逐字节生成同一份仓库 —— 否则基线不可复现。"""
+    assert build_variant(GENERATOR_SPEC).files == build_variant(GENERATOR_SPEC).files
+    assert (
+        build_variant(GENERATOR_SPEC, features=("discount",)).files
+        == build_variant(GENERATOR_SPEC, features=("discount",)).files
+    )
+
+
+def test_generator_patches_must_match_exactly_once() -> None:
+    """`patch()` 的锚点必须恰好出现一次。
+
+    这是整个生成方案的结构性保障：模板改了而功能线没跟着改时，补丁会**静默失效**
+    （功能没接上），而"种子必挂 / 参考解必过"这两条会随之静默走样。
+    """
+    files = build_repo(GENERATOR_SPEC)
+    files.patch("app/models.py", "class Order:", "class Order:  # patched")
+    assert "# patched" in files["app/models.py"]
+
+    with pytest.raises(AssertionError, match="恰好 1 次"):
+        files.patch("app/models.py", "不存在的锚点", "x")
+    with pytest.raises(AssertionError, match="恰好 1 次"):
+        files.patch("app/models.py", "def ", "x")  # 出现多次
+
+
+def test_the_feature_spans_several_layers() -> None:
+    """功能增量必须**贯通多层**，否则量不出长程。
+
+    少于 5 个文件就说明它退化成"改一两行"了 —— 那正是这一档要避免的。
+    """
+    seed = build_variant(GENERATOR_SPEC)
+    reference = build_variant(GENERATOR_SPEC, features=("discount",))
+    changed = changed_sources(seed, reference)
+    assert len(changed) >= 5, f"折扣功能只改了 {len(changed)} 个文件，太短"
+
+
+@pytest.mark.parametrize("task", LONG_TASKS, ids=LONG_IDS)
+def test_long_seed_is_unsolved_under_its_own_judge(task, tmp_path: Path) -> None:
+    """种子状态必须不通过（含隐藏测试）。"""
+    _write_seed(task, tmp_path)
+    proc = _run_judge(task, tmp_path)
+    output = proc.stdout + proc.stderr
+    assert proc.returncode != 0 and "FAILED" in output, (
+        f"{task.id} 的种子状态判定异常（退出码 {proc.returncode}）\n{output[-800:]}"
+    )
+
+
+@pytest.mark.parametrize("task", LONG_TASKS, ids=LONG_IDS)
+def test_long_reference_solution_passes_its_own_judge(task, tmp_path: Path) -> None:
+    """种子 + 参考解必须通过 —— 挡"任务根本无解"这类假阴性。"""
+    _write_seed(task, tmp_path)
+    _write(task, tmp_path, task.reference)
+    proc = _run_judge(task, tmp_path)
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, f"{task.id} 参考解没通过判定（任务不可满足）\n{output[-1200:]}"
+
+
+@pytest.mark.parametrize(
+    "task", [t for t in LONG_TASKS if t.hidden_tests], ids=lambda t: t.id
+)
+def test_long_spec_visible_tests_are_green_on_the_seed(task, tmp_path: Path) -> None:
+    """spec 类的前提：**可见测试在种子态全绿**。
+
+    否则它就不是"可见测试全绿、需求未满足"，而是普通的"测试是红的"任务 ——
+    那样测的是"让测试变绿"，而不是"照着需求做对"。
+    """
+    _write(task, tmp_path, task.seed_files)
+    visible = [m for m in _judge_modules(task) if "hidden" not in m]
+    proc = _run_judge(task, tmp_path, modules=visible)
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 0, f"{task.id} 的可见测试在种子态就是红的\n{output[-800:]}"
+
+
+def test_long_tasks_have_distinct_ids_and_a_tier_that_shows_up() -> None:
+    assert len(set(LONG_IDS)) == len(LONG_IDS)
+    assert {t.tier for t in LONG_TASKS} == {LONG}
+    assert "long" in TIERS and LONG == "long"
+
+
+@pytest.mark.parametrize("task", LONG_TASKS, ids=LONG_IDS)
+def test_long_budget_overrides_reach_real_settings_fields(task) -> None:
+    """预算覆盖的键名必须真的存在 —— 写错不会报错，只会**静默不生效**。
+
+    `Settings.model_copy(update=...)` 不做校验，塞一个不存在的键只会多出一个
+    无用的属性，而预算看起来"配了"其实没生效。这种静默失效正是这一轮在治的病。
+    """
+    from coding_agent.config import Settings
+
+    assert task.budget, f"{task.id} 长程任务必须显式声明预算（探路实测它会撞上限）"
+    unknown = set(task.budget) - set(Settings.model_fields)
+    assert not unknown, f"{task.id} 的预算里有不存在的配置项：{sorted(unknown)}"
+    for name, value in task.budget.items():
+        assert isinstance(value, int) and value > 0, f"{task.id} 的 {name}={value!r} 不合法"
+
+
+def test_long_budget_is_larger_than_the_default() -> None:
+    """抬预算是为了把「被预算卡住」与「真做不成」分开，所以必须**确实更大**。"""
+    from coding_agent.config import Settings
+
+    defaults = Settings(_env_file=None)
+    budget = LONG_TASKS[0].budget or {}
+    for name, value in budget.items():
+        assert value > getattr(defaults, name), (
+            f"{name}={value} 没有超过默认值 {getattr(defaults, name)}，抬预算没有意义"
+        )
+
+
+def test_aggregate_merges_every_per_task_number_not_just_the_verdict() -> None:
+    """`--repeat k` 时逐任务的**数值字段也必须跨轮聚合**。
+
+    这条踩过两次：先是 `mechanism`，后是逐任务行 —— 后者只覆盖了 verdict/passes，
+    其余数值留着第 1 轮的，于是一份 `--repeat 2` 的 baseline 里通过率是两轮聚合、
+    逐任务的 token 与验证次数却是第 1 轮的。口径不同却长得一样。
+    """
+    run1 = summarize([_result("t", verifications={"failed": 3}, repairs=2, writes=4,
+                              tool_calls=10, input_tokens=100)])
+    run2 = summarize([_result("t", "failed", verifications={"ok": 1}, repairs=5, writes=0,
+                              tool_calls=7, input_tokens=50)])
+    row = aggregate_runs([run1, run2])["tasks"][0]
+
+    assert row["verdict"] == "flaky" and row["passes"] == 1 and row["repeats"] == 2
+    assert row["tool_calls"] == 17          # 求和，不是取第 1 轮的 10
+    assert row["repairs"] == 7
+    assert row["writes"] == 4
+    assert row["verifications"] == {"failed": 3, "ok": 1}
+    assert row["input_tokens"] == 150
+
+
+def test_writes_distinguishes_did_nothing_from_did_it_wrong() -> None:
+    """「只读不写」与「改了但没做对」在通过率上长得一样，`writes` 才分得开。
+
+    实测里出现过前一种：模型全程只读、计划照常推进到最后一步（`dirty` 一直是
+    False，verify 与 review 都短路）。两种失败的处置完全不同 —— 前者要查为什么
+    不动手，后者才是能力问题。
+    """
+    did_nothing = _result("a", "failed", writes=0, tool_calls=15, steps=7)
+    tried_and_failed = _result("b", "failed", writes=6, tool_calls=27, steps=2)
+
+    summary = summarize([did_nothing, tried_and_failed])
+    by_id = {t["id"]: t for t in summary["tasks"]}
+
+    assert by_id["a"]["verdict"] == by_id["b"]["verdict"] == "failed"  # 通过率相同
+    assert by_id["a"]["writes"] == 0 and by_id["b"]["writes"] == 6      # 但这个分得开

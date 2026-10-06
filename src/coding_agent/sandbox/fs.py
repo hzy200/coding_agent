@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import shlex
 from dataclasses import dataclass
 
@@ -278,6 +279,84 @@ __AGENT_PAYLOAD__
                 )
             raise SandboxFsError(f"写入失败：{result.render(500)}")
         return len(content.encode("utf-8"))
+
+    def write_many(self, files: dict[str, str]) -> int:
+        """一次进程启动写入多个文件，返回写入的总字节数。
+
+        为什么需要它：`write_text` 是"一个文件一次 `wsl.exe`"（每次约 0.2–0.3s），
+        而几十个文件的工作区（评测任务的种子、参考解、判定前恢复测试）每次都要
+        整份重写 —— 逐个写就是几十次进程启动，光物化就十几秒。
+
+        与 `write_text` 的关系是**同一个不变量的两种粒度**，不是绕过它：
+        路径校验、realpath 校验、父目录创建都在脚本里做，且**先全量校验再落盘** ——
+        任何一个路径越界就一个字节都不写，不留下半成品工作区（逐个写做不到这点，
+        写到第 7 个文件才发现越界时前 6 个已经落盘了）。
+
+        内容来自宿主自己的任务定义（不是模型产出），但校验一样不能省：路径仍可能
+        因为配置或任务写错而越界。
+        """
+        if not files:
+            return 0
+
+        # 宿主侧先做词法校验（零 I/O）：绝对路径与 `..` 在这里就拒掉，
+        # 不必让沙箱去发现一个本来就能提前知道的问题。
+        targets: dict[str, str] = {}
+        for path, content in files.items():
+            targets[ensure_inside(path, self.root, cwd=self.root)] = content
+
+        payload = base64.b64encode(
+            json.dumps(targets, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii")
+        script = f"""\
+root={_quote(self.real_root)}
+python3 - "$root" <<'__AGENT_WRITE_MANY__'
+import base64, json, os, sys
+
+root = os.path.realpath(sys.argv[1])
+files = json.loads(base64.b64decode("__AGENT_PAYLOAD__").decode("utf-8"))
+
+# 先全量校验，再落盘 —— 越界时一个字节都不写
+def escaped(where):
+    sys.stderr.write("ESCAPED=" + where + "\\n")
+    raise SystemExit(9)
+
+
+def inside(path):
+    return path == root or path.startswith(root + os.sep)
+
+
+checked = []
+for path, content in files.items():
+    # 父目录与目标自身都要按 realpath 校验（与 write_text 同一套判定）：
+    # 只判父目录挡不住"目标本身是指向工作区外的符号链接"。
+    if not inside(os.path.realpath(os.path.dirname(path))):
+        escaped(os.path.realpath(os.path.dirname(path)))
+    if os.path.exists(path) or os.path.islink(path):
+        if not inside(os.path.realpath(path)):
+            escaped(os.path.realpath(path))
+    checked.append((path, content))
+
+written = 0
+for path, content in checked:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    written += len(content.encode("utf-8"))
+print("WROTE=%d" % written)
+__AGENT_WRITE_MANY__
+"""
+        # 不折行：这份 payload 是内联的 **Python 字符串字面量**（不像 write_text
+        # 那样喂给 `base64 -d`），折行会直接变成语法错。脚本经 stdin 传，
+        # 没有命令行长度上限，一整行再长也无妨。
+        script = script.replace("__AGENT_PAYLOAD__", payload)
+        result = self._sandbox.run(script)
+        if not result.ok:
+            if "ESCAPED=" in (result.stderr or ""):
+                raise SandboxPathError(
+                    f"路径经符号链接逃出工作区，已拒绝写入（批量）：{result.stderr.strip()}"
+                )
+            raise SandboxFsError(f"批量写入失败：{result.render(500)}")
+        return sum(len(content.encode("utf-8")) for content in files.values())
 
     def remove(self, path: str) -> bool:
         """删除工作区内的**普通文件**，返回它此前是否存在。
