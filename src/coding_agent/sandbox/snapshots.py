@@ -31,6 +31,17 @@ BACKUP_DIRNAME = f"{AGENT_STATE_DIRNAME}/backups"
 
 ACTION_RESTORE = "restore"
 
+# 「留底时这个文件还不存在」的标记后缀。与内容文件同目录存放（`<path>.absent`），
+# 列目录时按后缀过滤掉，所以不会混进快照列表里。
+# 没有它就无法区分「原来是个空文件」和「原来根本没有这个文件」—— 而两者的
+# 回滚结果不同：前者还原成空文件，后者删掉。
+ABSENT_SUFFIX = ".absent"
+
+# 不进模型上下文的操作（快照留底、改前读出再写回）所用的体积上限。
+# 与 `settings.max_file_read_bytes` 不是一个口径：后者约束的是**喂给模型**的
+# 内容量，用在这里会把 2MB 以上的文件变成「改不了」，逼模型退回 shell。
+MAX_OPERATIONAL_BYTES = 10_000_000
+
 # 同一时钟刻度内生成多个 id 时，用它保证严格递增（进程内有效）
 _SNAPSHOT_SEQ = itertools.count()
 
@@ -88,11 +99,29 @@ class SnapshotStore:
     # 写入
     # ------------------------------------------------------------------
 
-    def save(self, path: str, original: str) -> str:
-        """把 path 当前的内容留底，返回 snapshot_id。"""
+    def save(self, path: str, original: str, *, existed: bool = True) -> str:
+        """把 path 当前的内容留底，返回 snapshot_id。
+
+        `existed=False` 表示**这次写入是新建**：光存一份空内容不够 —— 回滚时无法
+        区分「原来就是空文件」和「原来不存在」，于是只能还原成空文件，在工作区里
+        留下一堆删不掉的垃圾。所以额外落一个标记，让回滚可以真的删掉它。
+        """
         snapshot_id = _new_snapshot_id()
-        self._write(snapshot_id, _relpath(path, self.root), original)
+        relpath = _relpath(path, self.root)
+        self._write(snapshot_id, relpath, original)
+        if not existed:
+            self._write(snapshot_id, f"{relpath}{ABSENT_SUFFIX}", "")
         return snapshot_id
+
+    def was_absent(self, entry: SnapshotEntry) -> bool:
+        """这份留底是否代表「当时文件不存在」。"""
+        marker = posixpath.join(
+            self.backup_root, entry.snapshot_id, f"{entry.path}{ABSENT_SUFFIX}"
+        )
+        try:
+            return self._fs.stat(marker).exists
+        except (SandboxFsError, SandboxPathError):
+            return False
 
     def _write(self, snapshot_id: str, relpath: str, content: str) -> None:
         target = posixpath.join(self.backup_root, snapshot_id, relpath.lstrip("/"))
@@ -116,8 +145,12 @@ class SnapshotStore:
         for line in result.stdout.splitlines():
             name = line.strip()
             snapshot_id, sep, relpath = name.partition("/")
-            if sep and snapshot_id and relpath:
-                entries.append(SnapshotEntry(snapshot_id=snapshot_id, path=relpath))
+            # 标记文件不是一份留底，只是「当时不存在」的附注
+            if not sep or not snapshot_id or not relpath:
+                continue
+            if relpath.endswith(ABSENT_SUFFIX):
+                continue
+            entries.append(SnapshotEntry(snapshot_id=snapshot_id, path=relpath))
 
         entries.sort(key=lambda e: e.snapshot_id, reverse=True)
         return entries[:limit] if limit > 0 else entries
@@ -144,29 +177,47 @@ class SnapshotStore:
 
     def read(self, entry: SnapshotEntry) -> str:
         target = posixpath.join(self.backup_root, entry.snapshot_id, entry.path)
-        return self._fs.read_text(target, max_bytes=10_000_000)
+        return self._fs.read_text(target, max_bytes=MAX_OPERATIONAL_BYTES)
 
     # ------------------------------------------------------------------
     # 恢复
     # ------------------------------------------------------------------
 
     def restore(self, entry: SnapshotEntry) -> RestoreResult:
-        """把文件还原到该快照的内容；还原前先把当前内容留底。"""
+        """把文件还原到该快照的状态；还原前先把当前内容留底。
+
+        留底记的是「当时不存在」时，还原结果是**删掉这个文件**。还原成空文件不算
+        回到原状 —— 那会在工作区里留下一堆删不掉的垃圾文件。
+        """
         target = posixpath.join(self.root, entry.path)
-        try:
-            original = self.read(entry)
-        except (SandboxFsError, SandboxPathError) as exc:
-            return RestoreResult(ok=False, path=entry.path, message=f"快照内容读取失败：{exc}")
+        absent = self.was_absent(entry)
+
+        original = ""
+        if not absent:
+            try:
+                original = self.read(entry)
+            except (SandboxFsError, SandboxPathError) as exc:
+                return RestoreResult(
+                    ok=False, path=entry.path, message=f"快照内容读取失败：{exc}"
+                )
 
         current: str | None = None
         try:
             info = self._fs.stat(target)
             if info.exists and info.is_file:
-                current = self._fs.read_text(target, max_bytes=10_000_000)
+                current = self._fs.read_text(target, max_bytes=MAX_OPERATIONAL_BYTES)
         except (SandboxFsError, SandboxPathError):
             current = None
 
-        if current == original:
+        if absent and current is None:
+            return RestoreResult(
+                ok=True,
+                path=entry.path,
+                snapshot_id=entry.snapshot_id,
+                message=f"{entry.path} 当前已不存在，无需回滚。",
+            )
+
+        if not absent and current == original:
             return RestoreResult(
                 ok=True,
                 path=entry.path,
@@ -185,6 +236,30 @@ class SnapshotStore:
                     path=entry.path,
                     message=f"回滚前的留底失败，已中止：{exc}",
                 )
+
+        # 回滚一次新建 = 删除。删之前已经留了底，所以这次删除本身也能被回滚
+        if absent:
+            try:
+                self._fs.remove(target)
+            except (SandboxFsError, SandboxPathError) as exc:
+                return RestoreResult(
+                    ok=False, path=entry.path, message=f"回滚删除失败：{exc}"
+                )
+            diff = unified_diff(current or "", "", entry.path)
+            added, removed = count_changes(diff)
+            return RestoreResult(
+                ok=True,
+                path=entry.path,
+                snapshot_id=entry.snapshot_id,
+                undo_snapshot_id=undo_snapshot_id,
+                added=added,
+                removed=removed,
+                diff=diff,
+                message=(
+                    f"已删除 {entry.path}（回滚新建：留底时这个文件不存在，"
+                    f"当前内容已留底为 {undo_snapshot_id or '无'}）"
+                ),
+            )
 
         try:
             self._fs.write_text(target, original)

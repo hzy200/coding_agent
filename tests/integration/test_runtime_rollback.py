@@ -70,9 +70,10 @@ def test_list_snapshots_returns_recent_first(ctx) -> None:
     _edit(ctx, "a.py", "v1", "v2")
     _edit(ctx, "a.py", "v2", "v3")
 
+    # 3 份：新建一份 + 两次改动各一份（新建那份记的是「当时不存在」）
     entries = ctx["runtime"].list_snapshots()
-    assert len(entries) == 2
-    assert entries[0].snapshot_id > entries[1].snapshot_id
+    assert len(entries) == 3
+    assert entries[0].snapshot_id > entries[1].snapshot_id > entries[2].snapshot_id
 
 
 def test_list_snapshots_honours_limit(ctx) -> None:

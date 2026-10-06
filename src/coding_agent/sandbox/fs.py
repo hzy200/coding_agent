@@ -30,6 +30,16 @@ class SandboxFsError(RuntimeError):
     """文件系统操作失败（沙箱不可用、路径非法等）。"""
 
 
+class SandboxFsTooLarge(SandboxFsError):
+    """文件超过了本次操作允许的大小上限。
+
+    单独成一个类型，是为了让调用方能**只对这一种失败**给退路：
+    `file_read` 有 offset/limit 可以分段读，`file_edit` 没有。
+    早先统一在错误后面拼一句「请用 offset/limit 分段读取」，
+    于是文件不存在、是二进制时也被这么提示，模型会照着再试一轮白烧工具预算。
+    """
+
+
 @dataclass(slots=True)
 class FileStat:
     exists: bool
@@ -162,10 +172,24 @@ fi
         self._check_real_path(lexical, info)
         return lexical, info
 
+    def lexical(self, path: str) -> str:
+        """只做词法归一化，**零 I/O**。
+
+        相对路径按工作区根展开 —— 模型习惯给 `src/a.py` 这样的相对路径。
+
+        与 `resolve()` 的区别：`resolve` 还要在沙箱内 `realpath` 校验符号链接，
+        那是一次 `wsl.exe` 进程启动。而紧随其后的 `read_text` / `read_bytes`
+        本来就会做同一套校验（见 `read_bytes`），于是「先 resolve 再读」等于
+        为同一次读付两次启动。只要接着就要读/写，用它就够了。
+        """
+        return ensure_inside(path, self.root, cwd=self.root)
+
     def resolve(self, path: str) -> str:
         """返回通过双重校验的可用路径。
 
         相对路径按工作区根展开 —— 模型习惯给 `src/a.py` 这样的相对路径。
+
+        只在**不接着读写**时才该用它（例如只要一个展示用路径）。
         """
         return self.probe(path)[0]
 
@@ -192,8 +216,12 @@ fi
         if not info.is_file:
             raise SandboxFsError(f"不是普通文件：{lexical}")
         if info.size > max_bytes:
-            raise SandboxFsError(
-                f"文件过大：{info.size} 字节（上限 {max_bytes}）。请用 offset/limit 分段读取。"
+            # 只说事实、不说办法：调用方才知道自己有什么退路（file_read 有
+            # offset/limit，file_edit 没有 —— 曾经统一写「请用 offset/limit
+            # 分段读取」，把改不动大文件的模型直接推向 shell）。
+            # 类型本身携带「这是大小问题」，退路由调用方各自补。
+            raise SandboxFsTooLarge(
+                f"文件过大：{info.size} 字节（本次操作上限 {max_bytes} 字节）"
             )
         if data is None:
             raise SandboxFsError(f"读取失败：没有取到内容（{lexical}）")
@@ -250,6 +278,44 @@ __AGENT_PAYLOAD__
                 )
             raise SandboxFsError(f"写入失败：{result.render(500)}")
         return len(content.encode("utf-8"))
+
+    def remove(self, path: str) -> bool:
+        """删除工作区内的**普通文件**，返回它此前是否存在。
+
+        唯一用途是「回滚一次新建」——留底时那个文件还不存在，把它还原成空文件
+        等于留下一堆垃圾，还原成「不存在」才是真的回到原状。因此这里只删文件：
+        目录、符号链接一律拒绝（符号链接可能是逃逸通道，删它也可能删到工作区外）。
+        """
+        lexical = ensure_inside(path, self.root, cwd=self.root)
+        # 先探一次：既拿到状态（存在吗、是文件吗），也完成 realpath 校验
+        info = self.stat(lexical)
+        self._check_real_path(lexical, info)
+        if not info.exists:
+            return False
+        if not info.is_file:
+            raise SandboxFsError(f"不是普通文件，拒绝删除：{lexical}")
+
+        script = f"""\
+p={_quote(lexical)}
+root={_quote(self.real_root)}
+if [ -e "$p" ] || [ -L "$p" ]; then
+  real_p=$(realpath -m -- "$p")
+  case "$real_p" in
+    "$root"|"$root"/*) ;;
+    *) echo "ESCAPED=$real_p" >&2; exit 9 ;;
+  esac
+fi
+rm -f -- "$p"
+"""
+        result = self._sandbox.run(script)
+        if not result.ok:
+            if "ESCAPED=" in (result.stderr or ""):
+                raise SandboxPathError(
+                    f"路径经符号链接逃出工作区，已拒绝删除：{lexical}"
+                    f"（{result.stderr.strip()}）"
+                )
+            raise SandboxFsError(f"删除失败：{result.render(500)}")
+        return True
 
 
 def _wrap(payload: str, width: int = 76) -> str:

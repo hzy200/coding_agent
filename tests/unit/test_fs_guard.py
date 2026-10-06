@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import base64
 
-from coding_agent.sandbox.fs import SandboxFs
+import pytest
+
+from coding_agent.sandbox.fs import SandboxFs, SandboxFsError, SandboxFsTooLarge
+from coding_agent.sandbox.pathguard import SandboxPathError
 
 
 def _fs() -> SandboxFs:
@@ -66,3 +69,69 @@ def test_parse_stat_non_empty_decodes() -> None:
     payload = base64.b64encode("你好".encode()).decode()
     _, data = SandboxFs._parse_stat(_stdout(size=6, data_line=f"DATA={payload}"))
     assert data == "你好".encode()
+
+
+# ---------------- lexical：零 I/O 的词法归一化 ----------------
+
+
+def test_lexical_expands_a_relative_path_against_the_workspace() -> None:
+    fs = _fs()
+    assert fs.lexical("src/a.py") == "/ws/src/a.py"
+    assert fs.lexical("/ws/src/a.py") == "/ws/src/a.py"
+
+
+def test_lexical_rejects_escapes_without_asking_the_sandbox() -> None:
+    """越界路径在 Python 侧就被挡下 —— `lexical` 不该产生任何进程启动。
+
+    传 None 当沙箱：只要它真发了命令，这里就会以 AttributeError 炸掉，
+    而不是静默地多跑一趟 wsl.exe。
+    """
+    fs = _fs()
+    with pytest.raises(SandboxPathError):
+        fs.lexical("../etc/passwd")
+    with pytest.raises(SandboxPathError):
+        fs.lexical("/etc/passwd")
+
+
+# ---------------- 超限是可区分的失败类型 ----------------
+
+
+class _StubSandbox:
+    """只回答 stat 脚本的假沙箱：`read_bytes` 的其他分支用不到真 WSL。"""
+
+    def __init__(self, stdout: str) -> None:
+        self.stdout = stdout
+        self.runs = 0
+
+    def run(self, command: str, *, cwd: str | None = None, timeout: int | None = None):
+        from coding_agent.sandbox.wsl_exec import ExecResult
+
+        self.runs += 1
+        # real_root 那条命令回答工作区自身路径
+        out = "/ws" if command.startswith("realpath") else self.stdout
+        return ExecResult(command=command, exit_code=0, stdout=out, stderr="", duration_ms=0)
+
+
+def _read_with(stdout: str, *, max_bytes: int) -> None:
+    SandboxFs(_StubSandbox(stdout), "/ws").read_bytes("/ws/x", max_bytes=max_bytes)
+
+
+def test_oversized_read_raises_a_distinguishable_error() -> None:
+    """「文件过大」必须能被单独认出来 —— 只有它有退路（file_read 的 offset/limit）。
+
+    曾经所有失败都拼同一句提示，文件不存在时也让人去分段读。
+    """
+    assert issubclass(SandboxFsTooLarge, SandboxFsError)
+    with pytest.raises(SandboxFsTooLarge):
+        _read_with("EXISTS=1\nFILE=1\nSIZE=9999\nREAL=/ws/x\n", max_bytes=10)
+
+
+def test_other_read_failures_are_not_reported_as_oversized() -> None:
+    """文件不存在 / 非普通文件不能带上「可以分段读」的暗示。"""
+    for stdout in (
+        "EXISTS=0\nFILE=0\nSIZE=0\nREAL=/ws/x\n",
+        "EXISTS=1\nFILE=0\nSIZE=0\nREAL=/ws/x\n",
+    ):
+        with pytest.raises(SandboxFsError) as excinfo:
+            _read_with(stdout, max_bytes=10)
+        assert not isinstance(excinfo.value, SandboxFsTooLarge)

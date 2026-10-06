@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from coding_agent.tools.artifacts import (
+    CallArtifact,
     FileArtifact,
     ShellArtifact,
     pack,
@@ -68,6 +69,13 @@ def test_parse_artifact_dispatches_on_kind() -> None:
     file = parse_artifact(FileArtifact(path="a.py", action="edit", added=2).model_dump())
     assert isinstance(file, FileArtifact)
     assert file.added == 2
+
+    call = parse_artifact(
+        CallArtifact(tool="git_commit", ok=False, rejected=True, level=2).model_dump()
+    )
+    assert isinstance(call, CallArtifact)
+    assert call.tool == "git_commit"
+    assert call.rejected is True
 
 
 def test_parse_artifact_rejects_unknown_and_malformed() -> None:

@@ -1,6 +1,11 @@
 """TUI 无头测试：注入假的 runtime，验证「事件 → 界面」的映射。
 
 不需要 API Key，也不需要 WSL —— 这正是事件层解耦换来的可测性。
+
+textual 属于可选的 `ui` extras。缺它时必须**在模块导入期就 skip**：
+放任下面的 import 失败会变成 collection error（不是 skip），一条就足以让
+整个测试套件以非零码退出、结果全部不可信。因此 importorskip 必须位于
+textual 相关导入之前 —— 后续导入的 E402 由 pyproject 的 per-file-ignores 放行。
 """
 
 from __future__ import annotations
@@ -8,6 +13,10 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
+
+pytest.importorskip("textual", reason='TUI 测试需要 ui extras：pip install -e ".[ui]"')
 
 from textual.widgets import Input, RichLog
 
@@ -21,6 +30,7 @@ from coding_agent.events import (
     RepairStarted,
     RunFailed,
     RunFinished,
+    RunStarted,
     StepFinished,
     StepStarted,
     ToolCallFinished,
@@ -422,6 +432,34 @@ def test_separator_resets_for_a_new_session() -> None:
             await pilot.pause()
             await pilot.pause()
             assert _transcript_text(app).count("── 最终答复 ──") == 1
+
+    _run(scenario())
+
+
+def test_separator_returns_on_the_second_run_of_the_same_session() -> None:
+    """同一会话里连续跑两轮，两轮都该有分界。
+
+    分界标记是「本轮首次 respond」触发的，所以必须由 RunStarted 在每轮开头复位；
+    只在 /new、/switch 复位的话，同一个会话的第二轮起就不再显示分界了。
+    """
+
+    async def scenario() -> None:
+        events = [
+            RunStarted(thread_id="t"),
+            AssistantToken(node="respond", text="答复"),
+            RunFinished(thread_id="t"),
+        ]
+        app = AgentTuiApp(runtime_factory=lambda: FakeRuntime(events))
+
+        async with app.run_test() as pilot:
+            prompt = app.query_one("#prompt", Input)
+            for question in ("第一问", "第二问"):
+                prompt.value = question
+                await pilot.press("enter")
+                await pilot.pause()
+                await pilot.pause()
+
+            assert _transcript_text(app).count("── 最终答复 ──") == 2
 
     _run(scenario())
 

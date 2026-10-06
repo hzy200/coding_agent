@@ -64,9 +64,29 @@ class FileArtifact(ToolArtifact):
     snapshot_id: str | None = None
 
 
+class CallArtifact(ToolArtifact):
+    """既不是 shell 也不是文件工具的调用结果。
+
+    典型场景是「被拒的 `git_commit` / `deps_install` / `run_tests`」：这些调用
+    确实需要一个结构化产物，但它们既没有命令字符串（不可当 ShellArtifact），
+    也没有文件路径（不可当 FileArtifact）。早先的实现一律塞进 FileArtifact，
+    结果事件层把它们标成「文件工具」、审计里 `level` 也是错的。
+    """
+
+    kind: Literal["call"] = "call"
+
+    tool: str = ""
+    ok: bool = False
+    # 被安全策略 / 审批拒绝时为 True，此时工具未被调用
+    rejected: bool = False
+    level: int | None = None
+    level_label: str = ""
+
+
 _ARTIFACT_TYPES: dict[str, type[ToolArtifact]] = {
     "shell": ShellArtifact,
     "file": FileArtifact,
+    "call": CallArtifact,
 }
 
 

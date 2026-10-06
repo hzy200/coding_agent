@@ -24,7 +24,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from coding_agent.config import Settings, get_settings
-from coding_agent.events import Event, RunStarted
+from coding_agent.events import Event
 from coding_agent.memory.sessions import SessionIndex, format_table_rows
 from coding_agent.runtime import AgentRuntime
 
@@ -115,7 +115,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async def stream() -> AsyncIterator[str]:
             import asyncio
 
-            yield _sse(RunStarted(thread_id=thread_id))
+            # RunStarted 由 runtime 在事件流开头发出（见 AgentRuntime._stream），
+            # 前端不再自己造 —— 否则多前端各造一份，契约就散了。
             try:
                 async for event in runtime.run(request.prompt, thread_id=thread_id):
                     yield _sse(event)

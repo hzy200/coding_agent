@@ -24,14 +24,22 @@ from coding_agent.tools.shell import build_shell_tool
 from coding_agent.tools.testrun import build_test_tool
 
 
-def build_tools(settings: Settings | None = None, *, allow_write: bool = False) -> list[BaseTool]:
+def build_tools(
+    settings: Settings | None = None,
+    *,
+    allow_write: bool = False,
+    sandbox: WslSandbox | None = None,
+) -> list[BaseTool]:
     """构造本次会话的全部工具。
 
     注意：放行与否**不在这里决定**，而是由 approval_gate + tools 节点依据
     SessionPolicy 逐次判定。这里只决定「暴露哪些工具」。
+
+    `sandbox` 由调用方传入以便与 verify、runtime 共用一份实例：环境探测的结果
+    缓存在实例上，每多建一份就多探一遍。
     """
     settings = settings or get_settings()
-    sandbox = WslSandbox(settings)
+    sandbox = sandbox or WslSandbox(settings)
 
     tools: list[BaseTool] = [build_shell_tool(settings, sandbox)]
     # 其余工具与 shell 共用同一个 sandbox 实例，工作区边界一致

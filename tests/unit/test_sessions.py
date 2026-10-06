@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from coding_agent.audit import AuditLogger, AuditRecord
 from coding_agent.audit.logger import now_iso
 from coding_agent.audit.models import FILE_CHANGE, PLAN, ROLLBACK, RUN_END, RUN_START, TOOL_CALL
@@ -121,6 +123,50 @@ def test_title_is_truncated(tmp_path) -> None:
     logger = AuditLogger(tmp_path)
     _write(logger, kind=RUN_START, thread_id="a", detail="x" * 500)
     assert len(SessionIndex(tmp_path).get("a").title) <= 80
+
+
+def _piece(path: Path, thread_id: str, ts: str) -> None:
+    """直接往某个审计片里写一条 —— 用来造出「同一天的多个轮转片」。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            AuditRecord(ts=ts, kind=RUN_START, thread_id=thread_id, detail="提问")
+            .model_dump_json(exclude_none=True)
+            + "\n"
+        )
+
+
+def test_lookback_is_counted_in_days_not_files(tmp_path) -> None:
+    """回溯的单位必须是天。
+
+    启用轮转后一天会有多片；按文件数回溯时，一天的 3 片就能吃掉 2 的配额，
+    更早那天的会话就静默消失了（审计文件还在，列表里却查不到）。
+    """
+    for piece in ("", ".1", ".2"):
+        _piece(tmp_path / f"2026-09-01{piece}.jsonl", "old", "2026-09-01T10:00:00+00:00")
+        _piece(tmp_path / f"2026-09-02{piece}.jsonl", "new", "2026-09-02T10:00:00+00:00")
+
+    sessions = SessionIndex(tmp_path, lookback_days=2).list()
+    assert {s.thread_id for s in sessions} == {"old", "new"}
+
+
+def test_lookback_days_excludes_older_sessions(tmp_path) -> None:
+    for piece in ("", ".1"):
+        _piece(tmp_path / f"2026-09-01{piece}.jsonl", "old", "2026-09-01T10:00:00+00:00")
+    _piece(tmp_path / "2026-09-02.jsonl", "new", "2026-09-02T10:00:00+00:00")
+
+    assert [s.thread_id for s in SessionIndex(tmp_path, lookback_days=1).list()] == ["new"]
+
+
+def test_pieces_of_one_day_are_all_scanned(tmp_path) -> None:
+    """同一天的每一片都要算进来：会话的信息是分散在各片里的。"""
+    _piece(tmp_path / "2026-09-01.jsonl", "a", "2026-09-01T10:00:00+00:00")
+    _piece(tmp_path / "2026-09-01.1.jsonl", "a", "2026-09-01T11:00:00+00:00")
+    _piece(tmp_path / "2026-09-01.2.jsonl", "b", "2026-09-01T12:00:00+00:00")
+
+    info = SessionIndex(tmp_path, lookback_days=1).get("a")
+    assert info is not None and info.prompts == 2
+    assert {s.thread_id for s in SessionIndex(tmp_path, lookback_days=1).list()} == {"a", "b"}
 
 
 def test_corrupt_lines_do_not_break_listing(tmp_path) -> None:

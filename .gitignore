@@ -13,6 +13,7 @@ dist/
 .ruff_cache/
 .idea/
 .vscode/
+.workbuddy/
 
 # 覆盖率产物：二进制，每次运行都会变，不该入库
 .coverage

@@ -56,6 +56,21 @@ markers = [
     "wsl_env: 显式探测宿主 WSL 环境（如 doctor），允许真实执行沙箱命令",
 ]
 
+[tool.coverage.run]
+source = ["src/coding_agent"]
+
+[tool.coverage.report]
+# 把没被覆盖的行号打出来：沙箱层与能力层的缺口必须**看得见**，而不是藏在总数里
+show_missing = true
+# 门槛按 **CI 实际执行的那部分** 定：GitHub 托管 runner 是 Linux 容器、没有 WSL2，
+# 因此 `-m "not wsl and not llm"` 的子集在 Windows 上实测 78.87%（不含 wsl 集成测试）。
+# 取 76 而不是贴着 78.87：这些数字是在 Windows 上量的，CI 跑在 Linux，
+# 平台相关的分支（路径守卫、wsl 输出解码）会让数字小幅漂移，贴太近会变成随机红灯。
+# 本机跑全量（含 `-m wsl`）为 90.49%，远高于此值。
+# 之所以只做全局门槛而不按模块设：沙箱层的低覆盖（CI 子集下 tools/files.py 29%、
+# snapshots.py 43%、fs.py 50%）要的是**可见**与后续改进，不是靠 omit 抹平。
+fail_under = 76
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
@@ -63,3 +78,8 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# textual 是可选依赖：必须先 importorskip，再导入它，否则缺 ui extras 时
+# 会以 collection error 而非 skip 收场。E402 在这里是有意为之。
+"tests/tui/test_tui_app.py" = ["E402"]

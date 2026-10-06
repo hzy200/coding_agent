@@ -24,6 +24,35 @@ MAX_DETAIL_CHARS = 2_000
 _PIECE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:\.(\d+))?\.jsonl$")
 
 
+def audit_files_by_day(directory: str | Path) -> dict[str, list[Path]]:
+    """审计目录下的所有片段，**按天分组**，组内按片号升序（首片在前）。
+
+    要分组而不是平铺，是因为「回溯最近 N 天」和「取最近 N 个文件」在启用轮转
+    （`audit_max_mb > 0`）之后不是一回事：一天会产出 `<date>.1.jsonl`、
+    `<date>.2.jsonl`…后者会被轮转片吃掉配额，更早的会话就静默消失了。
+    """
+    root = Path(directory)
+    if not root.exists():
+        return {}
+    grouped: dict[str, list[tuple[int, Path]]] = {}
+    for candidate in root.glob("*.jsonl"):
+        match = _PIECE_RE.match(candidate.name)
+        if not match:
+            continue
+        grouped.setdefault(match.group(1), []).append((int(match.group(2) or 0), candidate))
+    return {
+        day: [path for _, path in sorted(pieces, key=lambda item: item[0])]
+        for day, pieces in grouped.items()
+    }
+
+
+def _next_piece(day: str, path: Path) -> Path:
+    """`path` 之后的下一片：`<day>.jsonl` → `<day>.1.jsonl` → `<day>.2.jsonl`。"""
+    match = _PIECE_RE.match(path.name)
+    index = int(match.group(2) or 0) if match else 0
+    return path.with_name(f"{day}.{index + 1}.jsonl")
+
+
 class AuditError(RuntimeError):
     """审计写入失败。"""
 
@@ -61,6 +90,11 @@ class AuditLogger:
         self.directory = Path(directory)
         self.enabled = enabled
         self.max_bytes = max_bytes
+        # 「当天该写哪一片」的缓存。只在跨天或需要换片时才重新扫目录 ——
+        # 一个任务上百条记录，每条都 glob 一次纯属浪费（见 C5）。
+        self._active: tuple[str, Path] | None = None
+        # 目录只需建一次；运行中途被删掉的话下一次 open 会失败并照常报错
+        self._dir_ready = False
 
     def _day(self) -> str:
         return datetime.now(UTC).strftime("%Y-%m-%d")
@@ -71,40 +105,45 @@ class AuditLogger:
         return self.directory / f"{self._day()}.jsonl"
 
     def files_today(self) -> list[Path]:
-        """当天全部片段，按片号升序（首片在前）。"""
-        day = self._day()
-        if not self.directory.exists():
-            return [self.path]
-        pieces: list[tuple[int, Path]] = []
-        for candidate in self.directory.glob(f"{day}*.jsonl"):
-            match = _PIECE_RE.match(candidate.name)
-            if match and match.group(1) == day:
-                pieces.append((int(match.group(2) or 0), candidate))
-        pieces.sort(key=lambda item: item[0])
-        return [p for _, p in pieces] or [self.path]
+        """当天全部片段，按片号升序（首片在前）。
+
+        这是**给外部读**用的（TUI 的 `/audit` 要列出当天的每一片），所以不缓存。
+        写入侧走 `_active_path()`，那里才做缓存。
+        """
+        return audit_files_by_day(self.directory).get(self._day()) or [self.path]
 
     def _active_path(self) -> Path:
-        """当前应写入的片段；未启用轮转或未写满时就是当天首个文件。"""
+        """当前应写入的片段；未启用轮转或未写满时就是当天首个文件。
+
+        缓存的是"最近写过的那一片"，判满只做一次 `stat()`（比扫目录便宜得多），
+        跨天或写满时才推进片号。外部另起了更高的片号时也由 stat 循环兜住。
+        """
+        day = self._day()
         if self.max_bytes <= 0:
-            return self.path
-        latest = self.files_today()[-1]
-        if latest.exists() and latest.stat().st_size >= self.max_bytes:
-            match = _PIECE_RE.match(latest.name)
-            index = int(match.group(2) or 0) if match else 0
-            return self.directory / f"{self._day()}.{index + 1}.jsonl"
-        return latest
+            return self.directory / f"{day}.jsonl"
+
+        known_day, target = self._active or ("", None)
+        if target is None or known_day != day:
+            target = self.files_today()[-1]
+        while target.exists() and target.stat().st_size >= self.max_bytes:
+            target = _next_piece(day, target)
+        self._active = (day, target)
+        return target
 
     def write(self, record: AuditRecord) -> None:
         if not self.enabled:
             return
-        target = self._active_path()
+        target: Path | None = None
         try:
-            self.directory.mkdir(parents=True, exist_ok=True)
+            if not self._dir_ready:
+                self.directory.mkdir(parents=True, exist_ok=True)
+                self._dir_ready = True
+            target = self._active_path()
             line = record.model_dump_json(exclude_none=True)
             with target.open("a", encoding="utf-8") as handle:
                 handle.write(line + "\n")
         except OSError as exc:
-            raise AuditError(f"审计日志写入失败（{target}）：{exc}") from exc
+            raise AuditError(f"审计日志写入失败（{target or self.path}）：{exc}") from exc
 
 
 def read_records(

@@ -10,6 +10,7 @@ import shlex
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 from coding_agent.sandbox.fs import SandboxFs
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
@@ -63,7 +64,8 @@ def test_write_creates_file_with_exact_bytes(require_wsl, tools, workspace) -> N
     )
     assert artifact.ok
     assert artifact.action == "create"
-    assert artifact.snapshot_id is None  # 新建无需备份
+    # 新建也要留底：否则「回滚最近一次改动」对新建的文件不成立（B3）
+    assert artifact.snapshot_id
     assert _read_raw(require_wsl, f"{workspace}/src/pkg/mod.py") == "# 注释带中文\nvalue = 1\n"
     assert "已创建" in text
 
@@ -96,6 +98,18 @@ def test_read_offset_and_limit(tools) -> None:
     assert "显示第 2-3 行" in text
 
 
+def test_read_offset_beyond_end_is_not_reported_as_empty(tools) -> None:
+    """offset 越界时不能说「文件为空」—— 模型会据此以为可以整份覆盖写入。"""
+    _invoke(tools[WRITE_TOOL_NAME], path="a.txt", content="1\n2\n3\n", reason="准备")
+    text, artifact = _invoke(tools[READ_TOOL_NAME], path="a.txt", reason="越界读", offset=99)
+
+    assert artifact.ok
+    assert artifact.lines_total == 3
+    assert artifact.lines_read == 0
+    assert "文件为空" not in text
+    assert "没有内容可显示" in text
+
+
 def test_read_missing_file(tools) -> None:
     _, artifact = _invoke(tools[READ_TOOL_NAME], path="nope.txt", reason="不存在")
     assert not artifact.ok
@@ -126,6 +140,18 @@ def test_edit_replaces_unique_occurrence(tools, require_wsl, workspace) -> None:
     assert artifact.snapshot_id  # 覆盖已有文件必须先备份
     assert _read_raw(require_wsl, f"{workspace}/a.py") == "x = 42\ny = 2\n"
     assert "-x = 1" in text and "+x = 42" in text
+
+
+def test_edit_rejects_empty_old_string(tools, require_wsl, workspace) -> None:
+    """空 old_string 命中 `str.replace("", x)` 的逐字符插入语义，必须在 schema 挡住。"""
+    _invoke(tools[WRITE_TOOL_NAME], path="a.py", content="value = 1\n", reason="准备")
+
+    with pytest.raises(ValidationError):
+        tools[EDIT_TOOL_NAME].invoke(
+            {"path": "a.py", "old_string": "", "new_string": "#", "reason": "空串"}
+        )
+
+    assert _read_raw(require_wsl, f"{workspace}/a.py") == "value = 1\n"
 
 
 def test_edit_refuses_when_old_string_absent(tools, require_wsl, workspace) -> None:
@@ -287,6 +313,36 @@ def test_write_tools_absent_in_read_only_mode(require_wsl, workspace, settings) 
     scoped = settings.model_copy(update={"wsl_workspace": workspace})
     names = {tool.name for tool in build_file_tools(scoped, require_wsl, allow_write=False)}
     assert names == {READ_TOOL_NAME}
+
+
+def test_read_of_oversized_file_points_at_offset_limit(tools, settings) -> None:
+    """file_read 才有 offset/limit，退路只能由它自己给。"""
+    _invoke(
+        tools[WRITE_TOOL_NAME],
+        path="big.txt",
+        content="x" * (settings.max_file_read_bytes + 10),
+        reason="准备",
+    )
+    text, artifact = _invoke(tools[READ_TOOL_NAME], path="big.txt", reason="读")
+    assert artifact.ok is False
+    assert "offset/limit" in text
+
+
+def test_edit_works_beyond_the_context_read_limit(tools, settings) -> None:
+    """B4：file_edit 的读取不进上下文，不该被「喂给模型」的读限卡住。
+
+    曾经 2MB 以上的文件根本改不了，而错误又让模型去用并不存在的 offset/limit，
+    只能退回 shell —— 经 shell 的改动不留快照，绕开了可回滚这条底线。
+    """
+    body = "keep\n" + "y" * (settings.max_file_read_bytes + 1000) + "\nkeep\n"
+    _invoke(tools[WRITE_TOOL_NAME], path="big.txt", content=body, reason="准备")
+
+    text, artifact = _invoke(
+        tools[EDIT_TOOL_NAME], path="big.txt", old_string="keep\n", new_string="KEEP\n",
+        reason="改大文件", replace_all=True,
+    )
+    assert artifact.ok, text
+    assert artifact.action == "edit"
 
 
 # ---------------- SandboxFs 单元 ----------------

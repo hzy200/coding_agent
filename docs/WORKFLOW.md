@@ -21,17 +21,24 @@
 START → planner ─→ act ─┬─(有 tool_calls)→ approval_gate ─→ tools ─┐
                         │                                          │
                         │←─────────────────────────────────────────┘
-                        └─(本步做完)→ verify ─┬─(失败，还有预算)→ repair ─→ act
+                        └─(本步做完)→ verify ─┬─(失败，有修复预算)→ repair ─→ act
+                                              ├─(失败，修复用尽)──→ replan ─┬─→ act（换做法）
+                                              │                            └─→ respond → END（没辙）
                                               ├─(预算耗尽/空转)──→ respond → END
-                                              └─(通过/还有后续步)→ advance ─→ act
+                                              └─(通过/还有后续步)→ advance ─→ replan ─┬─→ act
+                                                                                      └─→ respond → END
 ```
 
 它由**三个正交机制**拼成，是设计里最关键的一点：
 
-1. **规划-步进**（`planner` ⇄ `advance`）：把请求拆成有序子任务，一次只做一步
-   （`compose_system_prompt` 注入"← 现在只做这一步"）。
+1. **规划-步进-重规划**（`planner` ⇄ `advance` ⇄ `replan`）：把请求拆成有序子任务，
+   一次只做一步（`compose_system_prompt` 注入"← 现在只做这一步"）。
+   `replan` 在每次步进后重新审视**剩余步骤** —— 计划可以在执行中被修正。
 2. **执行内核**（`act` ⇄ `tools`）：出意图 → 审批 → 执行 → 结果回灌，循环到本步做完或轮次用尽。
 3. **验证-修复**（`verify` ⇄ `repair`）：改过东西就自动跑测试，失败带结构化错误重来，硬性上限。
+
+**修复与重规划的分工**：`repair` 修的是**这一步**（验证没过，重做），`replan` 修的是
+**后面**（计划本身不对了）。两者都有硬性次数上限，都不是"发现问题就无限重试"。
 
 三者通过**条件边**（`graph/routing.py`）组合；节点彼此不知道对方存在，加一个机制不用改其它两个。
 节点**只读状态、返回状态增量**，不产事件、不写审计——那是 `runtime` 的职责。
@@ -43,7 +50,8 @@ START → planner ─→ act ─┬─(有 tool_calls)→ approval_gate ─→ t
 | 字段 | 生命周期 | 重置者 |
 |---|---|---|
 | `messages` | 全程累积（`add_messages`） | 只追加 |
-| `plan` / `step_idx` | 本任务 | planner 初始化，advance 递增 |
+| `plan` / `step_idx` | 本任务 | planner 初始化，advance 递增，replan 改写剩余部分 |
+| `replan_count` | **整个任务**的额度 | planner 清零、replan 递增（advance 不动它） |
 | `tool_rounds` | **本步** | planner / advance / repair 归零 |
 | `dirty` | **本步**是否改过东西 | planner / advance 清零、tools 置位、repair 置位 |
 | `verification` | 本步最近一次验证 | planner / advance 清空 |
@@ -91,7 +99,8 @@ START → planner ─→ act ─┬─(有 tool_calls)→ approval_gate ─→ t
 | `max_tool_rounds` | 12/步 | 单步工具调用轮次 |
 | `max_plan_steps` | 5 | 子任务数 |
 | `max_repair_rounds` | 3/步 | 修复次数硬上限 |
-| `recursion_limit` | `5×(3×12+3)+10` | 图超步防跑飞（系数按拓扑推导） |
+| `max_replans` | 2/任务 | 重建剩余计划的次数上限（到顶后不再问模型） |
+| `recursion_limit` | `5×(3×156)+10` | 图超步防跑飞（按拓扑推导：每周期 `3×12+2`=38，修复阶段 `4×38+3`=155；重规划会给新做法重置预算，故「阶段+replan」重复 3 遍） |
 | 沙箱资源 | CPU 600s / 文件 512MB / 进程 1024 / 墙钟 60s | 单条命令层面 |
 
 ### 2.7 错误处理与降级

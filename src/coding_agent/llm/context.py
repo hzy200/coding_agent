@@ -141,6 +141,22 @@ def _shorten(message: AnyMessage, limit: int) -> tuple[AnyMessage, bool]:
     return message, False
 
 
+def _cap_single(message: AnyMessage, budget: ContextBudget) -> tuple[AnyMessage, bool]:
+    """单条消息的绝对上限。
+
+    `keep_recent` 的本意是留住模型刚拿到的工具结果，但它挡不住「一条消息就把
+    整个预算吃光」—— 那不是设计取舍而是缺陷：`file_read` 的 limit 一度没有
+    上界，一次就能读进 2MB，而最近的消息根本不参与裁剪，于是原样进了请求。
+    后果不是变慢，而是超长请求直接 400。
+
+    阈值取整个预算：正常读取（几百行、十几 KB）碰不到它，
+    只有真正病态的单条消息才会被截断。
+    """
+    if message_chars(message) <= budget.max_chars:
+        return message, False
+    return _shorten(message, budget.max_chars)
+
+
 def _is_trimmable(message: AnyMessage) -> bool:
     """工具结果是大头；助手的长篇总结次之。
 
@@ -164,7 +180,16 @@ def trim_messages(
     trimmed: list[AnyMessage] = []
 
     for index, message in enumerate(messages):
-        if index >= cutoff or not _is_trimmable(message):
+        if index >= cutoff:
+            # 最近的消息不参与常规裁剪，但仍受单条上限约束
+            if _is_trimmable(message):
+                new_message, changed = _cap_single(message, budget)
+                report.trimmed += int(changed)
+                trimmed.append(new_message)
+            else:
+                trimmed.append(message)
+            continue
+        if not _is_trimmable(message):
             trimmed.append(message)
             continue
         new_message, changed = _shorten(message, budget.tool_chars)

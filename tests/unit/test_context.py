@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from coding_agent.llm.context import (
     HARD_TOOL_CHARS,
     ContextBudget,
+    message_chars,
     total_chars,
     trim_messages,
 )
@@ -100,11 +101,40 @@ def test_small_messages_are_untouched() -> None:
 # ---------------- 裁剪行为 ----------------
 
 def test_recent_window_is_never_trimmed() -> None:
-    messages = _history(6)
+    """最近的消息不参与常规裁剪（tool_chars）—— 那是模型刚拿到的工具结果。
+
+    用装得进预算的消息：单条吃掉整个预算是另一回事，由下面的用例单独守。
+    """
+    messages = _history(6, size=500)
     trimmed, _ = trim_messages(messages, BUDGET)
     recent = BUDGET.keep_recent
     for original, result in zip(messages[-recent:], trimmed[-recent:], strict=True):
         assert original.content == result.content
+
+
+def test_a_single_message_that_dwarfs_the_budget_is_capped() -> None:
+    """一条消息吃掉整个预算也要被截 —— 最近窗口不参与常规裁剪，但挡不住这个。
+
+    `file_read` 的 limit 一度没有上界，一次能读进 2MB；那条消息属于最近窗口，
+    任何裁剪都碰不到它，于是原样进了请求。后果不是变慢，而是超长请求直接 400。
+    """
+    messages = _history(2, size=50_000)
+    trimmed, report = trim_messages(messages, BUDGET)
+
+    recent = trimmed[-BUDGET.keep_recent :]
+    # +100 是截断说明本身的长度（`_shorten` 把说明拼在正文后面）
+    assert all(message_chars(m) <= BUDGET.max_chars + 100 for m in recent)
+    assert report.changed
+    assert report.after_chars <= report.before_chars
+
+
+def test_a_recent_message_within_the_budget_is_untouched() -> None:
+    """反向守着：装得进预算的最近消息不能被上面的兜底误伤。"""
+    messages = _history(6, size=500)
+    trimmed, _ = trim_messages(messages, BUDGET)
+    assert [m.content for m in trimmed[-BUDGET.keep_recent :]] == [
+        m.content for m in messages[-BUDGET.keep_recent :]
+    ]
 
 
 def test_old_tool_results_are_shortened() -> None:

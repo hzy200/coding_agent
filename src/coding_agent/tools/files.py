@@ -17,9 +17,9 @@ from pydantic import BaseModel, Field
 
 from coding_agent.config import Settings
 from coding_agent.diffing import count_changes, unified_diff
-from coding_agent.sandbox.fs import SandboxFs, SandboxFsError
+from coding_agent.sandbox.fs import SandboxFs, SandboxFsError, SandboxFsTooLarge
 from coding_agent.sandbox.pathguard import SandboxPathError
-from coding_agent.sandbox.snapshots import SnapshotStore
+from coding_agent.sandbox.snapshots import MAX_OPERATIONAL_BYTES, SnapshotStore
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
 from coding_agent.tools.artifacts import FileArtifact, pack
 
@@ -29,6 +29,11 @@ EDIT_TOOL_NAME = "file_edit"
 RESTORE_TOOL_NAME = "file_restore"
 
 DEFAULT_READ_LINES = 400
+
+# limit 只有下界时，模型传 `limit=100000` 就能把整个文件（上限 2MB）一次性灌进
+# 上下文 —— 而上下文裁剪**不碰最近 keep_recent 条**，任何裁剪都拦不住它。
+# 这里是一道理智闸门；真正的上下文保证在 `llm/context.py` 的单条消息上限。
+MAX_READ_LINES = 2_000
 
 READ_DESCRIPTION = """\
 读取工作区内某个文本文件的内容，返回带行号的文本。
@@ -63,6 +68,9 @@ RESTORE_DESCRIPTION = """\
 或用 snapshot_id 指定具体快照。
 
 回滚前会先给当前内容留底，所以这次回滚本身也可以再回滚。
+注意：回滚一次**新建**（file_write 建出来的文件）会**删掉**那个文件 ——
+留底时它并不存在，还原成空文件只是留下一堆删不掉的垃圾。
+删除前同样会留底，所以这次删除也可以再回滚。
 """
 
 
@@ -70,7 +78,12 @@ class ReadInput(BaseModel):
     path: str = Field(description="文件路径，工作区内相对路径或绝对路径")
     reason: str = Field(description="读取这个文件的意图，一句话说明")
     offset: int | None = Field(default=None, description="起始行号（从 1 开始），省略则从头读")
-    limit: int | None = Field(default=None, description=f"最多读取行数，默认 {DEFAULT_READ_LINES}")
+    limit: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_READ_LINES,
+        description=f"最多读取行数（{DEFAULT_READ_LINES} 以内效果最好，上限 {MAX_READ_LINES}）",
+    )
 
 
 class WriteInput(BaseModel):
@@ -81,7 +94,10 @@ class WriteInput(BaseModel):
 
 class EditInput(BaseModel):
     path: str = Field(description="文件路径，工作区内相对路径或绝对路径")
-    old_string: str = Field(description="要被替换掉的原文，必须与文件内容逐字符一致且唯一")
+    old_string: str = Field(
+        min_length=1,
+        description="要被替换掉的原文，**不能为空**，必须与文件内容逐字符一致且唯一",
+    )
     new_string: str = Field(description="替换成的新内容；传空字符串表示删除这段")
     reason: str = Field(description="这次修改的意图，一句话说明")
     replace_all: bool = Field(default=False, description="old_string 出现多次时是否全部替换")
@@ -112,7 +128,12 @@ def build_file_tools(
     root = resolve_workspace(settings, sandbox)
     fs = SandboxFs(sandbox, root)
     snapshots = SnapshotStore(sandbox, fs, root)
+    # 喂进模型上下文的读上限
     max_bytes = settings.max_file_read_bytes
+    # 「读出来改完再写回」的上限。这类读取的内容**不进上下文**（模型只看到 diff），
+    # 用读限卡它属于口径错配：2MB 以上的文件就彻底改不了，模型只能退回 shell，
+    # 而经 shell 的改动不留快照、无法回滚 —— 正好绕开「可回滚」这条底线。
+    internal_max_bytes = MAX_OPERATIONAL_BYTES
 
     def _reject(path: str, action: str, message: str) -> str:
         artifact = FileArtifact(path=path, action=action, ok=False, rejected=True)
@@ -127,15 +148,21 @@ def build_file_tools(
     # ------------------------------------------------------------------
 
     def _read(path: str, reason: str, offset: int | None = None, limit: int | None = None) -> str:
+        # 词法归一化零 I/O。紧接着的 read_text 会完成 realpath 校验，
+        # 再单独 resolve 一次等于为同一次读付两次 wsl.exe 进程启动。
         try:
-            target = fs.resolve(path)
+            target = fs.lexical(path)
         except SandboxPathError as exc:
             return _reject(path, "read", f"路径被拒绝：{exc}")
-        except SandboxFsError as exc:
-            return _error(path, "read", f"路径解析失败：{exc}")
 
         try:
             text = fs.read_text(target, max_bytes=max_bytes)
+        except SandboxPathError as exc:
+            return _reject(path, "read", f"路径被拒绝：{exc}")
+        except SandboxFsTooLarge as exc:
+            # 只有这一种失败有退路，也只有 file_read 有 offset/limit。
+            # 曾经任何错误都拼上这句，文件不存在时也让人去分段读。
+            return _error(target, "read", f"{exc}。请用 offset/limit 分段读取。")
         except SandboxFsError as exc:
             return _error(target, "read", str(exc))
 
@@ -147,7 +174,7 @@ def build_file_tools(
 
         numbered = "\n".join(f"{start + i + 1:>6}\t{line}" for i, line in enumerate(window))
         header = f"文件 {_relpath(target, root)}（共 {total} 行"
-        if start or len(window) < total:
+        if window and (start or len(window) < total):
             header += f"，显示第 {start + 1}-{start + len(window)} 行"
         header += f"）\n{reason}"
 
@@ -158,7 +185,17 @@ def build_file_tools(
             lines_read=len(window),
             lines_total=total,
         )
-        return pack(f"{header}\n{numbered}" if window else f"{header}\n（文件为空）", artifact)
+        if window:
+            return pack(f"{header}\n{numbered}", artifact)
+        if total == 0:
+            return pack(f"{header}\n（文件为空）", artifact)
+        # 只有真的没有内容时才能说「空」：offset 越界时说成空文件，
+        # 模型会以为该文件可以整份覆盖写入。
+        return pack(
+            f"{header}\n（从第 {start + 1} 行起没有内容可显示，该文件共 {total} 行，"
+            f"未读取到任何内容）",
+            artifact,
+        )
 
     # ------------------------------------------------------------------
     # write
@@ -178,7 +215,7 @@ def build_file_tools(
             if not info.is_file:
                 return _error(target, "overwrite", f"不是普通文件，拒绝覆盖：{target}")
             try:
-                original = fs.read_text(target, max_bytes=max_bytes)
+                original = fs.read_text(target, max_bytes=internal_max_bytes)
             except SandboxFsError as exc:
                 return _error(target, "overwrite", f"无法读取原文件，拒绝覆盖：{exc}")
 
@@ -187,6 +224,14 @@ def build_file_tools(
         if original is not None:
             try:
                 snapshot_id = snapshots.save(target, original)
+            except (SandboxFsError, SandboxPathError) as exc:
+                return _error(target, action, f"备份失败，已中止写入：{exc}")
+        elif not info.exists:
+            # 新建也要留底：否则「回滚最近一次改动」对新建的文件根本不成立，
+            # 而新建恰恰是最容易想撤销的一类改动（文件放错位置、内容整个不对）。
+            # 留的是「当时不存在」这个事实，回滚时据此删掉它。
+            try:
+                snapshot_id = snapshots.save(target, "", existed=False)
             except (SandboxFsError, SandboxPathError) as exc:
                 return _error(target, action, f"备份失败，已中止写入：{exc}")
 
@@ -223,13 +268,29 @@ def build_file_tools(
         reason: str,
         replace_all: bool = False,
     ) -> str:
+        # 空 old_string 会命中 `str.replace("", x)` 的逐字符插入语义
+        # （`"ab".count("") == 3`，能让唯一性检查失效），必须在这里挡下。
+        # schema 上的 min_length=1 是第一道，这里是直接调用时的兜底。
+        if not old_string:
+            return _error(path, "edit", "old_string 不能为空，未做任何修改。")
         try:
-            target = fs.resolve(path)
-        except (SandboxPathError, SandboxFsError) as exc:
+            target = fs.lexical(path)
+        except SandboxPathError as exc:
             return _reject(path, "edit", f"路径被拒绝：{exc}")
 
         try:
-            original = fs.read_text(target, max_bytes=max_bytes)
+            original = fs.read_text(target, max_bytes=internal_max_bytes)
+        except SandboxPathError as exc:
+            return _reject(path, "edit", f"路径被拒绝：{exc}")
+        except SandboxFsTooLarge as exc:
+            # 这里不能沿用 file_read 那句「请用 offset/limit 分段读取」——
+            # file_edit 没有这两个参数，那么说只会把模型推向 shell
+            return _error(
+                target,
+                "edit",
+                f"{exc}。file_edit 需要整份读出、精确替换后再写回，改不了这么大的文件。"
+                f"可以退回 shell 修改，但经 shell 的改动不留快照、无法回滚。",
+            )
         except SandboxFsError as exc:
             return _error(target, "edit", str(exc))
 
@@ -297,8 +358,10 @@ def build_file_tools(
             wanted = None
             if path:
                 try:
-                    wanted = _relpath(fs.resolve(path), root).lstrip("/")
-                except (SandboxPathError, SandboxFsError) as exc:
+                    # 只为拿到与快照条目同一口径的相对路径做比对，
+                    # 词法归一化就够 —— resolve 会为它多跑一趟 wsl.exe
+                    wanted = _relpath(fs.lexical(path), root).lstrip("/")
+                except SandboxPathError as exc:
                     return _reject(path, "restore", f"路径被拒绝：{exc}")
             entry = snapshots.find(snapshot_id, wanted)
             if entry is None:
@@ -310,8 +373,9 @@ def build_file_tools(
                 )
         elif path:
             try:
-                target = fs.resolve(path)
-            except (SandboxPathError, SandboxFsError) as exc:
+                # 同上：只需要比对的口径，不需要沙箱里那次 realpath 校验
+                target = fs.lexical(path)
+            except SandboxPathError as exc:
                 return _reject(path, "restore", f"路径被拒绝：{exc}")
             entry = snapshots.latest_for(target)
             if entry is None:

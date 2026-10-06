@@ -19,5 +19,18 @@ jobs:
         run: pip install -e ".[dev,ui,web]"
       - name: Lint
         run: ruff check src tests
-      - name: 测试
-        run: pytest -m "not wsl and not llm"
+      - name: 测试 + 覆盖率
+        # 门槛（fail_under=76）与说明在 pyproject.toml 的 [tool.coverage.report]。
+        # term-missing 是刻意的：沙箱层与能力层的缺口必须留在日志里能看见。
+        run: pytest -m "not wsl and not llm" --cov --cov-report=term-missing
+      - name: 显式化沙箱层缺口
+        # 没有这一步，"CI 全绿" 很容易被读成 "沙箱层也没问题" —— 恰恰相反：
+        # 执行真实命令的那一层在 CI 里**一行都没跑**，它的低覆盖就写在上面
+        # 覆盖率报告的 Missing 列里（tools/files.py、sandbox/snapshots.py…）。
+        # 用 ::warning:: 让它成为 GitHub 界面上的可见标注，而不是埋在日志里。
+        # 这一步是**信息性**的：它绝不能因为收集本身出问题就把构建弄红 ——
+        # 真正该红的是上面的覆盖率门槛。
+        run: |
+          skipped=$(pytest -m wsl --collect-only -q 2>/dev/null | tail -1 || true)
+          echo "::warning::CI 是 Linux runner、没有 WSL2，沙箱层用例未执行（$skipped）。仅快反馈用例通过 ≠ 沙箱层可用。"
+          echo "被跳过的沙箱层用例：$skipped"

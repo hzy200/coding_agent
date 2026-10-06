@@ -12,11 +12,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from coding_agent.audit.logger import read_records
+from coding_agent.audit.logger import audit_files_by_day, read_records
 from coding_agent.audit.models import PLAN, RUN_END, RUN_START, TOOL_CALL
 
-# 只扫最近这么多天的审计文件，避免长年累积后越读越慢
-DEFAULT_LOOKBACK_FILES = 30
+# 只扫最近这么多**天**的审计文件，避免长年累积后越读越慢。
+# 单位是天而不是文件：启用轮转（AGENT_AUDIT_MAX_MB > 0）后一天会有多片，
+# 按文件数回溯会让轮转片吃掉配额，更早的会话静默消失。
+DEFAULT_LOOKBACK_DAYS = 30
 TITLE_CHARS = 80
 
 
@@ -44,15 +46,18 @@ class SessionInfo:
 class SessionIndex:
     """把审计日志按 thread_id 归纳成会话列表。"""
 
-    def __init__(self, audit_dir: str | Path, *, lookback_files: int = DEFAULT_LOOKBACK_FILES):
+    def __init__(self, audit_dir: str | Path, *, lookback_days: int = DEFAULT_LOOKBACK_DAYS):
         self.directory = Path(audit_dir)
-        self.lookback_files = lookback_files
+        self.lookback_days = lookback_days
 
     def _audit_files(self) -> list[Path]:
-        if not self.directory.exists():
-            return []
-        # 文件名是 YYYY-MM-DD.jsonl，字典序即时间序（旧 → 新）
-        return sorted(self.directory.glob("*.jsonl"))[-self.lookback_files :]
+        """最近 N **天**的全部片段，按时间序（旧 → 新，同一天内首片在前）。"""
+        by_day = audit_files_by_day(self.directory)
+        # 文件名是 YYYY-MM-DD.jsonl，字典序即时间序
+        files: list[Path] = []
+        for day in sorted(by_day)[-self.lookback_days :]:
+            files.extend(by_day[day])
+        return files
 
     def list(self, *, limit: int = 20) -> list[SessionInfo]:
         """按最近活跃时间倒序列出会话。"""

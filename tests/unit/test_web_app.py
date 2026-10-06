@@ -17,12 +17,14 @@ from coding_agent.events import (
     AssistantToken,
     PlanCreated,
     RunFinished,
+    RunStarted,
     ToolCallFinished,
     ToolCallStarted,
 )
 from coding_agent.runtime import HistoryMessage
 
 SCRIPT = [
+    RunStarted(thread_id="t"),
     PlanCreated(steps=["看目录"]),
     AssistantToken(node="act", text="先看看"),
     ToolCallStarted(name="shell_exec", args={}, summary="ls", level="L0 只读"),

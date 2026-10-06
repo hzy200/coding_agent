@@ -22,9 +22,20 @@ from langchain_core.tools import BaseTool
 from coding_agent.graph.nodes.approve import tool_level
 from coding_agent.graph.state import AgentState
 from coding_agent.sandbox.policy import APPROVED, AUTO, DENIED, DENY, CommandLevel
-from coding_agent.tools.artifacts import FileArtifact, ShellArtifact, pack, unpack
+from coding_agent.tools.artifacts import (
+    CallArtifact,
+    FileArtifact,
+    ShellArtifact,
+    pack,
+    unpack,
+)
 from coding_agent.tools.deps import DEPS_INSTALL
-from coding_agent.tools.files import EDIT_TOOL_NAME, RESTORE_TOOL_NAME, WRITE_TOOL_NAME
+from coding_agent.tools.files import (
+    EDIT_TOOL_NAME,
+    READ_TOOL_NAME,
+    RESTORE_TOOL_NAME,
+    WRITE_TOOL_NAME,
+)
 from coding_agent.tools.git import GIT_ADD, GIT_COMMIT
 from coding_agent.tools.shell import SHELL_TOOL_NAME
 
@@ -46,6 +57,10 @@ MUTATING_TOOLS = frozenset(
 
 # 允许实际执行的审批结果
 _EXECUTABLE = frozenset({AUTO, APPROVED})
+
+# 文件工具的产出是 FileArtifact；其余工具（git_commit / deps_install / run_tests…）
+# 的产出是 CallArtifact。事件层据此选对标签，别把前者安到后者头上。
+_FILE_TOOLS = frozenset({READ_TOOL_NAME, WRITE_TOOL_NAME, EDIT_TOOL_NAME, RESTORE_TOOL_NAME})
 
 _DENIED_TEXT = (
     "用户拒绝了这条命令，未执行任何操作。\n"
@@ -80,8 +95,13 @@ _NOT_APPROVED_TEXT = (
 )
 
 
-def _denied_artifact(name: str, args: dict[str, Any], decision: str, reason: str) -> dict[str, Any]:
-    """拒绝也要产出结构化产物，否则事件层与审计层会缺一条记录。"""
+def _denied_artifact(name: str, args: dict[str, Any], decision: str) -> dict[str, Any]:
+    """拒绝也要产出结构化产物，否则事件层与审计层会缺一条记录。
+
+    按工具种类分派：shell → ShellArtifact，文件工具 → FileArtifact，
+    其余（git_commit / deps_install / run_tests…）→ CallArtifact。
+    全都塞进 FileArtifact 会让被拒的 git commit 在事件里被标成「文件工具」。
+    """
     level = tool_level(name, args)
     if name == SHELL_TOOL_NAME:
         return ShellArtifact(
@@ -92,11 +112,20 @@ def _denied_artifact(name: str, args: dict[str, Any], decision: str, reason: str
             level_label=level.label,
             decision=decision,
         ).model_dump()
-    return FileArtifact(
-        path=str(args.get("path", "")),
-        action="deny",
+    if name in _FILE_TOOLS:
+        return FileArtifact(
+            path=str(args.get("path", "")),
+            action="deny",
+            ok=False,
+            rejected=True,
+            decision=decision,
+        ).model_dump()
+    return CallArtifact(
+        tool=name,
         ok=False,
         rejected=True,
+        level=int(level),
+        level_label=level.label,
         decision=decision,
     ).model_dump()
 
@@ -127,7 +156,7 @@ def make_tools_node(
                     content, recorded = _POLICY_DENIED_TEXT, DENY
                 else:
                     content, recorded = _NOT_APPROVED_TEXT, "missing"
-                artifact = _denied_artifact(name, args, recorded, "")
+                artifact = _denied_artifact(name, args, recorded)
                 results.append(
                     ToolMessage(
                         content=pack(content, artifact),
@@ -158,8 +187,14 @@ def make_tools_node(
             # 执行过的调用补上审批结果，供审计区分 auto 与 approved
             if isinstance(artifact, dict):
                 artifact["decision"] = decision
-                if artifact.get("ok") and _mutates_workspace(name, args):
-                    dirty = True
+                if _mutates_workspace(name, args):
+                    # "改动了工作区"与"这次调用成功了"是两件事，不能互相否决。
+                    # shell 尤其如此：sed -i 改完了才失败、gcc 出了产物才报错，
+                    # 非零退出不代表没动过文件 —— 那种情况下跳过验证最危险。
+                    # 文件工具则相反：ok=False 就是没写成（路径越界、替换没命中…），
+                    # 它的 ok 正好是"改动是否发生"，所以只有它才看 ok。
+                    if name == SHELL_TOOL_NAME or artifact.get("ok"):
+                        dirty = True
                     if name == SHELL_TOOL_NAME:
                         content += _SHELL_MUTATION_NOTE
                 content = pack(content, artifact)

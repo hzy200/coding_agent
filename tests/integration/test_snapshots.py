@@ -70,9 +70,11 @@ def test_list_returns_newest_first(ctx) -> None:
     _call(ctx, EDIT_TOOL_NAME, path="a.py", old_string="v1", new_string="v2", reason="改1")
     _call(ctx, EDIT_TOOL_NAME, path="a.py", old_string="v2", new_string="v3", reason="改2")
 
+    # 3 份：两次改动各留一份，**新建也留一份**（记的是「当时不存在」，回滚据此删除）
     entries = ctx["store"].list()
-    assert len(entries) == 2
+    assert len(entries) == 3
     assert entries[0].snapshot_id > entries[1].snapshot_id  # 时间戳前缀可字典序比较
+    assert entries[1].snapshot_id > entries[2].snapshot_id
     assert all(e.path == "a.py" for e in entries)
 
 
@@ -150,9 +152,11 @@ def test_restore_across_multiple_edits(ctx) -> None:
     _call(ctx, EDIT_TOOL_NAME, path="a.py", old_string="v1", new_string="v2", reason="改1")
     _call(ctx, EDIT_TOOL_NAME, path="a.py", old_string="v2", new_string="v3", reason="改2")
 
-    # 指定回滚到第一次改动前的版本
-    oldest = ctx["store"].list()[-1]
-    ctx["store"].restore(oldest)
+    # 指定回滚到第一次改动前的版本。列表是新到旧：[-1] 是「新建前」那份
+    # （回滚它等于删掉文件，见 test_restore_of_a_creation_deletes_the_file），
+    # 所以第一次改动前的那份是 [-2]。
+    before_first_edit = ctx["store"].list()[-2]
+    ctx["store"].restore(before_first_edit)
     assert _content(ctx["sandbox"], ctx["ws"], "a.py") == "v1\n"
 
 
@@ -169,10 +173,16 @@ def test_snapshots_are_per_file(ctx) -> None:
     assert _content(ctx["sandbox"], ctx["ws"], "b.py") == "b1"  # b 不受影响
 
 
-def test_newly_created_file_has_no_snapshot(ctx) -> None:
-    """新建文件没有「改之前」可言，不该留底 —— 否则回滚会变成删除文件。"""
+def test_newly_created_file_has_a_snapshot(ctx) -> None:
+    """新建也要留底 —— 否则「回滚最近一次改动」对新建的文件根本不成立。
+
+    留的是「当时不存在」这个事实（`.absent` 标记），所以回滚结果是删掉它，
+    而不是还原成空文件留下垃圾。
+    """
     _call(ctx, WRITE_TOOL_NAME, path="fresh.py", content="hi", reason="新建")
-    assert ctx["store"].latest_for(f"{ctx['ws']}/fresh.py") is None
+    entry = ctx["store"].latest_for(f"{ctx['ws']}/fresh.py")
+    assert entry is not None
+    assert ctx["store"].was_absent(entry) is True
 
 
 # ---------------- file_restore 工具 ----------------
@@ -207,6 +217,27 @@ def test_restore_tool_by_snapshot_id(ctx) -> None:
     )
     assert artifact.ok
     assert _content(ctx["sandbox"], ctx["ws"], "a.py") == "v1\n"
+
+
+def test_restore_tool_deletes_a_created_file(ctx) -> None:
+    """回滚一次新建 = 删掉它，而不是把它清空。"""
+    _call(ctx, WRITE_TOOL_NAME, path="fresh.py", content="hi\n", reason="新建")
+
+    text, artifact = _call(ctx, RESTORE_TOOL_NAME, path="fresh.py", reason="放错位置了")
+    assert artifact.ok
+    assert "已删除" in text
+    probe = f"test -e {shlex.quote(ctx['ws'] + '/fresh.py')} && echo yes || echo no"
+    assert ctx["sandbox"].run(probe).stdout.strip() == "no"
+
+
+def test_deleting_rollback_can_be_undone(ctx) -> None:
+    """删除前先留了底，所以「撤销这次撤销」能把文件找回来。"""
+    _call(ctx, WRITE_TOOL_NAME, path="fresh.py", content="hi\n", reason="新建")
+    _call(ctx, RESTORE_TOOL_NAME, path="fresh.py", reason="放错位置了")
+
+    _, artifact = _call(ctx, RESTORE_TOOL_NAME, reason="撤销刚才的撤销")
+    assert artifact.ok
+    assert _content(ctx["sandbox"], ctx["ws"], "fresh.py") == "hi\n"
 
 
 def test_restore_tool_reports_unknown_snapshot(ctx) -> None:
