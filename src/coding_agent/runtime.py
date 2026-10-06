@@ -87,6 +87,22 @@ def _verification_passed(raw: dict[str, Any]) -> bool:
     return str(raw.get("status", "skipped")) != _VERIFICATION_BLOCKING_STATUS
 
 
+def _verification_verdict(raw: dict[str, Any]) -> bool | None:
+    """**审计**里的验证结论：True 通过 / False 失败 / **None 没验证**。
+
+    与 `_verification_passed`（路由口径）刻意分开：路由只需要"要不要拦"，所以
+    `not_configured` / `skipped` 都算"不拦"；但审计要回答的是"这次到底验证了没有"，
+    把"没做"记成 `ok=True` 会让**验证有缺口在账上看不出来** —— 而审计本该是可信
+    来源，这正是本项目最不能接受的失败模式之一（IMPROVEMENT_PLAN 的 P0-2）。
+    """
+    status = str(raw.get("status", "skipped"))
+    if status == _VERIFICATION_BLOCKING_STATUS:
+        return False
+    if status == "ok":
+        return True
+    return None  # not_configured / skipped：没做，不是通过
+
+
 # 审查是否「拦下了这一步」的唯一口径。与路由同源：只有 blocked 才改控制流，
 # warned / clean / skipped 都只是记录。审查没能执行（status=warned 且带
 # review-unavailable）**不算阻断** —— 工具坏了不该把用户的任务卡死。
@@ -642,8 +658,10 @@ class AgentRuntime:
                                     ts=now_iso(),
                                     kind=audit_models.VERIFY,
                                     thread_id=thread_id,
-                                    ok=_verification_passed(raw),
+                                    # 没做验证时记 None（未验证），不记 True（通过）
+                                    ok=_verification_verdict(raw),
                                     detail=truncate(
+                                        f"[{raw.get('kind', 'none')}] "
                                         f"{raw.get('command', '')} → {raw.get('summary', '')}"
                                     ),
                                 )
@@ -1033,7 +1051,8 @@ class AgentRuntime:
         return Verification(
             status=str(raw.get("status", "skipped")),
             command=str(raw.get("command", "")),
-            ok=_verification_passed(raw),
+            # 与审计同源：都用三态口径，两边的结论必须一致
+            ok=_verification_verdict(raw),
             summary=str(raw.get("summary", "")),
             issues=issues,
         )

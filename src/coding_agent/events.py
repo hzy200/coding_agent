@@ -143,7 +143,10 @@ class Verification(Event):
     type: Literal["verification"] = "verification"
     status: str = "skipped"
     command: str = ""
-    ok: bool = True
+    # 三态：True 通过 / False 失败 / **None 没验证**（`not_configured` / `skipped`）。
+    # 与审计里的 `ok` 刻意保持同源同形 —— 曾经两边口径不同，同一次「没跑验证」
+    # 在事件与审计里结论相反，事后对账对不上（见 BUG_AUDIT 的 B7）。
+    ok: bool | None = None
     summary: str = ""
     issues: list[str] = Field(default_factory=list)
 

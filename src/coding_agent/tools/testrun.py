@@ -80,6 +80,12 @@ class VerifyResult(BaseModel):
     summary: str = ""
     issues: list[VerifyIssue] = Field(default_factory=list)
     output_tail: str = ""
+    # 这次验证**有多强**：`tests`（跑了项目自己的测试）| `syntax`（只做了语法解析级兜底）
+    # | `none`（什么都没跑）。
+    #
+    # 单列一个字段是因为「通过」的含金量差别很大：语法过了不等于行为对。
+    # 让调用方能把它显示出来、也能按它决定要不要更谨慎地收尾。
+    kind: Literal["tests", "syntax", "none"] = "none"
 
     @property
     def ok(self) -> bool:
@@ -92,7 +98,7 @@ class VerifyResult(BaseModel):
     def render(self) -> str:
         """回灌给模型的紧凑文本。"""
         if self.status == "not_configured":
-            return "未检测到可用的测试命令。"
+            return "未检测到可用的测试命令，也没有可解析的源码 —— 本次没有做任何验证。"
         if self.status == "skipped":
             return "本次未执行验证。"
 
@@ -100,6 +106,11 @@ class VerifyResult(BaseModel):
         if self.summary:
             head += f"\n{self.summary}"
         if self.status == "ok":
+            if self.kind == "syntax":
+                return (
+                    f"{head}\n语法校验通过 —— 项目里没有可识别的测试命令，"
+                    f"所以只做了这一层。**行为是否正确没有被验证。**"
+                )
             return f"{head}\n验证通过。"
 
         lines = [head, f"发现 {len(self.issues)} 个问题："]
@@ -194,6 +205,39 @@ def extract_summary(output: str) -> str:
 # 命令探测
 # --------------------------------------------------------------------------
 
+# 没有可识别的测试时的**降级验证**：逐个 `.py` 做语法解析。
+#
+# 为什么要它：识别不出测试命令 → `not_configured` → 路由判为非 failed → 直接
+# advance，审计还记成 `ok=True`。于是**「没验证」与「验证通过」在账上长得一样**，
+# 在没有测试的项目上整条验证脊柱静默失效（IMPROVEMENT_PLAN 的 P0-2）。
+# 今天 P0-3 的修复又放大了它：`make test` / `npm test` 不再走自动 verify，
+# 这类项目现在必然落进 `not_configured`。
+#
+# 为什么是语法级而不是更强的东西：沙箱里只有 `python3`（没有 ruff / mypy / tsc /
+# go）。**能确定做到的那一点，比做不到的承诺有用** —— 语法错是"改了但根本跑不起来"
+# 这一类里最硬的信号，而且解析不写任何文件（不产 `__pycache__`，不污染工作区）。
+_SYNTAX_CHECK = """\
+python3 - <<'__AGENT_SYNTAX__'
+import ast, pathlib, sys
+
+problems = []
+for path in sorted(pathlib.Path(".").rglob("*.py")):
+    if any(part.startswith(".") for part in path.parts):
+        continue
+    try:
+        ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except SyntaxError as exc:
+        problems.append("%s:%s: %s" % (path, exc.lineno or 0, exc.msg))
+    except (UnicodeDecodeError, OSError):
+        continue  # 非文本或读不了的文件不该让校验失败
+
+for line in problems:
+    print(line)
+sys.exit(1 if problems else 0)
+__AGENT_SYNTAX__
+"""
+
+
 def _probe_script(files: tuple[str, ...]) -> str:
     quoted = " ".join(f'"{name}"' for name in files)
     return (
@@ -203,7 +247,10 @@ def _probe_script(files: tuple[str, ...]) -> str:
         f"command -v python3 >/dev/null && python3 -c 'import pytest' 2>/dev/null "
         f"&& echo \"HAS pytest\"; "
         f"[ -f Makefile ] && grep -qE '^test:' Makefile && echo \"MAKE test\"; "
-        f"[ -f package.json ] && grep -q '\"test\"' package.json && echo \"NPM test\""
+        f"[ -f package.json ] && grep -q '\"test\"' package.json && echo \"NPM test\"; "
+        # 降级验证的判据：这个项目里有没有可解析的源码
+        f"find . -maxdepth 3 -name '*.py' -not -path '*/.*' -print -quit 2>/dev/null "
+        f"| grep -q . && echo \"HAS python\""
     )
 
 
@@ -237,14 +284,17 @@ def _detect(sandbox: WslSandbox, root: str, *, allow_manifest: bool) -> str:
         return "python3 -m pytest -q"
 
     if not allow_manifest:
-        return ""
+        # 降级：没有可识别的测试命令时，**至少**做一遍语法解析。
+        # 不这么做的话这里会返回空串 → `not_configured` → 路由当作没失败 →
+        # 审计记 `ok=True`，「没验证」与「验证通过」就分不开了（P0-2）。
+        return _SYNTAX_CHECK if "HAS python" in lines else ""
 
     if "NPM test" in lines:
         return "npm test --silent"
     if "MAKE test" in lines:
         return "make test"
 
-    return ""
+    return _SYNTAX_CHECK if "HAS python" in lines else ""
 
 
 def detect_test_command(
@@ -274,7 +324,10 @@ def detect_test_command(
     found = sandbox.cached_probe(
         key, lambda: _detect(sandbox, root, allow_manifest=allow_manifest)
     )
-    if not found:
+    # 不缓存**降级**结果，理由与"不缓存没探到"是同一条：语法校验是这里最弱的一档，
+    # 而任务常常是先建目录、后写测试 —— 把兜底记死了，真正的测试命令就再也发现不了。
+    # 代价是没测试的项目每次验证多探一次（约 0.25s），可以接受。
+    if not found or found == _SYNTAX_CHECK:
         sandbox.forget_probe(key)
     return found
 
@@ -304,12 +357,14 @@ def run_verification(
     if not resolved:
         return VerifyResult(status="not_configured")
 
+    kind = "syntax" if resolved.startswith("python3 - <<'__AGENT_SYNTAX__'") else "tests"
     result = sandbox.run(resolved, cwd=root)
     combined = f"{result.stdout}\n{result.stderr}"
     issues = [] if result.ok else parse_issues(combined)
 
     return VerifyResult(
         status="ok" if result.ok else "failed",
+        kind=kind,
         command=resolved,
         exit_code=result.exit_code,
         duration_ms=result.duration_ms,

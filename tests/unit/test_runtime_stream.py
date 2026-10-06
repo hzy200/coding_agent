@@ -897,15 +897,22 @@ def test_verification_ok_agrees_with_the_audit_record(tmp_path, status: str) -> 
     event = next(e for e in events if isinstance(e, Verification))
     record = next(r for r in read_records(runtime.audit_path) if r.kind == "verify")
     assert event.ok == record.ok
-    assert event.ok is (status != "failed")
+    expected = {"ok": True, "failed": False}.get(status)  # 其余的「没验证」= None
+    assert event.ok is expected
 
 
 def test_not_running_verification_is_not_a_failure(tmp_path) -> None:
-    """skipped / not_configured 是「没验证」，不能记成验证失败。"""
+    """skipped / not_configured 是「没验证」—— 既不算失败，也不算通过。
+
+    记成 `True` 会让验证缺口在账上看不出来；记成 `False` 又会被读成"改了但没通过"。
+    所以是 `None`（未知/不适用），路由那边另有口径（不拦）。
+    """
     runtime, _ = _runtime(tmp_path, [
         _updates(verify={"verification": {"status": "skipped", "summary": "没有改动"}}),
     ])
-    _run(_collect(runtime))
+    events = _run(_collect(runtime))
 
     record = next(r for r in read_records(runtime.audit_path) if r.kind == "verify")
-    assert record.ok is True
+    assert record.ok is None
+    event = next(e for e in events if isinstance(e, Verification))
+    assert event.ok is None

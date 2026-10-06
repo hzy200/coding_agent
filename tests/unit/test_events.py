@@ -319,10 +319,17 @@ def test_verification_maps_failure_with_issues() -> None:
     assert event.issues == ["tests/a.py:3 assert 1 == 2"]
 
 
-def test_verification_non_failure_statuses_count_as_ok() -> None:
-    for status in ("ok", "skipped", "not_configured"):
-        assert AgentRuntime._verification({"status": status}).ok is True
+def test_verification_ok_is_three_state() -> None:
+    """`ok` 是三态：通过 / 失败 / **没验证**。
+
+    `skipped` 与 `not_configured` 是「没做」—— 记成 True 会让验证缺口在账上
+    看不出来，记成 False 又会被读成"改了但没通过"。取 None（未知/不适用）。
+    路由那边另有口径（这两种不拦），两者刻意分开。
+    """
+    assert AgentRuntime._verification({"status": "ok"}).ok is True
     assert AgentRuntime._verification({"status": "failed"}).ok is False
+    for status in ("skipped", "not_configured"):
+        assert AgentRuntime._verification({"status": status}).ok is None
 
 
 def test_verification_survives_missing_fields() -> None:

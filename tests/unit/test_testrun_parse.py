@@ -202,3 +202,78 @@ def test_override_wins() -> None:
             raise AssertionError("有 override 时不该去探测")
 
     assert detect_test_command(_UnusedSandbox(), "/x", override="make check") == "make check"
+
+
+# ---------------- 无测试项目的降级验证 ----------------
+#
+# 识别不出测试命令时原先是 `not_configured` → 路由判为非 failed → 审计记
+# `ok=True`，「没验证」与「验证通过」在账上长得一样（IMPROVEMENT_PLAN 的 P0-2）。
+# P0-3 的修复又放大了它：make/npm 派生的命令不再走自动 verify。
+
+class _ProbeSandbox:
+    """把探测脚本的输出换成固定内容；`run` 记录被调用次数。"""
+
+    def __init__(self, lines: str) -> None:
+        self.lines = lines
+        self.runs = 0
+        self._cache: dict[str, object] = {}
+
+    def run(self, command: str, *, cwd=None, timeout=None):
+        from coding_agent.sandbox.wsl_exec import ExecResult
+
+        self.runs += 1
+        return ExecResult(
+            command=command, exit_code=0, stdout=self.lines, stderr="", duration_ms=1
+        )
+
+    def cached_probe(self, key, producer):
+        if key not in self._cache:
+            self._cache[key] = producer()
+        return self._cache[key]
+
+    def forget_probe(self, key):
+        self._cache.pop(key, None)
+
+
+def test_a_python_project_without_tests_falls_back_to_a_syntax_check() -> None:
+    from coding_agent.tools.testrun import _SYNTAX_CHECK, detect_test_command
+
+    sandbox = _ProbeSandbox("HAS python\n")
+    assert detect_test_command(sandbox, "/ws", allow_manifest=False) == _SYNTAX_CHECK
+
+
+def test_a_project_without_any_source_stays_not_configured() -> None:
+    """没有源码就没有可做的校验 —— 这时如实返回空串（`not_configured`）。"""
+    from coding_agent.tools.testrun import detect_test_command
+
+    sandbox = _ProbeSandbox("DIR tests\n")  # 有 tests 目录但没源码
+    assert detect_test_command(sandbox, "/ws", allow_manifest=False) == ""
+
+
+def test_the_syntax_fallback_is_not_cached() -> None:
+    """兜底是这里最弱的一档，不能记死。
+
+    任务常常是先建目录、后写测试 —— 把降级结果缓存下来，真正的测试命令就再也
+    发现不了（这与"不缓存没探到"是同一条理由）。
+    """
+    from coding_agent.tools.testrun import detect_test_command
+
+    sandbox = _ProbeSandbox("HAS python\n")
+    detect_test_command(sandbox, "/ws", allow_manifest=False)  # 探一次，不留下缓存
+    sandbox.lines = "HAS python\nDIR tests\nHAS pytest\n"  # 项目补上了测试
+
+    assert detect_test_command(sandbox, "/ws", allow_manifest=False) == "python3 -m pytest -q"
+
+
+def test_the_audit_records_not_configured_as_unverified_not_passed() -> None:
+    """审计里的 `ok` 必须是三态：通过 / 失败 / **没验证**。
+
+    把"没做"记成"通过"会让验证缺口在账上看不出来 —— 而审计本该是可信来源。
+    """
+    from coding_agent.runtime import _verification_verdict
+
+    assert _verification_verdict({"status": "ok"}) is True
+    assert _verification_verdict({"status": "failed"}) is False
+    assert _verification_verdict({"status": "not_configured"}) is None
+    assert _verification_verdict({"status": "skipped"}) is None
+    assert _verification_verdict({}) is None
