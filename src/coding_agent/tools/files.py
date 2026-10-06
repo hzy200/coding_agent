@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import ast
+
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
 
@@ -135,6 +137,28 @@ def build_file_tools(
     # 而经 shell 的改动不留快照、无法回滚 —— 正好绕开「可回滚」这条底线。
     internal_max_bytes = MAX_OPERATIONAL_BYTES
 
+    def _syntax_error(text: str, relpath: str) -> str:
+        """`.py` 的语法预校验；有问题就返回一句可执行的说明，否则空串。
+
+        **为什么在落盘前查**：原先的顺序是「先写下去 → review 事后 `ast.parse` →
+        不合格再 repair 重做」，白烧一轮工具预算与一次模型往返。而语法错是这里
+        **最便宜就能确定**的一类错误（纯解析、零依赖、零 I/O），没有必要等到事后。
+
+        只查 `.py`：沙箱里只有 `python3`，别的语言查不了 —— 能确定做到的那一点，
+        比做不到的承诺有用。
+
+        **判据是「有没有变坏」，不是「是不是好的」**：调用点只在原文件本来就是
+        合法的时候才拒。否则模型分步修一个已经坏掉的文件时会被自己的中间状态堵死。
+        """
+        if not relpath.endswith(".py"):
+            return ""
+        try:
+            ast.parse(text, filename=relpath)
+        except SyntaxError as exc:
+            where = f"第 {exc.lineno} 行" if exc.lineno else "（无法定位行号）"
+            return f"{where}：{exc.msg}"
+        return ""
+
     def _reject(path: str, action: str, message: str) -> str:
         artifact = FileArtifact(path=path, action=action, ok=False, rejected=True)
         return pack(message, artifact)
@@ -220,6 +244,21 @@ def build_file_tools(
                 return _error(target, "overwrite", f"无法读取原文件，拒绝覆盖：{exc}")
 
         action = "overwrite" if info.exists else "create"
+        # 语法预校验：**只在原文件本来就合法时**才拒（原本就坏的说明模型正在
+        # 分步修它，中间状态不合法是正常的）。放在留底之前 —— 被拒的写入不该
+        # 产生"回滚点"，否则 `.agent/backups/` 会被无谓的失败尝试塞满。
+        relpath = _relpath(target, root)
+        if not (original is not None and _syntax_error(original, relpath)):
+            problem = _syntax_error(content, relpath)
+            if problem:
+                return _error(
+                    target,
+                    action,
+                    f"语法错误，已拒绝写入（文件未改动）：{problem}。"
+                    f"请修正后重新提交完整内容 —— 需要分步改一个已经坏掉的文件时，"
+                    f"先把它改回合法状态。",
+                )
+
         snapshot_id: str | None = None
         if original is not None:
             try:
@@ -316,6 +355,20 @@ def build_file_tools(
         updated = original.replace(old_string, new_string) if replace_all else original.replace(
             old_string, new_string, 1
         )
+
+        # 语法预校验：同样只在原文件**本来就合法**时才拒 ——
+        # 模型分步修一个已经坏掉的文件时，中间状态不合法是正常的。
+        relpath = _relpath(target, root)
+        if not _syntax_error(original, relpath):
+            problem = _syntax_error(updated, relpath)
+            if problem:
+                return _error(
+                    target,
+                    "edit",
+                    f"语法错误，已拒绝修改（文件未改动）：{problem}。"
+                    f"一次编辑之后的文件必须是合法 Python —— 需要跨多处改动时，"
+                    f"把 old_string 扩展到覆盖整段、一次改完。",
+                )
 
         try:
             snapshot_id = snapshots.save(target, original)

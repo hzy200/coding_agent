@@ -454,3 +454,70 @@ def test_write_many_with_nothing_to_do_is_a_noop(
 ) -> None:
     fs = SandboxFs(require_wsl, workspace)
     assert fs.write_many({}) == 0
+
+
+# ---------------- 写入前语法预校验 ----------------
+#
+# 原先的顺序是「先写下去 → review 事后查语法 → 不合格再 repair 重做」，白烧一轮
+# 工具预算与一次模型往返。语法错是这里最便宜就能确定的一类错误。
+
+def test_write_rejects_broken_python(tools, require_wsl, workspace) -> None:
+    text, artifact = _invoke(
+        tools[WRITE_TOOL_NAME], path="broken.py", content="def f(:\n    return 1\n",
+        reason="写个坏的",
+    )
+
+    assert not artifact.ok
+    assert "语法错误" in text and "第 1 行" in text
+    # 落盘前就拒了，所以文件根本没被创建（不是"写了又删"）
+    assert not require_wsl.run(f"[ -e {shlex.quote(workspace + '/broken.py')} ]").ok
+
+
+def test_edit_rejects_a_change_that_breaks_syntax(tools, require_wsl, workspace) -> None:
+    _invoke(tools[WRITE_TOOL_NAME], path="a.py", content="def f(a):\n    return a\n", reason="准备")
+
+    text, artifact = _invoke(
+        tools[EDIT_TOOL_NAME], path="a.py", old_string="def f(a):", new_string="def f(a:",
+        reason="改坏",
+    )
+
+    assert not artifact.ok
+    assert "语法错误" in text
+    assert _read_raw(require_wsl, f"{workspace}/a.py") == "def f(a):\n    return a\n"
+
+
+def test_an_already_broken_file_can_still_be_edited(tools, require_wsl, workspace) -> None:
+    """**关键的退路**：判据是「有没有变坏」，不是「是不是好的」。
+
+    模型分步修一个已经坏掉的文件时，中间状态不合法是正常的 —— 一刀切会把它
+    自己的修复过程堵死。
+    """
+    _invoke(tools[WRITE_TOOL_NAME], path="ok.py", content="x = 1\n", reason="准备")
+    # 绕过工具直接造一个坏文件（模拟前一次留下的坏状态）
+    broken = "def f(:" + chr(10)
+    require_wsl.run(
+        f"printf %s {shlex.quote(broken)} > {shlex.quote(workspace + '/ok.py')}"
+    )
+
+    text, artifact = _invoke(
+        tools[EDIT_TOOL_NAME], path="ok.py", old_string="def f(:", new_string="def f(:  # 还没修好",
+        reason="分步修",
+    )
+
+    assert artifact.ok, text  # 仍不合法，但没变得更坏，允许
+
+
+def test_non_python_files_are_not_syntax_checked(tools, require_wsl, workspace) -> None:
+    """只查 `.py`：沙箱里只有 python3，别的语言查不了。"""
+    _, artifact = _invoke(
+        tools[WRITE_TOOL_NAME], path="notes.txt", content="{{{ 不是 python",
+        reason="随便写点文本",
+    )
+    assert artifact.ok
+
+
+def test_write_accepts_valid_python(tools) -> None:
+    _, artifact = _invoke(
+        tools[WRITE_TOOL_NAME], path="good.py", content="def f(a):\n    return a\n", reason="准备"
+    )
+    assert artifact.ok
