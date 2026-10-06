@@ -70,7 +70,7 @@ review 的「改动前」**直接复用快照**（不变量 8：所有写操作�
 ruff check .
 
 # 2. 全量测试（含真实 WSL 沙箱）
-pytest -m "not llm"          # 期望 1070 passed
+pytest -m "not llm"          # 期望 1194 passed
 # 另有 3 条 llm 标记用例需要 DEEPSEEK_API_KEY；不要用裸 pytest 代替 ——
 # 不加 -m 时它们会真的调用模型（本机配了 key 就产生费用）。
 
@@ -90,23 +90,25 @@ python scripts/demo.py --only 1
 
 | 项 | 结果 |
 |---|---|
-| 测试 | **1070 passed**（`pytest -m "not llm"`，含真实 WSL），其中 `wsl` 标记 **183**，无失败；另 3 条 `llm` 用例需 API Key |
-| 覆盖率 | **90.9%**（`pytest -m "not llm" --cov`，含真实 WSL）；**CI 子集 81.4%**，门槛 `fail_under=76` |
+| 测试 | **1194 passed**（`pytest -m "not llm"`，含真实 WSL），其中 `wsl` 标记 **201**，无失败；另 3 条 `llm` 用例需 API Key |
+| 覆盖率 | **90.0%**（`pytest -m "not llm" --cov`，含真实 WSL）；**CI 子集 80.2%**，门槛 `fail_under=76` |
 | lint | 干净（`ruff check src tests`） |
-| 快反馈 | `pytest -m "not wsl and not llm"` = **887 passed**（deselect 186 = 183 个 `wsl` + 3 个 `llm`，两组无交集）；需装齐 `.[dev,ui,web]`，缺 `textual` 时 TUI 整目录 skip（TUI 45 条）。含覆盖率约 80 秒 |
-| 能力评测 | **两个套件**：`default` 29 个短任务（`--repeat 2` 实测 52%/83%，**波动 31 个百分点**）、`long` 2 个长程任务（38 文件 / 近千行仓库，功能贯通 6 个文件）。报告带机制指标（验证/修复/重规划次数、token）与噪声块；跑法见 [tests/eval/README](../tests/eval/README.md) |
-
-> **口径提醒**：`default` 那 52%/83% 说明单次运行的通过率**说明不了任何事** ——
-> 上一版把它读作「已落进 30–70% 区间、有区分度」是过度解读。
-> 版本对比至少要 `--repeat 2`，且差异必须大于 `spread` 才值得讨论。
+| 快反馈 | `pytest -m "not wsl and not llm"` = **993 passed**（deselect 204 = 201 个 `wsl` + 3 个 `llm`，两组无交集）；需装齐 `.[dev,ui,web]`，缺 `textual` 时 TUI 整目录 skip（TUI 45 条）。含覆盖率约 90 秒 |
+| 能力评测 | **两个套件，各记各的基线**：`default` 29 个短任务（通过率 **12/29 = 41.4%**，逐轮 44.8%/37.9%，`spread` 6.9pp，12/29 任务翻转）；`long` 5 个长程任务（38 文件 / 近千行仓库，改动跨度 3–8 文件，通过率 **2/5 = 30%**，`spread` 20pp）。报告带机制指标（验证/修复/重规划次数、token、写调用数）与噪声块；跑法见 [tests/eval/README](../tests/eval/README.md) |
 | CI | `.github/workflows/ci.yml`：`pip install -e ".[dev,ui,web]"` → ruff → `pytest -m "not wsl and not llm"` |
+
+> **口径提醒**：单次运行的通过率**说明不了任何事**。同一份代码曾跑出 52% 与 83%
+> （`spread` 31 个百分点、11/29 任务翻转）—— 上一版把这读作「已落进 30–70% 区间、
+> 有区分度」是过度解读。版本对比至少要 `--repeat 2`，且差异必须大于 `spread`。
+> 另外**聚合稳、成员不稳**：`default` 最新两次的 `spread` 只有 6.9pp，但仍有 12/29
+> 任务在两轮间翻转（方向相抵），所以 `flipped` 比 `spread` 更该看。
 
 > **口径提醒**：全量一律写 `pytest -m "not llm"`。裸 `pytest` 会把那 3 条 `llm` 用例一起跑、
 > 真的调用模型 —— 本机 `.env` 配了 key 就计费，而它们本意是"需要时手动跑"。
 >
-> **CI 与本地不是一回事**：CI 是 Linux runner、没有 WSL2，只跑快反馈那 887 个用例，
-> 覆盖率 81.4%。沙箱层与能力层的覆盖（`tools/files.py` 85%、`sandbox/snapshots.py` 88%）
-> 全靠 `-m wsl` 的 183 个用例，它们**只在本地执行**。CI 会以 `::warning::` 显式提示这个缺口 ——
+> **CI 与本地不是一回事**：CI 是 Linux runner、没有 WSL2，只跑快反馈那 993 个用例，
+> 覆盖率 80.2%。沙箱层与能力层的覆盖（`tools/files.py` 85%、`sandbox/snapshots.py` 88%）
+> 全靠 `-m wsl` 的 201 个用例，它们**只在本地执行**。CI 会以 `::warning::` 显式提示这个缺口 ——
 > 详见 [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md) 的 Q1。
 >
 > 上面每个数字都是量出来的，命令见本节第 2–4 条；改动后请重跑核对，别手抄。
@@ -169,6 +171,6 @@ python scripts/demo.py --only 1
 
 代码冻结后不再改动功能，只接受缺陷修复。任何改动都应：
 
-1. 跑 `pytest -m "not llm"`（1070 个用例全过；见第 3 节口径提醒）
+1. 跑 `pytest -m "not llm"`（1194 个用例全过；见第 3 节口径提醒）
 2. 跑 `ruff check .`
 3. 如果是安全相关的改动，对照本文件第 2 节确认对应测试仍在

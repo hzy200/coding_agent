@@ -160,6 +160,8 @@ def test_seed_is_unsolved_under_the_judge(task, tmp_path: Path) -> None:
         cwd=tmp_path,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=180,
         check=False,
     )
@@ -190,6 +192,8 @@ def test_reference_solution_passes_the_judge(task, tmp_path: Path) -> None:
         cwd=tmp_path,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=180,
         check=False,
     )
@@ -499,7 +503,14 @@ def _run_judge(
 ) -> subprocess.CompletedProcess:
     args = [sys.executable, "-m", "unittest", "-v", *(modules or _judge_modules(task))]
     return subprocess.run(
-        args, cwd=root, capture_output=True, text=True, timeout=180, check=False
+        args,
+        cwd=root,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+        check=False
     )
 
 
