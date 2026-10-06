@@ -611,7 +611,11 @@ def noise_summary(runs: list[dict]) -> dict:
     }
 
 
-_SUMMED_TASK_FIELDS = ("tool_calls", "steps", "replans", "repairs", "writes")
+# 事件计数：跨轮**求和**。
+_SUMMED_TASK_FIELDS = ("tool_calls", "replans", "repairs", "writes")
+# 位置类：不是"发生过几次"，而是"走到了多远"。求和无意义（5 步 + 6 步 = 11 步，
+# 比任何一次计划都长），取**均值**。这条踩过一次 —— 当时把所有数值字段一律求和。
+_MEAN_TASK_FIELDS = ("steps",)
 _TOKEN_FIELDS = ("input_tokens", "output_tokens")
 
 
@@ -626,6 +630,8 @@ def _merge_task_rows(rows: list[dict], repeats: int) -> dict:
     merged = dict(rows[0])
     for name in _SUMMED_TASK_FIELDS:
         merged[name] = sum(int(row.get(name) or 0) for row in rows)
+    for name in _MEAN_TASK_FIELDS:
+        merged[name] = round(sum(int(row.get(name) or 0) for row in rows) / len(rows))
 
     statuses: Counter[str] = Counter()
     for row in rows:
@@ -704,6 +710,13 @@ def aggregate_runs(runs: list[dict]) -> dict:
     ]
     summary["noise"] = noise_summary(runs)
     summary["mechanism"] = merge_mechanisms(runs)
+    # 把各轮的**原始逐任务行**留存下来。
+    #
+    # 理由：聚合口径已经出过三次错（mechanism 漏合并、逐任务数值只取第 1 轮、
+    # `steps` 被当成事件计数求和），而每次发现时原始数据都已经没了 —— 要么重跑
+    # （几分钟 + 真金白银），要么手改（那就不再是机器产物）。存下来之后，
+    # 改口径只需重算，不必重跑。
+    summary["per_run"] = [run["tasks"] for run in runs]
     return summary
 
 

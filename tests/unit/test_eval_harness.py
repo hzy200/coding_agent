@@ -672,3 +672,32 @@ def test_writes_distinguishes_did_nothing_from_did_it_wrong() -> None:
 
     assert by_id["a"]["verdict"] == by_id["b"]["verdict"] == "failed"  # 通过率相同
     assert by_id["a"]["writes"] == 0 and by_id["b"]["writes"] == 6      # 但这个分得开
+
+
+def test_steps_aggregates_as_a_mean_not_a_sum() -> None:
+    """`steps` 是「走到了第几步」，不是「发生过几次」。
+
+    跨轮求和会得出比任何一次计划都长的数（5 步 + 6 步 = 11 步）—— 这条踩过一次，
+    当时把所有数值字段一律当成事件计数求和。
+    """
+    run1 = summarize([_result("t", "passed", steps=5)])
+    run2 = summarize([_result("t", "passed", steps=6)])
+    row = aggregate_runs([run1, run2])["tasks"][0]
+
+    assert row["steps"] == 6  # 均值 5.5 取整，而不是 11
+    assert row["repeats"] == 2
+
+
+def test_the_repeated_run_keeps_its_raw_per_task_rows() -> None:
+    """各轮的原始逐任务行必须留存。
+
+    聚合口径已经出过三次错，而每次发现时原始数据都没了 —— 只能重跑或手改。
+    存下来之后，改口径只需重算。
+    """
+    run1 = summarize([_result("a", "passed", tool_calls=10)])
+    run2 = summarize([_result("a", "failed", tool_calls=3)])
+    summary = aggregate_runs([run1, run2])
+
+    assert len(summary["per_run"]) == 2
+    assert [row["tool_calls"] for row in summary["per_run"][0]] == [10]
+    assert [row["verdict"] for row in summary["per_run"][1]] == ["failed"]
