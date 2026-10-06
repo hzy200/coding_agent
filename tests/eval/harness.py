@@ -849,12 +849,29 @@ def eval_audit_dir() -> Path:
     return Path(tempfile.gettempdir()) / "coding-agent-eval-audit"
 
 
-def git_state() -> dict[str, object]:
+def _dirty_entries(porcelain: str, *, ignore: tuple[str, ...] = ()) -> list[str]:
+    """从 `git status --porcelain` 的输出里挑出"算脏"的条目。
+
+    纯函数，便于直接测（否则只能在某棵树的具体状态上断言 —— 那种用例在干净的
+    检出上会失败）。
+    """
+    return [
+        line
+        for line in porcelain.splitlines()
+        if line.strip() and not any(line.endswith(path) for path in ignore)
+    ]
+
+
+def git_state(*, ignore: tuple[str, ...] = ()) -> dict[str, object]:
     """baseline 对应的代码版本。
 
     一份说不清对应哪版代码的通过率没有意义：下一版涨了 10 个点，是因为改了能力，
     还是因为跑的时候工作区里躺着别的改动？`git_dirty` 就是把这件事写明白 ——
     只在干净工作区上跑出来的数字才可比较。
+
+    `ignore` 用来排除**本次要写入的 baseline 文件自己**。少了它会有个很别扭的
+    死结：第一次写 baseline 会把树弄脏，于是"再测另一个套件"永远被拒 ——
+    而那个文件是本次测量的**产物**，不是测量的输入。踩过一次，白跑一轮。
     """
     root = Path(__file__).resolve().parents[2]
 
@@ -872,7 +889,8 @@ def git_state() -> dict[str, object]:
             return ""
         return proc.stdout.strip()
 
+    changed = _dirty_entries(_git("status", "--porcelain"), ignore=ignore)
     return {
         "git_commit": _git("rev-parse", "--short", "HEAD"),
-        "git_dirty": bool(_git("status", "--porcelain")),
+        "git_dirty": bool(changed),
     }

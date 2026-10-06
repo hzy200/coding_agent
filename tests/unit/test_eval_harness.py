@@ -701,3 +701,20 @@ def test_the_repeated_run_keeps_its_raw_per_task_rows() -> None:
     assert len(summary["per_run"]) == 2
     assert [row["tool_calls"] for row in summary["per_run"][0]] == [10]
     assert [row["verdict"] for row in summary["per_run"][1]] == ["failed"]
+
+
+def test_the_baseline_file_itself_does_not_count_as_dirty() -> None:
+    """要写入的基线文件不算"脏改动" —— 它是测量的产物，不是输入。
+
+    少了这条会有个很别扭的死结：第一次写 baseline 把树弄脏，于是"再测另一个
+    套件"永远被拒。踩过一次，白跑一轮（约 550 万 token）。
+    """
+    from harness import _dirty_entries, baseline_path
+
+    target = str(baseline_path("long"))
+    porcelain = "\n".join([" M src/coding_agent/runtime.py", f"?? {target}", ""])
+
+    assert _dirty_entries(porcelain) != []  # 默认算脏
+    # 只忽略目标文件，其余照旧
+    assert _dirty_entries(porcelain, ignore=(target,)) == [" M src/coding_agent/runtime.py"]
+    assert _dirty_entries(f"?? {target}\n", ignore=(target,)) == []

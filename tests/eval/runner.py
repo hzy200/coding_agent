@@ -338,8 +338,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # 可比性守卫放在**开跑之前**：三条理由（子集 / 脏工作区 / 沙箱无 pytest）
     # 此刻全都已知，没有任何理由先烧掉十分钟的模型调用再拒绝。
+    # 要写入的基线文件本身不算"脏改动" —— 它是本次测量的产物，不是输入
+    target = args.baseline or baseline_path(args.suite)
     reasons = comparability(
-        full_set=args.only is None, capabilities=capabilities, git=git_state()
+        full_set=args.only is None,
+        capabilities=capabilities,
+        git=git_state(ignore=(str(target),)),
     )
     writing_default = args.baseline is None and not args.ab
     if reasons and writing_default and not args.force:
@@ -403,7 +407,6 @@ def main(argv: list[str] | None = None) -> int:
     summary["comparable"] = not reasons
     summary["comparable_reason"] = "；".join(reasons)
 
-    target = args.baseline or baseline_path(args.suite)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nbaseline 已写入 {target}")
