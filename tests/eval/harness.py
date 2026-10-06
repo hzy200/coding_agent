@@ -893,6 +893,22 @@ def _repo_relative(paths: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(relatives)
 
 
+def baseline_files() -> tuple[str, ...]:
+    """`tests/eval/baseline*.json` 的仓库相对 posix 路径。
+
+    它们是**产物**，不是测量的输入 —— 任何关于"工作树干不干净"的判断都该把它们
+    排除。这里踩过一次：`_run_all` 里的时间戳调用拿不到目标路径（它不知道跑的是
+    哪个套件），于是刚写出来的 `baseline_long.json` 被当成了脏改动，一份在干净
+    树上测出来的基线被记成 `git_dirty: true` —— 保守方向的错，但会让人误以为
+    那份数字不可用。
+    """
+    directory = Path(__file__).resolve().parent
+    root = directory.parents[1]
+    return tuple(
+        sorted(path.relative_to(root).as_posix() for path in directory.glob("baseline*.json"))
+    )
+
+
 def git_state(*, ignore: tuple[str, ...] = ()) -> dict[str, object]:
     """baseline 对应的代码版本。
 
@@ -921,7 +937,9 @@ def git_state(*, ignore: tuple[str, ...] = ()) -> dict[str, object]:
         return proc.stdout.strip()
 
     changed = _dirty_entries(
-        _git("status", "--porcelain"), ignore=_repo_relative(ignore)
+        _git("status", "--porcelain"),
+        # 显式目标（`--baseline <任意路径>` 时用得上）+ 全部基线产物
+        ignore=(*_repo_relative(ignore), *baseline_files()),
     )
     return {
         "git_commit": _git("rev-parse", "--short", "HEAD"),

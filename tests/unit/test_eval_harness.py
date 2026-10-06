@@ -736,3 +736,19 @@ def test_repo_relative_normalises_absolute_paths_for_the_guard() -> None:
     )
     # 仓库外的路径原样返回，不参与过滤（也不该因此炸掉）
     assert _repo_relative(("D:/somewhere/else.json",)) == ("D:/somewhere/else.json",)
+
+
+def test_the_recorded_stamp_ignores_baseline_artifacts() -> None:
+    """时间戳也必须忽略基线产物。
+
+    `_run_all` 拿不到目标路径（它不知道跑的是哪个套件），所以它靠 glob 忽略整个
+    `baseline*.json` 家族 —— 否则刚写出来的那份会被当成脏改动，一份在干净树上
+    测出来的基线会被记成 `git_dirty: true`。踩过一次，保守方向的错，
+    但会让人误以为那份数字不可用。
+    """
+    from harness import baseline_files
+
+    files = baseline_files()
+    assert files, "至少要认得出仓库里已有的基线产物"
+    assert all(name.startswith("tests/eval/baseline") for name in files)
+    assert all(name.endswith(".json") for name in files)
