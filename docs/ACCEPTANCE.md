@@ -94,7 +94,11 @@ python scripts/demo.py --only 1
 | 覆盖率 | **90.9%**（`pytest -m "not llm" --cov`，含真实 WSL）；**CI 子集 81.4%**，门槛 `fail_under=76` |
 | lint | 干净（`ruff check src tests`） |
 | 快反馈 | `pytest -m "not wsl and not llm"` = **887 passed**（deselect 186 = 183 个 `wsl` + 3 个 `llm`，两组无交集）；需装齐 `.[dev,ui,web]`，缺 `textual` 时 TUI 整目录 skip（TUI 45 条）。含覆盖率约 80 秒 |
-| 能力评测 | 29 任务（20 basic + 9 deep）**18/29 = 62%**，沙箱有 pytest、自动验证与修复循环已生效。报告带机制指标（验证/修复/重规划次数、token）与噪声块；跑法见 [tests/eval/README](../tests/eval/README.md) |
+| 能力评测 | **两个套件**：`default` 29 个短任务（`--repeat 2` 实测 52%/83%，**波动 31 个百分点**）、`long` 2 个长程任务（38 文件 / 近千行仓库，功能贯通 6 个文件）。报告带机制指标（验证/修复/重规划次数、token）与噪声块；跑法见 [tests/eval/README](../tests/eval/README.md) |
+
+> **口径提醒**：`default` 那 52%/83% 说明单次运行的通过率**说明不了任何事** ——
+> 上一版把它读作「已落进 30–70% 区间、有区分度」是过度解读。
+> 版本对比至少要 `--repeat 2`，且差异必须大于 `spread` 才值得讨论。
 | CI | `.github/workflows/ci.yml`：`pip install -e ".[dev,ui,web]"` → ruff → `pytest -m "not wsl and not llm"` |
 
 > **口径提醒**：全量一律写 `pytest -m "not llm"`。裸 `pytest` 会把那 3 条 `llm` 用例一起跑、
