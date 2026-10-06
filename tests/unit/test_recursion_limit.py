@@ -24,6 +24,8 @@ def test_matches_worst_case_topology() -> None:
     # 最坏路径是一路失败：每个阶段之后都进一次 replan（含最后一个，它负责放弃），
     # 而重规划会给新做法重置修复预算与轮次，所以整块「阶段 + replan」重复 (重规划+1) 遍
     per_step = (replans + 1) * (phase + 1)
+    # 一步没产生任何改动时会经 nudge 重做一轮：nudge 节点 + 一个完整周期
+    per_step += per_cycle + 1
     # 失败修订若让本步通过，仍会走 advance → replan（步进微调，独立额度），
     # 相邻步骤之间最多各多两个超步
     assert estimate_recursion_limit(steps, rounds, repairs, replans) == (

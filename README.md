@@ -438,6 +438,7 @@ python tests/eval/runner.py                  # 全量，结果写 baseline.json
 | `AGENT_APPROVAL_MODE` | `ask` | `ask` / `approve` / `deny` |
 | `AGENT_VERIFY_ENABLED` / `AGENT_VERIFY_COMMAND` | `true` / 空 | 自动验证；命令留空则按清单识别 |
 | `AGENT_REVIEW_ENABLED` | `true` | 验证通过后的代码审查（检查语法/被改弱的测试/调试残留） |
+| `AGENT_NUDGE_EMPTY_STEPS` | `true` | 一步没产生任何改动时给它一次带提示的重做机会 |
 | `AGENT_CONTEXT_MAX_CHARS` / `_KEEP_RECENT` / `_TOOL_CHARS` | `60000` / `12` / `1500` | 上下文裁剪；max=0 关闭 |
 | `AGENT_MAX_PLAN_STEPS` / `_TOOL_ROUNDS` / `_REPAIR_ROUNDS` / `_MAX_RESUMES` | `5` / `12` / `3` / `50` | 循环与恢复次数上限 |
 | `AGENT_MAX_REPLANS` | `2` | 执行中重建剩余计划的次数上限（0 = 不重规划） |

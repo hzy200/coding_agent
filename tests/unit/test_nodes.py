@@ -68,6 +68,7 @@ def test_advance_increments_step_and_resets_per_step_state() -> None:
         "dirty": False,
         "verification": {},
         "review": {},
+        "empty_step_nudged": False,
         "retry": 0,
     }
     # review_watermark **不在这里清**：它必须跨步骤保留，否则每一步都会重审
@@ -466,3 +467,34 @@ def test_compose_states_readonly_permission() -> None:
 def test_compose_with_empty_memories_omits_section() -> None:
     assert "长期记忆" not in compose_system_prompt(memories=[])
     assert "长期记忆" not in compose_system_prompt(memories=None)
+
+
+# ---------------- nudge ----------------
+
+def test_nudge_resets_the_tool_budget_and_marks_the_step() -> None:
+    """不给新预算的话 act 会立刻以"预算耗尽"收尾，这次机会等于没给。"""
+    from coding_agent.graph.nodes.nudge import nudge
+
+    out = nudge({"tool_rounds": 12, "budget_exhausted": True, "empty_step_nudged": False})
+
+    assert out["empty_step_nudged"] is True
+    assert out["tool_rounds"] == 0
+    assert out["budget_exhausted"] is False
+
+
+def test_nudge_tells_the_model_why_it_is_back() -> None:
+    """提示必须说明"上一步一个改动都没产生"，否则模型只会把同样的事再做一遍。"""
+    from coding_agent.llm.prompts import compose_system_prompt
+
+    prompt = compose_system_prompt(plan=["实现折扣"], step_idx=0, empty_step=True)
+
+    assert "一个改动都没有产生" in prompt
+    # 同时给出"这一步确实是只读"的退路 —— 否则会逼出无意义的改动
+    assert "无需改动" in prompt
+
+
+def test_no_nudge_hint_when_the_step_produced_changes() -> None:
+    from coding_agent.llm.prompts import compose_system_prompt
+
+    prompt = compose_system_prompt(plan=["实现折扣"], step_idx=0, empty_step=False)
+    assert "一个改动都没有产生" not in prompt

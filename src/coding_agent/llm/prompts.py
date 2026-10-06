@@ -178,6 +178,14 @@ def format_review_feedback(review: dict, *, attempt: int, limit: int) -> str:
     return "\n".join(lines)
 
 
+EMPTY_STEP_NUDGE = """\
+注意：上一步结束时，工作区里**一个改动都没有产生**。
+
+如果这一步本来就需要修改代码，说明你还没有做完 —— 现在把它做完。
+（只读探索本身不产生改动，所以如果你判断这一步确实只需只读，就明确说一句
+「这一步无需改动」并停下，不要为了凑改动而乱改。）"""
+
+
 def compose_system_prompt(
     base: str = SYSTEM_PROMPT,
     *,
@@ -186,6 +194,7 @@ def compose_system_prompt(
     allow_write: bool = False,
     memories: list[str] | None = None,
     feedback: str = "",
+    empty_step: bool = False,
 ) -> str:
     """把长期记忆、当前计划与所处步骤拼进系统提示。
 
@@ -223,5 +232,8 @@ def compose_system_prompt(
         lines.append("")
         lines.append("严格聚焦当前这一步，做完就停，不要越界去做后面的步骤。")
         sections.append("\n".join(lines))
+
+    if empty_step:
+        sections.append(f"\n{EMPTY_STEP_NUDGE}")
 
     return "\n".join(sections)

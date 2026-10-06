@@ -82,6 +82,7 @@ def make_planner_node(
             "tool_rounds": 0,
             "budget_exhausted": False,
             "dirty": False,
+            "empty_step_nudged": False,
             "verification": {},
             "review": {},
             # 水位线是**整轮**的：新的一轮开始，之前审过的留底都不算数了。

@@ -670,6 +670,22 @@ class AgentRuntime:
                             )
                             yield self._review(raw)
 
+                    elif node == "nudge":
+                        # 一步没产生任何改动被打回重做。**刻意不发事件**：
+                        # 它不是给用户看的结果，而是"这一步还没做完"的内部重试 ——
+                        # 前端时间线上会看到这一步继续在动。但审计必须留痕：
+                        # 事后要能回答"这次运行里有几步是被打回来的"。
+                        self._audit(
+                            AuditRecord(
+                                ts=now_iso(),
+                                kind=audit_models.NUDGE,
+                                thread_id=thread_id,
+                                detail=truncate(
+                                    f"第 {step_idx + 1} 步未产生改动，已要求重做"
+                                ),
+                            )
+                        )
+
                     elif node == "repair":
                         attempt = int(update.get("retry", 0))
                         limit = self.settings.max_repair_rounds

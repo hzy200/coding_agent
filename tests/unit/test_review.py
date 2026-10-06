@@ -445,3 +445,110 @@ def test_review_blocking_loop_terminates_with_a_zero_budget() -> None:
     assert calls["review"] == 1
     assert calls["act"] == 1
     assert calls["replan"] == 1
+
+
+# ---------------- 图级：空步骤只重做一次 ----------------
+
+def _nudge_graph(*, nudge_enabled: bool, limit: int = 3):
+    """迷你图：模型每次都不改任何东西（`dirty` 恒为 False）。
+
+    这复现的是实测里那种"把计划读完就算完成"—— `verify` 与 `review` 都因
+    `dirty=False` 而短路，控制流一路 advance。nudge 是这条路上的补救。
+    """
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.graph import END, START, StateGraph
+
+    from coding_agent.graph.nodes.nudge import nudge as nudge_node
+    from coding_agent.graph.nodes.repair import repair
+    from coding_agent.graph.routing import (
+        ADVANCE,
+        NUDGE,
+        REPAIR,
+        REPLAN,
+        RESPOND,
+        REVIEW,
+        VERIFY,
+        make_route_after_review,
+        make_route_after_verify,
+        route_after_act,
+    )
+    from coding_agent.graph.state import AgentState
+
+    calls = {"act": 0, "nudge": 0, "advance": 0, "respond": 0}
+
+    def act(state, config):
+        calls["act"] += 1
+        return {"messages": [AIMessage(content="我读完了")]}
+
+    def verify_node(state, config):
+        # `dirty=False` 时真节点就是这条短路
+        return {"verification": {}}
+
+    def review_node(state, config):
+        return {"review": {}}
+
+    def counting(name, inner):
+        # nudge 是**纯函数**（只收 state）—— LangGraph 靠签名决定传几个参数，
+        # 包一层之后要自己按同样口径调用，否则会多传一个 config。
+        def wrapper(state, config):
+            calls[name] += 1
+            return inner(state)
+        return wrapper
+
+    graph = StateGraph(AgentState)
+    graph.add_node("act", act)
+    graph.add_node(VERIFY, verify_node)
+    graph.add_node(REVIEW, review_node)
+    graph.add_node(NUDGE, counting("nudge", nudge_node))
+    graph.add_node(REPAIR, repair)
+    graph.add_node(REPLAN, lambda state, config: {"plan": []})
+    graph.add_node(ADVANCE, counting("advance", lambda state: {}))
+    graph.add_node(RESPOND, counting("respond", lambda state: {}))
+    graph.add_edge(START, "act")
+    graph.add_conditional_edges("act", route_after_act, {VERIFY: VERIFY})
+    graph.add_conditional_edges(
+        VERIFY,
+        make_route_after_verify(limit),
+        {REPAIR: REPAIR, REPLAN: REPLAN, REVIEW: REVIEW, RESPOND: RESPOND},
+    )
+    graph.add_conditional_edges(
+        REVIEW,
+        make_route_after_review(limit, nudge_empty_steps=nudge_enabled),
+        {NUDGE: NUDGE, REPAIR: REPAIR, REPLAN: REPLAN, ADVANCE: ADVANCE, RESPOND: RESPOND},
+    )
+    graph.add_edge(NUDGE, "act")
+    graph.add_edge(REPAIR, "act")
+    graph.add_edge(REPLAN, RESPOND)
+    graph.add_edge(ADVANCE, RESPOND)
+    graph.add_edge(RESPOND, END)
+    return graph.compile(checkpointer=MemorySaver()), calls
+
+
+def _run_nudge_graph(enabled: bool) -> dict:
+    app, calls = _nudge_graph(nudge_enabled=enabled)
+    asyncio.run(app.ainvoke(
+        # 两步计划：单步计划下 `has_more_steps` 为假会直接去 RESPOND，
+        # 那样就验不到 advance 这一跳
+        {"messages": [], "plan": ["实现折扣", "跑测试"], "step_idx": 0,
+         "dirty": False, "retry": 0},
+        {"configurable": {"thread_id": f"nudge-{enabled}"}, "recursion_limit": 200},
+    ))
+    return calls
+
+
+def test_a_step_that_changes_nothing_is_retried_once_then_accepted() -> None:
+    """只重做一次，然后放行 —— 不能变成死循环，也不能无限要求"必须有改动"。"""
+    calls = _run_nudge_graph(enabled=True)
+
+    assert calls["nudge"] == 1
+    assert calls["act"] == 2  # 初次 + 重做一次
+    assert calls["advance"] == 1
+
+
+def test_without_the_nudge_the_empty_step_passes_straight_through() -> None:
+    """关掉开关时回到旧行为（现有基线要有一条可比的路）。"""
+    calls = _run_nudge_graph(enabled=False)
+
+    assert calls["nudge"] == 0
+    assert calls["act"] == 1
+    assert calls["advance"] == 1

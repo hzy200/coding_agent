@@ -85,6 +85,9 @@ def make_act_node(
             allow_write=allow_write,
             memories=state.get("memories"),
             feedback=feedback,
+            # 上一步没产生任何改动、被 nudge 打回来重做 —— 把它明说给模型听，
+            # 否则它只会把同样的事再做一遍
+            empty_step=bool(state.get("empty_step_nudged")) and not state.get("dirty"),
         )
         history, _ = trim_messages(state["messages"], trim_budget)
         messages = [SystemMessage(content=system), *history]

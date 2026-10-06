@@ -29,4 +29,6 @@ def repair(state: AgentState) -> dict[str, Any]:
         "budget_exhausted": False,
         # 修完必须重新验证，否则「改坏了但没人发现」
         "dirty": True,
+        # 修复本身会再给一次"有没有产出"的判断机会
+        "empty_step_nudged": False,
     }

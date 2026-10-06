@@ -38,12 +38,14 @@ from coding_agent.graph.nodes import (
     make_review_node,
     make_tools_node,
     make_verify_node,
+    nudge,
     repair,
 )
 from coding_agent.graph.routing import (
     ACT,
     ADVANCE,
     APPROVE,
+    NUDGE,
     REPAIR,
     REPLAN,
     RESPOND,
@@ -102,6 +104,9 @@ def estimate_recursion_limit(
     # **包括最后一个**——它负责放弃并把剩余步骤砍掉。所以是 (重规划次数+1) 个
     # 「阶段 + replan」。
     per_step = (max_replans + 1) * (phase + 1)
+    # 一步若**一个改动都没产生**，会经 nudge 重做一轮（上限一次，见 nodes/nudge.py）：
+    # nudge 节点 1 个超步 + 一个完整的执行周期。
+    per_step += per_cycle + 1
     # 失败重规划若让本步通过，仍会走 advance → replan（步进微调），
     # 那两个超步落在相邻步骤之间，最多每步各一次。
     return max_plan_steps * (per_step + 2) + _RECURSION_MARGIN
@@ -149,6 +154,7 @@ def build_graph(
     graph.add_node(TOOLS, make_tools_node(tools))
     graph.add_node(VERIFY, make_verify_node(sandbox, root))
     graph.add_node(REVIEW, make_review_node(sandbox, root))
+    graph.add_node(NUDGE, nudge)
     graph.add_node(REPAIR, repair)
     graph.add_node("advance", advance)
     graph.add_node(
@@ -185,14 +191,19 @@ def build_graph(
     # 验证通过后过一遍代码审查，它决定是步进还是打回修复
     graph.add_conditional_edges(
         REVIEW,
-        make_route_after_review(settings.max_repair_rounds),
+        make_route_after_review(
+            settings.max_repair_rounds, nudge_empty_steps=settings.nudge_empty_steps
+        ),
         {
+            NUDGE: NUDGE,
             REPAIR: REPAIR,
             REPLAN: REPLAN,
             ADVANCE: "advance",
             RESPOND: "respond",
         },
     )
+    # 一步没产生任何改动 → 带提示重做一次（上限一次，见 nodes/nudge.py）
+    graph.add_edge(NUDGE, "act")
     graph.add_edge(REPAIR, "act")
     # 步进之后必过 replan：它可能把剩余步骤重写（甚至清空，直接去收尾）
     graph.add_edge("advance", REPLAN)

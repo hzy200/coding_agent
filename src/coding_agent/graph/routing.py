@@ -11,6 +11,7 @@ APPROVE = "approval_gate"
 TOOLS = "tools"
 VERIFY = "verify"
 REVIEW = "review"
+NUDGE = "nudge"
 REPAIR = "repair"
 ADVANCE = "advance"
 REPLAN = "replan"
@@ -92,11 +93,15 @@ def make_route_after_verify(max_repair_rounds: int) -> Callable[[AgentState], st
     return route_after_verify
 
 
-def make_route_after_review(max_repair_rounds: int) -> Callable[[AgentState], str]:
+def make_route_after_review(
+    max_repair_rounds: int, *, nudge_empty_steps: bool = True
+) -> Callable[[AgentState], str]:
     """审查之后去哪。
 
     审查的阻断与验证的失败走**同一条出口**（repair，额度耗尽则 replan）：
     对这一步来说它们的含义相同 —— 东西做出来了，但不合格。
+
+    `nudge_empty_steps` 关掉时行为与本轮之前完全一致（给现有基线留一条可比的路）。
     """
 
     def route_after_review(state: AgentState) -> str:
@@ -104,6 +109,11 @@ def make_route_after_review(max_repair_rounds: int) -> Callable[[AgentState], st
             if state.get("retry", 0) < max_repair_rounds:
                 return REPAIR
             return REPLAN
+        # 这一步**一个改动都没产生** —— 而 verify 与 review 都只在 `dirty` 时才跑，
+        # 所以两者都短路通过，「只读了文件」和「做完了」在图上长得一样。
+        # 给它一次重做的机会（见 nodes/nudge.py），上限一次。
+        if nudge_empty_steps and not state.get("dirty") and not state.get("empty_step_nudged"):
+            return NUDGE
         return ADVANCE if has_more_steps(state) else RESPOND
 
     return route_after_review

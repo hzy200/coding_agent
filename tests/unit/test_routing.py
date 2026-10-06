@@ -6,6 +6,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from coding_agent.graph.routing import (
     ADVANCE,
     APPROVE,
+    NUDGE,
     REPAIR,
     REPLAN,
     RESPOND,
@@ -20,10 +21,17 @@ from coding_agent.graph.routing import (
 MAX_REPAIRS = 3
 route_after_verify = make_route_after_verify(MAX_REPAIRS)
 route_after_review = make_route_after_review(MAX_REPAIRS)
+# 关掉「空步骤重做」的那一版 —— 用来验证这个开关确实能回到旧行为
+route_after_review_no_nudge = make_route_after_review(MAX_REPAIRS, nudge_empty_steps=False)
 
 
-def _state(messages, plan=None, step_idx=0):
-    return {"messages": messages, "plan": plan or [], "step_idx": step_idx}
+def _state(messages, plan=None, step_idx=0, *, dirty=True):
+    """默认 `dirty=True`。
+
+    这一步的改动是**有意义的**：`dirty=False` 且没被 nudge 过时会走重做那条路
+    （见 `nodes/nudge.py`），而本文件大半用例考的是"改动之后往哪去"。
+    """
+    return {"messages": messages, "plan": plan or [], "step_idx": step_idx, "dirty": dirty}
 
 
 # ---------------- act 之后 ----------------
@@ -197,3 +205,36 @@ def test_budget_exhausted_does_not_override_failed_verification() -> None:
     state["verification"] = {"status": "failed"}
     state["retry"] = 0
     assert route_after_verify(state) == REPAIR
+
+
+# ---------------- 空步骤重做（nudge） ----------------
+#
+# `verify` 与 `review` 都只在 `dirty` 时跑。所以「这一步只读了文件」与
+# 「这一步做完了」在图上长得一样 —— 实测里模型因此把整个计划"读"完就算完成
+# （10 次运行里 5 次一次写都没尝试过）。这一组钉住那条补救路径。
+
+def test_a_step_with_no_change_is_sent_back_to_act() -> None:
+    state = _state([AIMessage(content="我读完了")], ["a", "b"], 0, dirty=False)
+    assert route_after_review(state) == NUDGE
+
+
+def test_the_nudge_happens_only_once_per_step() -> None:
+    """只读步骤是合法的（计划第一步常常就是探索），所以只给一次机会。
+
+    无限要求"必须有改动"会逼出无意义的改动。
+    """
+    state = _state([AIMessage(content="这一步只需只读")], ["a", "b"], 0, dirty=False)
+    state["empty_step_nudged"] = True
+    assert route_after_review(state) == ADVANCE
+
+
+def test_nudged_last_step_still_responds() -> None:
+    state = _state([AIMessage(content="只读")], ["a"], 0, dirty=False)
+    state["empty_step_nudged"] = True
+    assert route_after_review(state) == RESPOND
+
+
+def test_the_nudge_can_be_turned_off() -> None:
+    """关闭时必须回到旧行为 —— 现有基线要有一条可比的路。"""
+    state = _state([AIMessage(content="只读")], ["a", "b"], 0, dirty=False)
+    assert route_after_review_no_nudge(state) == ADVANCE

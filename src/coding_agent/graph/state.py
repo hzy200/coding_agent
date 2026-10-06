@@ -42,6 +42,9 @@ class AgentState(TypedDict, total=False):
     budget_exhausted: bool
     # 本步是否改过文件/依赖：没改动就不必跑验证
     dirty: bool
+    # 本步是否已经因「一个改动都没产生」被要求重做过一次（上限一次，防死循环）。
+    # 由 planner / advance / repair 复位，nudge 置位。
+    empty_step_nudged: bool
     # 最近一次验证结果（VerifyResult 的 model_dump）
     verification: dict[str, Any]
     # 最近一次代码审查结果（ReviewResult 的 model_dump）。

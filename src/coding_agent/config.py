@@ -110,6 +110,16 @@ class Settings(BaseSettings):
     # 留空表示按项目清单自动识别（pytest / cargo / go / npm / make）
     verify_command: str = Field(default="", alias="AGENT_VERIFY_COMMAND")
 
+    # 「一步没有任何改动」时是否给它一次重做的机会。
+    #
+    # 背景：`dirty=False` 时 verify 与 review 都会短路，控制流直接 advance ——
+    # 于是「这一步只读了文件」与「这一步做完了」在图上**无法区分**。实测过一整批
+    # 长程任务因此把计划"读"完就算完成：10 次运行里 5 次一次写都没尝试过。
+    #
+    # 默认开启，但**必须可关**：它会改变所有任务的行为，现有基线因此不再可比
+    # （评测的 baseline 里记了这个开关）。
+    nudge_empty_steps: bool = Field(default=True, alias="AGENT_NUDGE_EMPTY_STEPS")
+
     # ---------- 代码审查 ----------
     # 一步做完、验证通过后，对本次改动跑一遍确定性静态检查（`tools/review.py`）。
     # 与自动 verify 同一口径：不过审批，所以只跑宿主写死的检查，不读工作区里的

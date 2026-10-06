@@ -1,6 +1,7 @@
 from coding_agent.graph.nodes.act import make_act_node
 from coding_agent.graph.nodes.advance import advance
 from coding_agent.graph.nodes.approve import make_approval_gate_node, tool_level
+from coding_agent.graph.nodes.nudge import nudge
 from coding_agent.graph.nodes.planner import TaskPlan, make_planner_node
 from coding_agent.graph.nodes.repair import repair
 from coding_agent.graph.nodes.replan import ReplanDecision, make_replan_node
@@ -21,6 +22,7 @@ __all__ = [
     "make_review_node",
     "make_tools_node",
     "make_verify_node",
+    "nudge",
     "repair",
     "tool_level",
 ]

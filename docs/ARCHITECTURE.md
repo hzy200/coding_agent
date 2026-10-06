@@ -37,6 +37,7 @@ LLM 拿不到操作系统句柄，只能产出结构化调用 `{tool, args}`；�
 │   planner → act ⇄ (approval_gate → tools) → verify        │
 │   → review → advance → replan → …                         │
 │   两道质量关：verify 管行为对不对，review 管代码干不干净      │
+│   一步没有产生任何改动 → nudge 打回重做一次（上限一次）        │
 │   步进后经 replan：计划可在执行中被修正（修的是"后面"）        │
 │   节点只读状态、返回状态增量；不碰 I/O 以外的宿主资源         │
 └───────────────────────┬──────────────────────────────────┘
@@ -182,6 +183,8 @@ Web 页面上一个按钮就能跳过命令分级。这条约束是安全属性�
 | 20 | **路由每一跳只看自己那道关** | `repair` 刻意不清 `review`，若 `route_after_verify` 也去看 review，"验证失败→修复→验证通过"这条路上陈旧的阻断会把刚通过的验证直接打回 repair，**审查再也不重跑** | `test_verify_does_not_reroute_on_a_stale_review_block`、`test_review_blocking_loop_converges_and_reviews_every_round` |
 | 21 | **审查阻断与验证失败共用修复预算，额度耗尽一律去 replan** | 两个独立计数器会让 `estimate_recursion_limit` 多一层乘积，而它算歪过三次。共用的收敛性由 replan 的硬上限保证 | `test_review_blocking_loop_converges_and_reviews_every_round`、`test_review_blocking_loop_terminates_with_a_zero_budget` |
 | 22 | **审查没跑起来 ≠ 审查通过** | 与审计、验证同源的一条：脚本崩了要留一条可见的告警，而不是静默当成"审过了没问题" | `test_a_crashed_review_is_not_reported_as_clean` |
+| 23 | **「这一步只读了文件」不等于「这一步做完了」** | `verify` 与 `review` 都只在 `dirty` 时执行，所以一个只读步骤会**一路短路到 advance** —— 实测里模型因此把整个计划"读"完就算完成（长程任务 10 次运行里 5 次一次写都没尝试过）。改为一律经 `nudge` 打回重做一次，并在提示里说明原因 | `test_a_step_with_no_change_is_sent_back_to_act`、`test_a_step_that_changes_nothing_is_retried_once_then_accepted` |
+| 24 | **空步骤的重做有界，且必须给退路** | 只读步骤是合法的（计划第一步常常就是探索）。无限要求"必须有改动"会逼出无意义的改动，所以只给一次机会，且提示里明确写了"这一步确实只需只读就说明理由停下" | `test_the_nudge_happens_only_once_per_step`、`test_nudge_tells_the_model_why_it_is_back` |
 
 ## 7. 关键取舍
 
