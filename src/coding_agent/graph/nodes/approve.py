@@ -41,7 +41,8 @@ _READ_TOOLS = frozenset(
 _WRITE_TOOLS = frozenset({WRITE_TOOL_NAME, EDIT_TOOL_NAME, RESTORE_TOOL_NAME, GIT_ADD})
 
 # 变更性：产生提交、改动依赖环境、执行项目代码，一律逐条询问。
-# 注意自动 verify 不走这里 —— 它跑的是宿主推导出的固定命令，模型影响不了跑什么。
+# 注意自动 verify 不走这里 —— 它只跑命令文本由宿主写死的命令（见 nodes/verify.py）；
+# manifest 派生出来的 `make test` / `npm test` 只留给走审批的 run_tests。
 _MUTATE_TOOLS = frozenset({GIT_COMMIT, DEPS_INSTALL, RUN_TESTS_TOOL})
 
 

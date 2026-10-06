@@ -24,6 +24,13 @@ class _FakeSandbox:
         self.runs += 1
         return ExecResult(command=command, exit_code=0, stdout="", stderr="", duration_ms=1)
 
+    # 桩件刻意不做缓存：这里要数的就是 `run` 的调用次数。
+    def cached_probe(self, key: str, producer):
+        return producer()
+
+    def forget_probe(self, key: str) -> None:
+        return None
+
 
 def test_clean_step_skips_verification() -> None:
     sandbox = _FakeSandbox()

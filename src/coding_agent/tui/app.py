@@ -26,9 +26,12 @@ from coding_agent.events import (
     Event,
     FileChanged,
     PlanCreated,
+    PlanRevised,
     RepairStarted,
+    ReviewFinished,
     RunFailed,
     RunFinished,
+    RunStarted,
     StepFinished,
     StepStarted,
     ToolCallFinished,
@@ -273,10 +276,31 @@ class AgentTuiApp(App[None]):
         self.query_one("#streaming", Static).update("")
 
     def _apply(self, event: Event) -> None:
-        if isinstance(event, PlanCreated):
+        if isinstance(event, RunStarted):
+            # 每轮运行的新起点：清掉上一轮遗留的流式缓冲与「最终答复」标记。
+            # 不复位的话，同一会话的第二轮起 respond 的文本就不再打分隔标题，
+            # 会和 act 的每步小结混成一片。
+            self._flush_stream()
+            self._answering = False
+            self._plan = []
+            self._step_idx = 0
+            self._total = 1
+            self._plan_panel.render_plan([], 0)
+
+        elif isinstance(event, PlanCreated):
             self._plan = list(event.steps)
             self._step_idx = 0
             self._plan_panel.render_plan(self._plan, 0)
+            if event.degraded:
+                self._write("! 规划未解析，已退化为单步执行", "yellow")
+
+        elif isinstance(event, PlanRevised):
+            self._flush_stream()
+            self._plan = list(event.steps)
+            self._step_idx = event.step_idx
+            self._total = max(len(self._plan), 1)
+            self._plan_panel.render_plan(self._plan, event.step_idx)
+            self._write("↻ 计划已调整", "yellow")
 
         elif isinstance(event, StepStarted):
             self._flush_stream()
@@ -290,6 +314,8 @@ class AgentTuiApp(App[None]):
             self._flush_stream()
             if event.budget_exhausted:
                 self._write("（本步骤工具预算耗尽）", "yellow")
+            elif event.cancelled:
+                self._write("（本步骤未执行完，已放弃）", "yellow")
 
         elif isinstance(event, AssistantToken):
             # respond 与 act 的内容常有重叠（架构上就是「每步小结 + 最终汇总」），
@@ -337,6 +363,18 @@ class AgentTuiApp(App[None]):
                 self._write(f"验证失败  {event.summary}", "red")
                 for issue in event.issues[:5]:
                     self._write(f"  · {issue}", "red")
+
+        elif isinstance(event, ReviewFinished):
+            if event.status == "skipped":
+                pass
+            elif event.blocked:
+                self._write(f"代码审查未通过  {event.summary}", "red")
+                for finding in event.findings[:5]:
+                    self._write(f"  · {finding}", "red")
+            elif event.status == "warned":
+                self._write(f"代码审查有告警  {event.summary}", "yellow")
+            else:
+                self._write(f"代码审查通过  {event.summary}", "green")
 
         elif isinstance(event, RepairStarted):
             self._write(

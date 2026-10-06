@@ -13,10 +13,12 @@ from pydantic import BaseModel, Field
 # kind 取值
 RUN_START = "run_start"
 PLAN = "plan"
+REPLAN = "replan"
 TOOL_CALL = "tool_call"
 FILE_CHANGE = "file_change"
 ROLLBACK = "rollback"
 VERIFY = "verify"
+REVIEW = "review"
 REPAIR = "repair"
 RUN_END = "run_end"
 RUN_ERROR = "run_error"

@@ -1,0 +1,338 @@
+{
+  "passed": 18,
+  "total": 29,
+  "pass_rate": 0.6207,
+  "by_category": {
+    "single_file": {
+      "passed": 5,
+      "total": 7
+    },
+    "cross_file": {
+      "passed": 4,
+      "total": 8
+    },
+    "debug": {
+      "passed": 8,
+      "total": 11
+    },
+    "spec": {
+      "passed": 1,
+      "total": 3
+    }
+  },
+  "by_tier": {
+    "basic": {
+      "passed": 13,
+      "total": 20
+    },
+    "deep": {
+      "passed": 5,
+      "total": 9
+    }
+  },
+  "tasks": [
+    {
+      "id": "single_file/off_by_one",
+      "category": "single_file",
+      "tier": "basic",
+      "verdict": "passed",
+      "tool_calls": 7,
+      "steps": 4,
+      "replans": 0,
+      "agent_seconds": 20.4
+    },
+    {
+      "id": "single_file/mutable_default",
+      "category": "single_file",
+      "tier": "basic",
+      "verdict": "failed",
+      "tool_calls": 5,
+      "steps": 3,
+      "replans": 1,
+      "agent_seconds": 12.7
+    },
+    {
+      "id": "single_file/port_validation",
+      "category": "single_file",
+      "tier": "basic",
+      "verdict": "passed",
+      "tool_calls": 7,
+      "steps": 3,
+      "replans": 0,
+      "agent_seconds": 16.9
+    },
+    {
+      "id": "single_file/todo_stub",
+      "category": "single_file",
+      "tier": "basic",
+      "verdict": "passed",
+      "tool_calls": 3,
+      "steps": 4,
+      "replans": 0,
+      "agent_seconds": 13.6
+    },
+    {
+      "id": "single_file/slugify",
+      "category": "single_file",
+      "tier": "basic",
+      "verdict": "passed",
+      "tool_calls": 7,
+      "steps": 3,
+      "replans": 0,
+      "agent_seconds": 18.9
+    },
+    {
+      "id": "single_file/money_rounding",
+      "category": "single_file",
+      "tier": "basic",
+      "verdict": "failed",
+      "tool_calls": 7,
+      "steps": 2,
+      "replans": 3,
+      "agent_seconds": 34.7
+    },
+    {
+      "id": "single_file/email_validation",
+      "category": "single_file",
+      "tier": "basic",
+      "verdict": "passed",
+      "tool_calls": 5,
+      "steps": 4,
+      "replans": 0,
+      "agent_seconds": 15.8
+    },
+    {
+      "id": "cross_file/rename_function",
+      "category": "cross_file",
+      "tier": "basic",
+      "verdict": "failed",
+      "tool_calls": 7,
+      "steps": 3,
+      "replans": 0,
+      "agent_seconds": 14.0
+    },
+    {
+      "id": "cross_file/extract_helper",
+      "category": "cross_file",
+      "tier": "basic",
+      "verdict": "failed",
+      "tool_calls": 8,
+      "steps": 2,
+      "replans": 3,
+      "agent_seconds": 34.1
+    },
+    {
+      "id": "cross_file/move_class",
+      "category": "cross_file",
+      "tier": "basic",
+      "verdict": "passed",
+      "tool_calls": 11,
+      "steps": 4,
+      "replans": 0,
+      "agent_seconds": 25.2
+    },
+    {
+      "id": "cross_file/signature_change",
+      "category": "cross_file",
+      "tier": "basic",
+      "verdict": "passed",
+      "tool_calls": 10,
+      "steps": 4,
+      "replans": 0,
+      "agent_seconds": 22.7
+    },
+    {
+      "id": "cross_file/split_module",
+      "category": "cross_file",
+      "tier": "basic",
+      "verdict": "passed",
+      "tool_calls": 6,
+      "steps": 4,
+      "replans": 0,
+      "agent_seconds": 15.4
+    },
+    {
+      "id": "cross_file/config_single_source",
+      "category": "cross_file",
+      "tier": "basic",
+      "verdict": "passed",
+      "tool_calls": 11,
+      "steps": 3,
+      "replans": 0,
+      "agent_seconds": 21.3
+    },
+    {
+      "id": "cross_file/shape_mismatch",
+      "category": "cross_file",
+      "tier": "basic",
+      "verdict": "failed",
+      "tool_calls": 10,
+      "steps": 3,
+      "replans": 3,
+      "agent_seconds": 43.5
+    },
+    {
+      "id": "debug/misleading_error",
+      "category": "debug",
+      "tier": "basic",
+      "verdict": "failed",
+      "tool_calls": 6,
+      "steps": 4,
+      "replans": 0,
+      "agent_seconds": 15.2
+    },
+    {
+      "id": "debug/circular_import",
+      "category": "debug",
+      "tier": "basic",
+      "verdict": "failed",
+      "tool_calls": 7,
+      "steps": 1,
+      "replans": 3,
+      "agent_seconds": 39.8
+    },
+    {
+      "id": "debug/leaked_counter",
+      "category": "debug",
+      "tier": "basic",
+      "verdict": "passed",
+      "tool_calls": 6,
+      "steps": 3,
+      "replans": 0,
+      "agent_seconds": 15.9
+    },
+    {
+      "id": "debug/output_order",
+      "category": "debug",
+      "tier": "basic",
+      "verdict": "passed",
+      "tool_calls": 7,
+      "steps": 3,
+      "replans": 0,
+      "agent_seconds": 15.8
+    },
+    {
+      "id": "debug/unflushed_write",
+      "category": "debug",
+      "tier": "basic",
+      "verdict": "passed",
+      "tool_calls": 10,
+      "steps": 3,
+      "replans": 0,
+      "agent_seconds": 21.2
+    },
+    {
+      "id": "debug/empty_edge_case",
+      "category": "debug",
+      "tier": "basic",
+      "verdict": "passed",
+      "tool_calls": 11,
+      "steps": 3,
+      "replans": 0,
+      "agent_seconds": 21.5
+    },
+    {
+      "id": "deep/config_precedence",
+      "category": "debug",
+      "tier": "deep",
+      "verdict": "passed",
+      "tool_calls": 12,
+      "steps": 4,
+      "replans": 0,
+      "agent_seconds": 23.3
+    },
+    {
+      "id": "deep/import_chain",
+      "category": "debug",
+      "tier": "deep",
+      "verdict": "passed",
+      "tool_calls": 12,
+      "steps": 4,
+      "replans": 0,
+      "agent_seconds": 29.3
+    },
+    {
+      "id": "deep/spec_pagination",
+      "category": "spec",
+      "tier": "deep",
+      "verdict": "passed",
+      "tool_calls": 11,
+      "steps": 4,
+      "replans": 0,
+      "agent_seconds": 31.7
+    },
+    {
+      "id": "deep/spec_idempotent",
+      "category": "spec",
+      "tier": "deep",
+      "verdict": "failed",
+      "tool_calls": 6,
+      "steps": 3,
+      "replans": 0,
+      "agent_seconds": 14.9
+    },
+    {
+      "id": "deep/request_payload",
+      "category": "spec",
+      "tier": "deep",
+      "verdict": "failed",
+      "tool_calls": 5,
+      "steps": 3,
+      "replans": 0,
+      "agent_seconds": 13.2
+    },
+    {
+      "id": "deep/field_propagation",
+      "category": "cross_file",
+      "tier": "deep",
+      "verdict": "failed",
+      "tool_calls": 9,
+      "steps": 5,
+      "replans": 0,
+      "agent_seconds": 21.4
+    },
+    {
+      "id": "replan/many_symptoms_one_cause",
+      "category": "debug",
+      "tier": "deep",
+      "verdict": "failed",
+      "tool_calls": 6,
+      "steps": 1,
+      "replans": 3,
+      "agent_seconds": 33.6
+    },
+    {
+      "id": "replan/stale_todo_list",
+      "category": "debug",
+      "tier": "deep",
+      "verdict": "passed",
+      "tool_calls": 14,
+      "steps": 5,
+      "replans": 2,
+      "agent_seconds": 28.6
+    },
+    {
+      "id": "replan/misdirected_request",
+      "category": "debug",
+      "tier": "deep",
+      "verdict": "passed",
+      "tool_calls": 9,
+      "steps": 4,
+      "replans": 1,
+      "agent_seconds": 21.0
+    }
+  ],
+  "recorded_at": "2026-10-05T05:15:35+00:00",
+  "model": "deepseek-chat",
+  "git_commit": "a88c822",
+  "git_dirty": true,
+  "sandbox_capabilities": {
+    "python3": true,
+    "pytest": true,
+    "make": false,
+    "node": false,
+    "cargo": false,
+    "go": false
+  },
+  "max_replans": 2
+}

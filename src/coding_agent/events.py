@@ -24,10 +24,30 @@ class Event(BaseModel):
 # --------------------------------------------------------------------------
 
 class PlanCreated(Event):
-    """planner 完成分解。"""
+    """planner 完成分解。
+
+    `degraded` 为真表示**规划其实失败了**：模型没给出可解析的步骤，
+    已退化成「整条请求当成一步」。这时 `steps` 只有一项、就是请求原文，
+    后面不会再有真正的多步推进。前端必须把它显示出来 ——
+    静默降级的话，一次完全失效的规划看起来和正常工作一模一样。
+    """
 
     type: Literal["plan_created"] = "plan_created"
     steps: list[str] = Field(default_factory=list)
+    degraded: bool = False
+
+
+class PlanRevised(Event):
+    """执行中重建了剩余计划（planner 只在开局跑一次，之后靠它修正）。
+
+    `steps` 是**完整的**新计划（含已完成的部分，它们不会被改动），
+    `step_idx` 是当前所处步骤，前端据此重新渲染计划面板。
+    修订次数有硬上限（`AGENT_MAX_REPLANS`）。
+    """
+
+    type: Literal["plan_revised"] = "plan_revised"
+    steps: list[str] = Field(default_factory=list)
+    step_idx: int = 0
 
 
 class StepStarted(Event):
@@ -40,11 +60,18 @@ class StepStarted(Event):
 
 
 class StepFinished(Event):
-    """当前子任务收尾（模型给出了小结，或工具预算耗尽被强制叫停）。"""
+    """当前子任务收尾（模型给出了小结，或工具预算耗尽被强制叫停）。
+
+    `cancelled` 表示这一步**根本没机会执行完**：重规划判定它做不成、把剩余步骤
+    砍掉了，于是路由直接去收尾。它与 `budget_exhausted` 的区别是——后者是"试过
+    但工具轮次用完"，前者是"还没试就被放弃了"。前端需要区分，否则用户会以为
+    模型已经尝试过。
+    """
 
     type: Literal["step_finished"] = "step_finished"
     index: int = 0
     budget_exhausted: bool = False
+    cancelled: bool = False
     text: str = ""
 
 
@@ -121,6 +148,23 @@ class Verification(Event):
     issues: list[str] = Field(default_factory=list)
 
 
+class ReviewFinished(Event):
+    """一步做完、验证通过后，代码审查的结果。
+
+    与 `Verification` 分开而不是复用：审查回答的不是「行为对不对」，而是
+    「代码干不干净」（调试残留、被改弱的断言、语法坏掉的分支、往 `.agent/` 里写）。
+    合成一个事件会让「这一步到底卡在哪一关」看不出来。
+
+    status: clean / warned / blocked / skipped
+    """
+
+    type: Literal["review_finished"] = "review_finished"
+    status: str = "skipped"
+    blocked: bool = False
+    summary: str = ""
+    findings: list[str] = Field(default_factory=list)
+
+
 class RepairStarted(Event):
     """验证失败后开始第 N 次修复。"""
 
@@ -162,20 +206,36 @@ class RunStarted(Event):
 
 
 class RunFinished(Event):
+    """一轮运行正常收尾。
+
+    `input_tokens` / `output_tokens` 是整轮的用量总计（跨挂起-恢复累加），
+    取自 provider 回报的 `usage_metadata`。未回报时为 None —— 与 0 不同，
+    消费方（如能力评测）不该把缺失当成"用了零 token"。
+    """
+
     type: Literal["run_finished"] = "run_finished"
     thread_id: str = ""
     answer: str = ""
+    input_tokens: int | None = None
+    output_tokens: int | None = None
 
 
 class RunFailed(Event):
-    """编排层自身出错（模型/沙箱不可用等），与「工具执行失败」不同。"""
+    """编排层自身出错（模型/沙箱不可用等），与「工具执行失败」不同。
+
+    同样带上已累计的用量：失败的那一轮**花费可能最多**（反复重试、长上下文），
+    把它排除在统计外会让成本口径系统性偏低。
+    """
 
     type: Literal["run_failed"] = "run_failed"
     message: str = ""
+    input_tokens: int | None = None
+    output_tokens: int | None = None
 
 
 EventType = (
     PlanCreated
+    | PlanRevised
     | StepStarted
     | StepFinished
     | AssistantToken
@@ -183,6 +243,7 @@ EventType = (
     | ToolCallFinished
     | FileChanged
     | Verification
+    | ReviewFinished
     | RepairStarted
     | ApprovalRequested
     | RunStarted

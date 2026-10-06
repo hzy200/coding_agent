@@ -1,0 +1,126 @@
+{
+  "replan_on": {
+    "passed": 3,
+    "total": 3,
+    "pass_rate": 1.0,
+    "by_category": {
+      "debug": {
+        "passed": 3,
+        "total": 3
+      }
+    },
+    "by_tier": {
+      "deep": {
+        "passed": 3,
+        "total": 3
+      }
+    },
+    "tasks": [
+      {
+        "id": "replan/many_symptoms_one_cause",
+        "category": "debug",
+        "tier": "deep",
+        "verdict": "passed",
+        "tool_calls": 22,
+        "steps": 3,
+        "replans": 1,
+        "agent_seconds": 45.7
+      },
+      {
+        "id": "replan/stale_todo_list",
+        "category": "debug",
+        "tier": "deep",
+        "verdict": "passed",
+        "tool_calls": 16,
+        "steps": 4,
+        "replans": 0,
+        "agent_seconds": 31.5
+      },
+      {
+        "id": "replan/misdirected_request",
+        "category": "debug",
+        "tier": "deep",
+        "verdict": "passed",
+        "tool_calls": 9,
+        "steps": 4,
+        "replans": 0,
+        "agent_seconds": 21.4
+      }
+    ],
+    "recorded_at": "2026-10-05T04:59:42+00:00",
+    "model": "deepseek-chat",
+    "git_commit": "a88c822",
+    "git_dirty": true,
+    "sandbox_capabilities": {
+      "python3": true,
+      "pytest": true,
+      "make": false,
+      "node": false,
+      "cargo": false,
+      "go": false
+    },
+    "max_replans": 2
+  },
+  "replan_off": {
+    "passed": 3,
+    "total": 3,
+    "pass_rate": 1.0,
+    "by_category": {
+      "debug": {
+        "passed": 3,
+        "total": 3
+      }
+    },
+    "by_tier": {
+      "deep": {
+        "passed": 3,
+        "total": 3
+      }
+    },
+    "tasks": [
+      {
+        "id": "replan/many_symptoms_one_cause",
+        "category": "debug",
+        "tier": "deep",
+        "verdict": "passed",
+        "tool_calls": 12,
+        "steps": 5,
+        "replans": 0,
+        "agent_seconds": 34.1
+      },
+      {
+        "id": "replan/stale_todo_list",
+        "category": "debug",
+        "tier": "deep",
+        "verdict": "passed",
+        "tool_calls": 15,
+        "steps": 4,
+        "replans": 0,
+        "agent_seconds": 27.7
+      },
+      {
+        "id": "replan/misdirected_request",
+        "category": "debug",
+        "tier": "deep",
+        "verdict": "passed",
+        "tool_calls": 8,
+        "steps": 4,
+        "replans": 0,
+        "agent_seconds": 18.9
+      }
+    ],
+    "recorded_at": "2026-10-05T05:01:12+00:00",
+    "model": "deepseek-chat",
+    "git_commit": "a88c822",
+    "git_dirty": true,
+    "sandbox_capabilities": {
+      "python3": true,
+      "pytest": true,
+      "make": false,
+      "node": false,
+      "cargo": false,
+      "go": false
+    },
+    "max_replans": 0
+  }
+}

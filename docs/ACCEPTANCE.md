@@ -49,6 +49,18 @@
 | 失败驱动的命令修复循环 | `verify` → `repair` → `act`，硬性上限 3 次 | `test_repair.py`（图级收敛与上限） | 场景 3 |
 | 可回滚的修改流程 | `snapshots.py`；**回滚本身也可回滚** | `test_restore_is_itself_undoable` | 场景 4 |
 
+**两道质量关**（`verify` 管行为对不对，`review` 管代码干不干净）：
+
+| 关 | 代码 | 检查什么 |
+|---|---|---|
+| `verify` | `tools/testrun.py`、`nodes/verify.py` | 跑项目自己的测试/构建，把失败结构化 |
+| `review` | `tools/review.py`、`nodes/review.py` | 语法坏没坏、测试有没有被改弱、调试残留（`breakpoint()`/`pdb`）、有没有写进 `.agent/`；探测到 ruff/mypy 时一并跑 |
+
+review 的「改动前」**直接复用快照**（不变量 8：所有写操作先留底），不另建基线；
+只审水位线之后**新增**的行，水位线跨步骤保留 —— 否则每一步都会重审前面所有步骤
+的改动。阻断项（结构性缺陷）与验证失败**共用**同一份修复预算，走同一条
+`repair` 出口；告警只记录，不阻断。
+
 ## 3. 自检清单
 
 代码冻结前跑一遍，全部应当通过。
@@ -57,8 +69,10 @@
 # 1. 静态检查
 ruff check .
 
-# 2. 全量测试（含真实 WSL 沙箱；LLM 用例需 API Key）
-pytest                       # 期望 805 passed（不含 LLM 标记的用例）
+# 2. 全量测试（含真实 WSL 沙箱）
+pytest -m "not llm"          # 期望 1070 passed
+# 另有 3 条 llm 标记用例需要 DEEPSEEK_API_KEY；不要用裸 pytest 代替 ——
+# 不加 -m 时它们会真的调用模型（本机配了 key 就产生费用）。
 
 # 3. 环境自检
 agent doctor                 # 期望「全部通过」
@@ -72,15 +86,26 @@ python scripts/demo.py --list
 python scripts/demo.py --only 1
 ```
 
-当前状态（2026-10-04，缺陷收口后）：
+当前状态（2026-10-06，P0 缺陷收口后）：
 
 | 项 | 结果 |
 |---|---|
-| 测试 | **805 passed**（不含 LLM 用例），WSL 集成 176，无失败 |
-| 覆盖率 | **90%**（`pytest -m "not llm" --cov`，含真实 WSL） |
+| 测试 | **1070 passed**（`pytest -m "not llm"`，含真实 WSL），其中 `wsl` 标记 **183**，无失败；另 3 条 `llm` 用例需 API Key |
+| 覆盖率 | **90.9%**（`pytest -m "not llm" --cov`，含真实 WSL）；**CI 子集 81.4%**，门槛 `fail_under=76` |
 | lint | 干净（`ruff check src tests`） |
-| 快反馈 | `pytest -m "not wsl and not llm"` = **629 passed**，约 40 秒 |
-| CI | `.github/workflows/ci.yml`：`pip install -e ".[dev]"` → ruff → `pytest -m "not wsl and not llm"` |
+| 快反馈 | `pytest -m "not wsl and not llm"` = **887 passed**（deselect 186 = 183 个 `wsl` + 3 个 `llm`，两组无交集）；需装齐 `.[dev,ui,web]`，缺 `textual` 时 TUI 整目录 skip（TUI 45 条）。含覆盖率约 80 秒 |
+| 能力评测 | 29 任务（20 basic + 9 deep）**18/29 = 62%**，沙箱有 pytest、自动验证与修复循环已生效。报告带机制指标（验证/修复/重规划次数、token）与噪声块；跑法见 [tests/eval/README](../tests/eval/README.md) |
+| CI | `.github/workflows/ci.yml`：`pip install -e ".[dev,ui,web]"` → ruff → `pytest -m "not wsl and not llm"` |
+
+> **口径提醒**：全量一律写 `pytest -m "not llm"`。裸 `pytest` 会把那 3 条 `llm` 用例一起跑、
+> 真的调用模型 —— 本机 `.env` 配了 key 就计费，而它们本意是"需要时手动跑"。
+>
+> **CI 与本地不是一回事**：CI 是 Linux runner、没有 WSL2，只跑快反馈那 887 个用例，
+> 覆盖率 81.4%。沙箱层与能力层的覆盖（`tools/files.py` 85%、`sandbox/snapshots.py` 88%）
+> 全靠 `-m wsl` 的 183 个用例，它们**只在本地执行**。CI 会以 `::warning::` 显式提示这个缺口 ——
+> 详见 [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md) 的 Q1。
+>
+> 上面每个数字都是量出来的，命令见本节第 2–4 条；改动后请重跑核对，别手抄。
 
 ## 4. 已知限制
 
@@ -125,7 +150,7 @@ python scripts/demo.py --only 1
 ### 未验证
 
 **TUI 在真实交互终端下的视觉效果。**
-自动化测试用 Textual 无头驱动（44 个用例），覆盖了事件映射、计划面板、
+自动化测试用 Textual 无头驱动（45 个用例），覆盖了事件映射、计划面板、
 审批弹窗、斜杠命令，但**配色、边框、滚动行为需要人工看一眼**。
 
 **沙箱隔离：默认到 WSL 发行版级，可选用 bwrap 做内核级隔离。**
@@ -140,6 +165,6 @@ python scripts/demo.py --only 1
 
 代码冻结后不再改动功能，只接受缺陷修复。任何改动都应：
 
-1. 跑 `pytest`（687 个用例全过）
+1. 跑 `pytest -m "not llm"`（1070 个用例全过；见第 3 节口径提醒）
 2. 跑 `ruff check .`
 3. 如果是安全相关的改动，对照本文件第 2 节确认对应测试仍在

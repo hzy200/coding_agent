@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
@@ -20,6 +22,28 @@ class _EchoLLM:
     def invoke(self, messages, config=None):  # noqa: ANN001
         self.seen = messages
         return AIMessage(content=self.reply)
+
+    async def ainvoke(self, messages, config=None):  # noqa: ANN001
+        return self.invoke(messages, config)
+
+
+class _AsyncOnlyLLM:
+    """只实现 `ainvoke`：一旦节点退回同步调用，这里立刻炸。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def invoke(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("不该走同步 invoke —— 那样 Ctrl-C 取消不了")
+
+    async def ainvoke(self, messages, config=None):  # noqa: ANN001
+        self.calls += 1
+        return AIMessage(content="ok")
+
+
+def _act(node, state, config=None):  # noqa: ANN001
+    """act 是 async 节点（走 ainvoke 才能取消），单测里驱动一次。"""
+    return asyncio.run(node(state, config))
 
 
 # ---------------- advance ----------------
@@ -43,8 +67,12 @@ def test_advance_increments_step_and_resets_per_step_state() -> None:
         "budget_exhausted": False,
         "dirty": False,
         "verification": {},
+        "review": {},
         "retry": 0,
     }
+    # review_watermark **不在这里清**：它必须跨步骤保留，否则每一步都会重审
+    # 前面所有步骤的改动（留底记的是写前内容，老文件永远与自己的留底不同）
+    assert "review_watermark" not in out
 
 
 # ---------------- act ----------------
@@ -52,14 +80,14 @@ def test_advance_increments_step_and_resets_per_step_state() -> None:
 def test_act_injects_plan_and_marks_current_step() -> None:
     llm = _EchoLLM()
     node = make_act_node(llm, max_tool_rounds=5)
-    node(
+    _act(
+        node,
         {
             "messages": [HumanMessage(content="do it")],
             "plan": ["first", "second"],
             "step_idx": 1,
             "tool_rounds": 0,
         },
-        None,
     )
 
     assert isinstance(llm.seen[0], SystemMessage)
@@ -73,13 +101,13 @@ def test_act_injects_plan_and_marks_current_step() -> None:
 def test_act_injects_long_term_memories() -> None:
     llm = _EchoLLM()
     node = make_act_node(llm, max_tool_rounds=5)
-    node(
+    _act(
+        node,
         {
             "messages": [HumanMessage(content="do it")],
             "memories": ["这个仓库用 pytest", "别动 legacy/"],
             "tool_rounds": 0,
         },
-        None,
     )
     system = llm.seen[0].content
     assert "这个仓库用 pytest" in system
@@ -89,8 +117,9 @@ def test_act_injects_long_term_memories() -> None:
 
 def test_act_without_memories_has_no_memory_section() -> None:
     llm = _EchoLLM()
-    make_act_node(llm, max_tool_rounds=5)(
-        {"messages": [HumanMessage(content="x")], "tool_rounds": 0}, None
+    _act(
+        make_act_node(llm, max_tool_rounds=5),
+        {"messages": [HumanMessage(content="x")], "tool_rounds": 0},
     )
     assert "长期记忆" not in llm.seen[0].content
 
@@ -99,7 +128,8 @@ def test_act_injects_verification_feedback_on_retry() -> None:
     """修复轮次里，结构化错误必须进系统提示 —— 否则模型在盲改。"""
     llm = _EchoLLM()
     node = make_act_node(llm, max_tool_rounds=5, max_repair_rounds=3)
-    node(
+    _act(
+        node,
         {
             "messages": [HumanMessage(content="修好它")],
             "tool_rounds": 0,
@@ -111,7 +141,6 @@ def test_act_injects_verification_feedback_on_retry() -> None:
                 "issues": [{"location": "calc.py:2", "message": "assertEqual"}],
             },
         },
-        None,
     )
     system = llm.seen[0].content
     assert "calc.py:2" in system
@@ -120,29 +149,43 @@ def test_act_injects_verification_feedback_on_retry() -> None:
 
 def test_act_has_no_feedback_on_the_first_attempt() -> None:
     llm = _EchoLLM()
-    make_act_node(llm, max_tool_rounds=5, max_repair_rounds=3)(
-        {"messages": [HumanMessage(content="开始")], "tool_rounds": 0, "retry": 0}, None
+    _act(
+        make_act_node(llm, max_tool_rounds=5, max_repair_rounds=3),
+        {"messages": [HumanMessage(content="开始")], "tool_rounds": 0, "retry": 0},
     )
     assert "次修复" not in llm.seen[0].content
 
 
 def test_act_ignores_stale_passing_verification() -> None:
     llm = _EchoLLM()
-    make_act_node(llm, max_tool_rounds=5, max_repair_rounds=3)(
+    _act(
+        make_act_node(llm, max_tool_rounds=5, max_repair_rounds=3),
         {
             "messages": [HumanMessage(content="继续")],
             "tool_rounds": 0,
             "retry": 1,
             "verification": {"status": "ok"},
         },
-        None,
     )
     assert "次修复" not in llm.seen[0].content
 
 
+def test_act_goes_through_the_async_llm_api() -> None:
+    """act 必须走 `ainvoke`：同步 invoke 会被丢进线程池，取消信号传不进去
+    （Ctrl-C 在模型生成期间完全失效）。这个桩**只**实现 ainvoke。"""
+    llm = _AsyncOnlyLLM()
+    out = _act(
+        make_act_node(llm, max_tool_rounds=3),
+        {"messages": [HumanMessage(content="x")], "tool_rounds": 0},
+    )
+
+    assert llm.calls == 1
+    assert out["tool_rounds"] == 1
+
+
 def test_act_counts_rounds() -> None:
     node = make_act_node(_EchoLLM(), max_tool_rounds=5)
-    out = node({"messages": [HumanMessage(content="x")], "tool_rounds": 2}, None)
+    out = _act(node, {"messages": [HumanMessage(content="x")], "tool_rounds": 2})
     assert out["tool_rounds"] == 3
 
 
@@ -150,7 +193,7 @@ def test_act_stops_without_tool_calls_when_budget_exhausted() -> None:
     """这是路由能无条件信任 tool_calls 的前提：超预算的 act 不产出 tool_calls。"""
     llm = _EchoLLM()
     node = make_act_node(llm, max_tool_rounds=3)
-    out = node({"messages": [HumanMessage(content="x")], "tool_rounds": 3}, None)
+    out = _act(node, {"messages": [HumanMessage(content="x")], "tool_rounds": 3})
 
     assert llm.seen == []  # 根本没调用模型
     message = out["messages"][0]
@@ -164,14 +207,18 @@ def test_act_stops_without_tool_calls_when_budget_exhausted() -> None:
 class _FakeTool:
     """返回真实工具同款的封装格式，这样 artifact 链路也被覆盖到。"""
 
-    def __init__(self, name: str, result: str = "done") -> None:
+    def __init__(self, name: str, result: str = "done", *, ok: bool = True) -> None:
         self.name = name
         self.result = result
+        self.ok = ok
         self.seen: dict = {}
 
     def invoke(self, args, config=None):  # noqa: ANN001
         self.seen = args
-        return pack(self.result, ShellArtifact(command=str(args.get("command", "")), ok=True))
+        return pack(
+            self.result,
+            ShellArtifact(command=str(args.get("command", "")), ok=self.ok),
+        )
 
 
 class _BoomTool:
@@ -296,6 +343,26 @@ def test_denied_call_artifact_marks_decision() -> None:
     assert artifact["decision"] == "denied"
 
 
+def test_denied_non_file_tool_is_not_labeled_as_a_file_tool() -> None:
+    """git_commit / deps_install / run_tests 既没有命令也没有路径，
+    被拒时不该产出 FileArtifact —— 那会让事件层标成「文件工具」。"""
+    node = make_tools_node([_FakeTool("git_commit")])
+    message = _tool_call("git_commit", {"message": "x"}, call_id="c1")
+    out = node({"messages": [message], "approvals": {"c1": "denied"}}, None)
+
+    artifact = out["messages"][0].artifact
+    assert artifact["kind"] == "call"
+    assert artifact["rejected"] is True
+    assert artifact["level_label"] == "L2 变更性"
+
+
+def test_denied_file_tool_still_gets_a_file_artifact() -> None:
+    node = make_tools_node([_FakeTool("file_edit")])
+    message = _tool_call("file_edit", {"path": "a.py"}, call_id="c1")
+    out = node({"messages": [message], "approvals": {"c1": "denied"}}, None)
+    assert out["messages"][0].artifact["kind"] == "file"
+
+
 # ---------------- dirty：变更必须触发验证 ----------------
 
 def test_named_mutation_tool_marks_dirty() -> None:
@@ -318,6 +385,32 @@ def test_shell_git_add_marks_dirty() -> None:
     message = _tool_call("shell_exec", {"command": "git add src/", "reason": "r"})
     out = node(_approved_state(message), None)
     assert out["dirty"] is True
+
+
+def test_failed_shell_mutation_still_marks_dirty() -> None:
+    """改了东西但非零退出，仍然要验证。
+
+    典型的：sed -i 改完了后面的命令才失败、gcc 出了产物才编译报错。
+    「工作区被改动了」与「这次调用成功了」是两件事，后者不该否决前者 ——
+    否则这类失败恰好跳过验证，是最需要验证的时刻。
+    """
+    tool = _FakeTool("shell_exec", ok=False)
+    node = make_tools_node([tool])
+    message = _tool_call("shell_exec", {"command": "sed -i 's/a/b/' f.py && false", "reason": "r"})
+    out = node(_approved_state(message), None)
+
+    assert out["dirty"] is True
+    # 提示同样要给出：改动确实发生了，而且没有留底
+    assert "没有快照留底" in out["messages"][0].content
+
+
+def test_failed_file_edit_does_not_mark_dirty() -> None:
+    """文件工具的 ok=False 就是没写成（路径越界、替换没命中），不该触发验证。"""
+    tool = _FakeTool("file_edit", ok=False)
+    node = make_tools_node([tool])
+    out = node(_approved_state(_tool_call("file_edit", {"path": "a.py"})), None)
+
+    assert out["dirty"] is False
 
 
 def test_shell_read_does_not_mark_dirty() -> None:

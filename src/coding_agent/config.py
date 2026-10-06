@@ -110,6 +110,12 @@ class Settings(BaseSettings):
     # 留空表示按项目清单自动识别（pytest / cargo / go / npm / make）
     verify_command: str = Field(default="", alias="AGENT_VERIFY_COMMAND")
 
+    # ---------- 代码审查 ----------
+    # 一步做完、验证通过后，对本次改动跑一遍确定性静态检查（`tools/review.py`）。
+    # 与自动 verify 同一口径：不过审批，所以只跑宿主写死的检查，不读工作区里的
+    # 任何"配置"。关掉它等于去掉「测试通过 ≠ 代码正确」那第二道关。
+    review_enabled: bool = Field(default=True, alias="AGENT_REVIEW_ENABLED")
+
     # ---------- 持久化与审计 ----------
     # 留空表示自动用 <当前目录>/.agent/checkpoints.sqlite；填 :memory: 强制不落盘
     checkpoint_path: str = Field(default="", alias="AGENT_CHECKPOINT_PATH")
@@ -121,6 +127,9 @@ class Settings(BaseSettings):
 
     # ---------- Agent 循环 ----------
     max_repair_rounds: int = Field(default=3, alias="AGENT_MAX_REPAIR_ROUNDS")
+    # 执行中「重建剩余计划」的次数上限。计划可以修正，但不能无限改 ——
+    # 边做边改没有收敛点，而每次重规划都要多一次模型调用
+    max_replans: int = Field(default=2, alias="AGENT_MAX_REPLANS")
     max_tool_rounds: int = Field(default=12, alias="AGENT_MAX_TOOL_ROUNDS")
     max_plan_steps: int = Field(default=5, alias="AGENT_MAX_PLAN_STEPS")
     # 同一会话内「挂起→恢复」的总次数上限，防前端反复 resume 绕开 recursion_limit

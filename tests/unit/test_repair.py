@@ -8,15 +8,25 @@ from __future__ import annotations
 
 import asyncio
 
-from langchain_core.messages import AIMessage, HumanMessage
+import pytest
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 
+from coding_agent.graph.build import estimate_recursion_limit
+from coding_agent.graph.nodes import advance
 from coding_agent.graph.nodes.repair import repair
 from coding_agent.graph.routing import (
+    ADVANCE,
+    APPROVE,
     REPAIR,
+    REPLAN,
     RESPOND,
+    REVIEW,
+    TOOLS,
     VERIFY,
+    make_route_after_review,
     make_route_after_verify,
     route_after_act,
 )
@@ -116,11 +126,28 @@ class _RecordingAct:
         return {"messages": [AIMessage(content=f"attempt {len(self.seen)}")]}
 
 
+def _review_pass(state: AgentState, config) -> dict:
+    """审查通过的空实现。
+
+    迷你图要跟真实拓扑一致（`VERIFY → REVIEW → ADVANCE`）：少接这一跳，
+    `route_after_verify` 返回的 REVIEW 就不在条件边的映射里，图会直接报错 ——
+    而这正是本题要覆盖的"两道质量关串联"的结构。
+    """
+    return {"review": {}}
+
+
 def _loop_graph(verifier, act, limit: int):
     graph = StateGraph(AgentState)
     graph.add_node("act", act)
     graph.add_node(VERIFY, verifier)
+    graph.add_node(REVIEW, _review_pass)
     graph.add_node(REPAIR, repair)
+    # 修不动了就进 replan。真节点会问模型「换个做法行不行」，这里只关心
+    # 修复循环的收敛与上限，所以用最简单的等价行为（放弃）代替。
+    graph.add_node(
+        REPLAN,
+        lambda state: {"plan": (state.get("plan") or [])[: state.get("step_idx", 0)]},
+    )
     graph.add_node("respond", lambda state: {"messages": [AIMessage(content="done")]})
 
     graph.add_edge(START, "act")
@@ -128,9 +155,15 @@ def _loop_graph(verifier, act, limit: int):
     graph.add_conditional_edges(
         VERIFY,
         make_route_after_verify(limit),
-        {REPAIR: REPAIR, RESPOND: "respond"},
+        {REPAIR: REPAIR, REPLAN: REPLAN, REVIEW: REVIEW, RESPOND: "respond"},
+    )
+    graph.add_conditional_edges(
+        REVIEW,
+        make_route_after_review(limit),
+        {REPAIR: REPAIR, REPLAN: REPLAN, RESPOND: "respond"},
     )
     graph.add_edge(REPAIR, "act")
+    graph.add_edge(REPLAN, "respond")
     graph.add_edge("respond", END)
     return graph.compile(checkpointer=MemorySaver())
 
@@ -239,5 +272,149 @@ def test_each_retry_gets_a_fresh_tool_budget() -> None:
         assert result["verification"]["status"] == "ok"
         assert result["tool_rounds"] == 0  # repair 每轮都清零
         assert result["budget_exhausted"] is False
+
+    _run(scenario())
+
+
+# ---------------- 图级：最坏路径不能撞 recursion_limit ----------------
+#
+# 守的是一个真实缺陷：repair 会把 tool_rounds 清零，于是**每一轮修复都重新吃满
+# 一个完整周期**，而 estimate_recursion_limit 早期只按单周期推导。结果是「反复失败
+# 且每轮都把工具预算用光」的任务会以 GraphRecursionError 收场，拿不到 respond
+# 「我试过了但没修好」的收尾 —— 恰好打掉修复循环的结论价值。
+
+
+class _BudgetBurningAct:
+    """每轮都产出一个工具调用，直到本步的轮次预算耗尽 —— 最坏路径的形态。"""
+
+    def __init__(self, max_rounds: int) -> None:
+        self.max_rounds = max_rounds
+        self.calls = 0
+
+    def __call__(self, state: AgentState, config) -> dict:
+        self.calls += 1
+        rounds = state.get("tool_rounds", 0)
+        if rounds >= self.max_rounds:
+            return {
+                "messages": [AIMessage(content="预算用尽")],
+                "budget_exhausted": True,
+            }
+        return {
+            "messages": [
+                AIMessage(
+                    content="继续",
+                    tool_calls=[{"name": "noop", "args": {}, "id": f"c{self.calls}"}],
+                )
+            ],
+            "tool_rounds": rounds + 1,
+        }
+
+
+def _burning_graph(act, verifier, repair_limit: int):
+    """与 build.py 同形的拓扑，只把模型输出换成「每轮都调工具」。"""
+
+    def _gate(state: AgentState) -> dict:
+        return {"approvals": {}}
+
+    def _tools(state: AgentState) -> dict:
+        last = state["messages"][-1]
+        return {
+            "messages": [
+                ToolMessage(content="ok", tool_call_id=c["id"], name=c["name"])
+                for c in last.tool_calls
+            ]
+        }
+
+    def _respond(state: AgentState) -> dict:
+        return {"messages": [AIMessage(content="done")]}
+
+    def _replan(state: AgentState) -> dict:
+        """简化版 replan：修不动了就砍掉剩余步骤，直接收尾。
+
+        真节点会先问模型「换个做法行不行」；这里只关心修复循环的收敛与上限，
+        所以用最简单的等价行为（放弃）代替。
+        """
+        return {"plan": (state.get("plan") or [])[: state.get("step_idx", 0)]}
+
+    graph = StateGraph(AgentState)
+    graph.add_node("act", act)
+    graph.add_node(APPROVE, _gate)
+    graph.add_node(TOOLS, _tools)
+    graph.add_node(VERIFY, verifier)
+    graph.add_node(REVIEW, _review_pass)
+    graph.add_node(REPAIR, repair)
+    graph.add_node(REPLAN, _replan)
+    graph.add_node(ADVANCE, advance)
+    graph.add_node(RESPOND, _respond)
+
+    graph.add_edge(START, "act")
+    graph.add_conditional_edges("act", route_after_act, {APPROVE: APPROVE, VERIFY: VERIFY})
+    graph.add_edge(APPROVE, TOOLS)
+    graph.add_edge(TOOLS, "act")
+    graph.add_conditional_edges(
+        VERIFY,
+        make_route_after_verify(repair_limit),
+        {REPAIR: REPAIR, REPLAN: REPLAN, REVIEW: REVIEW, RESPOND: RESPOND},
+    )
+    graph.add_conditional_edges(
+        REVIEW,
+        make_route_after_review(repair_limit),
+        {REPAIR: REPAIR, REPLAN: REPLAN, ADVANCE: ADVANCE, RESPOND: RESPOND},
+    )
+    graph.add_edge(REPAIR, "act")
+    graph.add_edge(REPLAN, RESPOND)
+    graph.add_edge(ADVANCE, "act")
+    graph.add_edge(RESPOND, END)
+    return graph.compile(checkpointer=MemorySaver())
+
+
+def _one_step() -> dict:
+    return {
+        "messages": [HumanMessage(content="修好它")],
+        "plan": ["完成这一步"],
+        "step_idx": 0,
+        "tool_rounds": 0,
+        "budget_exhausted": False,
+        "dirty": True,
+        "retry": 0,
+        "verification": {},
+        "approvals": {},
+    }
+
+
+def test_maxed_out_repair_loop_fits_the_estimated_limit() -> None:
+    """每轮修复都烧光工具预算，仍要走到 respond 而不是抛 GraphRecursionError。"""
+
+    async def scenario() -> None:
+        rounds, repairs = 3, 2
+        act = _BudgetBurningAct(rounds)
+        verifier = _FlakyVerifier(fail_times=99)
+        app = _burning_graph(act, verifier, repair_limit=repairs)
+        limit = estimate_recursion_limit(1, rounds, repairs, 0)
+
+        result = await app.ainvoke(_one_step(), {**CONFIG, "recursion_limit": limit})
+
+        assert result["retry"] == repairs
+        assert result["verification"]["status"] == "failed"
+        # (修复次数+1) 个周期，每个周期 act 跑满 (轮次+1) 次
+        assert act.calls == (repairs + 1) * (rounds + 1)
+        assert verifier.calls == repairs + 1
+
+    _run(scenario())
+
+
+def test_repair_blind_limit_would_be_too_small() -> None:
+    """漏算修复循环的旧公式确实不够用 —— 这就是当初的缺陷，留着防回退。"""
+
+    async def scenario() -> None:
+        rounds, repairs = 3, 2
+        per_cycle = (rounds + 1) + 2 * rounds + 1
+        repair_blind = per_cycle + 1 + 10  # 单周期 + advance + planner/respond 余量
+
+        act = _BudgetBurningAct(rounds)
+        app = _burning_graph(act, _FlakyVerifier(fail_times=99), repair_limit=repairs)
+
+        with pytest.raises(GraphRecursionError):
+            await app.ainvoke(_one_step(), {**CONFIG, "recursion_limit": repair_blind})
 
     _run(scenario())

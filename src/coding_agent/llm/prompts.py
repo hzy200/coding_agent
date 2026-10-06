@@ -44,9 +44,15 @@ PLANNER_PROMPT = """\
 要求：
 - 每个子任务对应一个可以用一次或少数几次工具调用完成、且结果可验证的动作。
 - 简单请求就是 1 步，不要为了凑数而强行拆分。
+- 请求里若明确列出了**多个可以分别验收的交付物**（例如"这三个测试都要修好"、
+  "给 A 和 B 各加一个参数"），**每个交付物应当各自成一步**：它们能分别完成、
+  分别验证，合并成一步就没法在中途发现问题、也没法调整计划。
 - 最多 {max_steps} 步。
 - 子任务描述用中文，写清"做什么"以及"怎样算做完"。
 - 不要在子任务里预设你还不知道的结论（比如具体文件名），先探索再决定。
+
+输出格式：只输出一个 json 对象，键为 steps、值是字符串数组，不要有任何其它文字。
+例如：{{"steps": ["读一下 calc.py 与它的测试", "修正平均值的计算", "再跑一遍测试确认"]}}
 {permission_note}"""
 
 PLANNER_PERMISSION_READONLY = """\
@@ -55,6 +61,47 @@ PLANNER_PERMISSION_READONLY = """\
   而不是真的去改。"""
 
 PLANNER_PERMISSION_WRITE = "- 当前会话允许修改文件、安装依赖等变更动作。"
+
+REPLAN_PROMPT = """\
+你正在执行一个多步任务，刚刚做完其中一步。请判断**剩下的步骤**是否还需要调整。
+
+需要调整只有两种正当理由：
+- 后面的步骤已经没必要了（刚才的工作顺带把它做完了）。
+- 后面的步骤不够用或走不通（刚才的发现表明还缺一步，或原计划的做法行不通）。
+
+**不要为了"看起来更细致"而改。** 计划仍然有效、只是还没轮到它的情形很常见 ——
+这时不要改。
+
+要求：
+- 只给**剩下的**步骤，不含已完成的。
+- 每项一句话，写清"做什么"以及"怎样算做完"，用中文。
+- 最多 {max_steps} 步。如果剩下的工作其实已经做完，就给空列表。
+
+输出格式：只输出一个 json 对象，不要有任何其它文字。
+需要调整：{{"revise": true, "steps": ["调整后的第一步", "第二步"]}}
+不需要调整：{{"revise": false, "steps": []}}
+"""
+
+REPLAN_AFTER_FAILURE_PROMPT = """\
+你正在执行一个多步任务。其中一步**反复修复都没能做成**，现在要判断：
+换一种做法还能不能做成？
+
+- 如果还能：给出调整后的步骤（**包含这一步的新做法**，以及后面该怎么走）。
+- 如果确实做不成：给空列表。任务会就此如实收尾，明确说明这一步没完成 ——
+  这比继续硬试更有价值。
+
+判断时请基于失败信息与已经试过的做法。**不要给出和失败做法实质相同的步骤**，
+那只是把同一个坑再踩一遍。
+
+要求：
+- 只给**还需要做的**步骤，不含已完成的。
+- 每项一句话，写清"做什么"以及"怎样算做完"，用中文。
+- 最多 {max_steps} 步。
+
+输出格式：只输出一个 json 对象，不要有任何其它文字。
+还能做成：{{"revise": true, "steps": ["这一步的新做法", "后面怎么走"]}}
+做不成：{{"revise": false, "steps": []}}
+"""
 
 RESPOND_PROMPT = """\
 根据以上的执行过程，给用户一个最终答复。
@@ -102,6 +149,30 @@ def format_verification_feedback(verification: dict, *, attempt: int, limit: int
     lines.append(
         "请针对上面的失败位置做最小修正，改完就停下 —— 系统会自动再跑一次验证。"
     )
+    if attempt >= limit:
+        lines.append("这已经是最后一次修复机会，如果再失败就需要如实说明问题所在。")
+    return "\n".join(lines)
+
+
+def format_review_feedback(review: dict, *, attempt: int, limit: int) -> str:
+    """把代码审查的**阻断**问题整理成可执行的修复提示。
+
+    只给 blocking 的：warning 是记录用的，塞进提示会把注意力摊薄。
+    """
+    blocking = [
+        finding
+        for finding in (review.get("findings") or [])
+        if finding.get("severity") == "blocking"
+    ]
+    lines = [
+        f"上一步的改动没有通过代码审查，第 {attempt}/{limit} 次尝试修复。",
+        "必须处理的问题（这些是结构性缺陷，不是风格建议）：",
+    ]
+    for finding in blocking[:10]:
+        location = finding.get("location", "")
+        message = finding.get("message", "")
+        lines.append(f"- {location} {message}".rstrip())
+    lines.append("改完就停下 —— 系统会自动再跑一次验证与审查。")
     if attempt >= limit:
         lines.append("这已经是最后一次修复机会，如果再失败就需要如实说明问题所在。")
     return "\n".join(lines)

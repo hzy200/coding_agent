@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import posixpath
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,9 +30,12 @@ from coding_agent.events import (
     Event,
     FileChanged,
     PlanCreated,
+    PlanRevised,
     RepairStarted,
+    ReviewFinished,
     RunFailed,
     RunFinished,
+    RunStarted,
     StepFinished,
     StepStarted,
     ToolCallFinished,
@@ -54,7 +57,12 @@ from coding_agent.sandbox.snapshots import (
     SnapshotStore,
 )
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
-from coding_agent.tools.artifacts import FileArtifact, ShellArtifact, parse_artifact
+from coding_agent.tools.artifacts import (
+    CallArtifact,
+    FileArtifact,
+    ShellArtifact,
+    parse_artifact,
+)
 from coding_agent.tools.shell import SHELL_TOOL_NAME
 
 # 只有这几个 action 才真正改动了文件，read 与空回滚不发 FileChanged
@@ -66,6 +74,27 @@ STREAMING_NODES = frozenset({"act", "respond"})
 _PREVIEW_CHARS = 240
 _FAILURE_MARKERS = ("工具执行异常：", "错误：")
 _SUMMARY_KEYS = ("command", "path", "pattern", "query")
+# planner 没解析出步骤、退化成单步时记进审计的 detail，供事后复盘
+_PLAN_DEGRADED_DETAIL = "规划未解析，已退化为单步执行"
+# 验证是否「放行」的唯一口径。与路由判定同源（graph/routing.route_after_verify
+# 只在 failed 时拦下任务）：skipped / not_configured 表示**没验证**，不是**验证
+# 失败**。曾经事件层按前者记、审计层按后者记，于是同一次 skipped 在两边结论相反，
+# 事后对账对不上 —— 审计本该是可信来源，所以两处都必须走这个函数。
+_VERIFICATION_BLOCKING_STATUS = "failed"
+
+
+def _verification_passed(raw: dict[str, Any]) -> bool:
+    return str(raw.get("status", "skipped")) != _VERIFICATION_BLOCKING_STATUS
+
+
+# 审查是否「拦下了这一步」的唯一口径。与路由同源：只有 blocked 才改控制流，
+# warned / clean / skipped 都只是记录。审查没能执行（status=warned 且带
+# review-unavailable）**不算阻断** —— 工具坏了不该把用户的任务卡死。
+_REVIEW_BLOCKING_STATUS = "blocked"
+
+
+def _review_blocked(raw: dict[str, Any]) -> bool:
+    return str(raw.get("status", "skipped")) == _REVIEW_BLOCKING_STATUS
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,6 +291,21 @@ class AgentRuntime:
             await self._store.aclose()
             self._graph = None
 
+    def _forget_thread(self, thread_id: str) -> None:
+        """运行收尾后清掉按 thread_id 累积的状态。
+
+        `_pending_calls` / `_progress` 只为「挂起与恢复是两次 `_stream`」而存在
+        （见 `__init__` 注释），一旦这轮以 RunFinished / RunFailed 收场就再无用处。
+        长会话（TUI 一个进程跑几十轮）里不清会一直累积，而且 `_pending_calls`
+        留着还会让下一轮误以为有旧的待配对调用。
+
+        `_resume_counts` **故意不清**：它封顶的是「同一 thread 反复挂起-恢复」，
+        跑完一轮就清零等于把护栏拆了（前端跑完再 resume 就能无限续）。它每
+        thread 只占一个 int，本来也不是内存问题的所在。
+        """
+        self._pending_calls.pop(thread_id, None)
+        self._progress.pop(thread_id, None)
+
     @property
     def effective_settings(self) -> Settings:
         """把解析后的工作区写回配置。
@@ -290,6 +334,8 @@ class AgentRuntime:
                 checkpointer=await self._checkpointer(),
                 allow_write=self.allow_write,
                 policy=self.policy,
+                # 与 runtime 共用一份沙箱：探测缓存挂在实例上，各建一份就各探一遍
+                sandbox=self._sandbox,
             )
         return self._graph
 
@@ -320,6 +366,7 @@ class AgentRuntime:
                 )
             except Exception:  # noqa: BLE001, S110 - 已在错误路径上，不再二次抛出
                 pass
+            self._forget_thread(thread_id)
             yield RunFailed(message=detail)
             return
 
@@ -363,6 +410,7 @@ class AgentRuntime:
                 )
             except Exception:  # noqa: BLE001, S110 - 已在错误路径上，不再二次抛出
                 pass
+            self._forget_thread(thread_id)
             yield RunFailed(message=detail)
             return
 
@@ -378,7 +426,10 @@ class AgentRuntime:
             "configurable": {"thread_id": thread_id},
             # 按图拓扑推导，别再把系数算歪（见 estimate_recursion_limit）
             "recursion_limit": estimate_recursion_limit(
-                settings.max_plan_steps, settings.max_tool_rounds
+                settings.max_plan_steps,
+                settings.max_tool_rounds,
+                settings.max_repair_rounds,
+                settings.max_replans,
             ),
             # 这些会随 trace 一起上报，LangSmith 里可按会话/工作区/权限筛选
             "run_name": f"agent:{thread_id}",
@@ -388,9 +439,6 @@ class AgentRuntime:
 
         answer = ""
         streamed: list[str] = []
-        # 模型回报的用量累计（provider 未提供则保持 0，审计里落成 None）
-        input_tokens = 0
-        output_tokens = 0
         # 跨 run/resume 的状态；每次全新 run 清空，resume 时保留（见 __init__ 说明）
         pending = self._pending_calls.setdefault(thread_id, {})
         progress = self._progress.setdefault(thread_id, {})
@@ -398,11 +446,43 @@ class AgentRuntime:
             pending.clear()
             progress.clear()
             self._resume_counts[thread_id] = 0
+        # 模型回报的用量累计。**存 progress 而不是 _stream 的局部变量**：挂起与
+        # 恢复是两次 `_stream`，存局部会让挂起之前那段用量整个丢掉 —— 而挂起
+        # 恰恰常见于 L2/L3 审批，那是最费 token 的路径。provider 未提供时保持 0，
+        # 收尾落成 None（0 与「未回报」必须能区分）。
+        input_tokens = int(progress.get("input_tokens", 0))
+        output_tokens = int(progress.get("output_tokens", 0))
         plan: list[str] = progress.setdefault("plan", [])
         step_idx: int = progress.get("step_idx", 0)
         interrupted = False
         # 最近一次验证结果：repair 事件要带上它说明「在修什么」
         last_verification: dict[str, Any] = progress.setdefault("last_verification", {})
+        # 最近一次代码审查结果。同理要跨挂起保留，且**由新的验证结果作废** ——
+        # 否则上一步审查的阻断会被当成这一步的修复原因，repair 事件给出错误摘要。
+        last_review: dict[str, Any] = progress.setdefault("last_review", {})
+        # 步骤事件的配对状态：StepStarted 发出后必须有一个 StepFinished 收口。
+        # 存在 progress（按 thread 留存）而不是局部变量 —— 挂起与恢复是两次
+        # _stream，存局部会丢掉「上一段还开着一步」这件事，收尾时就不补发了。
+        step_open: bool = progress.get("step_open", False)
+
+        def _open_step(index: int, total: int, text: str) -> Iterator[Event]:
+            """发 StepStarted。上一步若还开着，先补一个收口再开新的。"""
+            nonlocal step_open
+            if step_open:
+                step_open = False
+                yield StepFinished(index=step_idx, cancelled=True, text="")
+            step_open = True
+            progress["step_open"] = True
+            yield StepStarted(index=index, total=total, text=text)
+
+        def _close_step(*, cancelled: bool = False) -> Iterator[Event]:
+            """收口当前步骤。已经关了就是空操作，不会多发一个事件。"""
+            nonlocal step_open
+            if not step_open:
+                return
+            step_open = False
+            progress["step_open"] = False
+            yield StepFinished(index=step_idx, cancelled=cancelled, text="")
 
         try:
             if fresh_run:
@@ -415,6 +495,10 @@ class AgentRuntime:
                         detail=truncate(prompt),
                     )
                 )
+                # 事件流起点。所有前端都能据此复位本轮状态（TUI 就靠它重置
+                # 「最终答复」标记与流式缓冲）。只有全新 run 算新的一轮，
+                # resume 不重复发 —— 那是同一次运行的延续。
+                yield RunStarted(thread_id=thread_id)
 
             graph = await self._ensure_graph()
             async for mode, data in graph.astream(
@@ -448,35 +532,71 @@ class AgentRuntime:
                         progress["plan"] = plan
                         progress["step_idx"] = 0
                         if plan:
+                            # 降级必须同时进事件与审计：只在事件里说的话，
+                            # 事后复盘仍然查不到「这次规划其实是失败的」。
+                            degraded = bool(update.get("plan_degraded"))
                             self._audit(
                                 AuditRecord(
                                     ts=now_iso(),
                                     kind=audit_models.PLAN,
                                     thread_id=thread_id,
                                     steps=plan,
+                                    detail=_PLAN_DEGRADED_DETAIL if degraded else "",
                                 )
                             )
-                            yield PlanCreated(steps=plan)
-                        yield StepStarted(
-                            index=0,
-                            total=max(len(plan), 1),
-                            text=plan[0] if plan else "",
-                        )
+                            yield PlanCreated(steps=plan, degraded=degraded)
+                        for event in _open_step(
+                            0, max(len(plan), 1), plan[0] if plan else ""
+                        ):
+                            yield event
 
                     elif node == "advance":
+                        # 先收口再推进：补发的 StepFinished 必须带**旧**的 index，
+                        # 而 step_idx 下一行就要被改掉
+                        for event in _close_step():
+                            yield event
                         step_idx = int(update.get("step_idx", step_idx + 1))
                         progress["step_idx"] = step_idx
-                        yield StepStarted(
-                            index=step_idx,
-                            total=len(plan),
-                            text=plan[step_idx] if step_idx < len(plan) else "",
+                        for event in _open_step(
+                            step_idx, len(plan), plan[step_idx] if step_idx < len(plan) else ""
+                        ):
+                            yield event
+
+                    elif node == "replan":
+                        # 节点不修订时返回空更新，只有真改了才发事件
+                        if "plan" not in update:
+                            continue
+                        revised = [s for s in (update.get("plan") or []) if s]
+                        detail = (
+                            f"剩余 {max(len(plan) - step_idx, 0)} 步"
+                            f" → {max(len(revised) - step_idx, 0)} 步"
                         )
+                        plan = revised
+                        progress["plan"] = plan
+                        self._audit(
+                            AuditRecord(
+                                ts=now_iso(),
+                                kind=audit_models.REPLAN,
+                                thread_id=thread_id,
+                                steps=plan,
+                                detail=detail,
+                            )
+                        )
+                        yield PlanRevised(steps=plan, step_idx=step_idx)
+                        # 计划被砍到当前这步之前（含当前这步）时，路由会直接去收尾，
+                        # act 再也不跑 —— 这一步必须在这里收口，否则前端的进度条
+                        # 永远停在「进行中」
+                        if step_idx >= len(plan):
+                            for event in _close_step(cancelled=True):
+                                yield event
 
                     elif node == "act":
                         last = _last_message(update)
                         input_tokens, output_tokens = _add_usage(
                             last, input_tokens, output_tokens
                         )
+                        progress["input_tokens"] = input_tokens
+                        progress["output_tokens"] = output_tokens
                         calls = getattr(last, "tool_calls", None) or []
                         for call in calls:
                             started = self._tool_started(
@@ -487,6 +607,8 @@ class AgentRuntime:
                             pending[started.call_id] = started
                             yield started
                         if not calls:
+                            step_open = False
+                            progress["step_open"] = False
                             yield StepFinished(
                                 index=step_idx,
                                 budget_exhausted=bool(update.get("budget_exhausted")),
@@ -507,6 +629,10 @@ class AgentRuntime:
 
                     elif node == "verify":
                         raw = update.get("verification") or {}
+                        # 新的验证结果让上一次的审查结论作废：审查总是紧跟在验证
+                        # 之后，所以"当前卡在哪一关"只需要看最新的一对。
+                        last_review = {}
+                        progress["last_review"] = {}
                         if raw:
                             last_verification = raw
                             progress["last_verification"] = raw
@@ -516,7 +642,7 @@ class AgentRuntime:
                                     ts=now_iso(),
                                     kind=audit_models.VERIFY,
                                     thread_id=thread_id,
-                                    ok=raw.get("status") == "ok",
+                                    ok=_verification_passed(raw),
                                     detail=truncate(
                                         f"{raw.get('command', '')} → {raw.get('summary', '')}"
                                     ),
@@ -524,10 +650,37 @@ class AgentRuntime:
                             )
                             yield event
 
+                    elif node == "review":
+                        raw = update.get("review") or {}
+                        if raw:
+                            last_review = raw
+                            progress["last_review"] = raw
+                            blocked = _review_blocked(raw)
+                            self._audit(
+                                AuditRecord(
+                                    ts=now_iso(),
+                                    kind=audit_models.REVIEW,
+                                    thread_id=thread_id,
+                                    ok=not blocked,
+                                    detail=truncate(
+                                        f"{raw.get('checked_files', 0)} 个改动文件 → "
+                                        f"{raw.get('summary', '')}"
+                                    ),
+                                )
+                            )
+                            yield self._review(raw)
+
                     elif node == "repair":
                         attempt = int(update.get("retry", 0))
                         limit = self.settings.max_repair_rounds
-                        summary = str(last_verification.get("summary", ""))
+                        # 摘要按**阻断来源**取：修的是谁就说什么。一味看
+                        # last_verification，在"审查阻断"时会带出验证的 ok 摘要。
+                        if _review_blocked(last_review):
+                            summary = str(last_review.get("summary", ""))
+                            issues = self._review(last_review).findings
+                        else:
+                            summary = str(last_verification.get("summary", ""))
+                            issues = self._verification(last_verification).issues
                         self._audit(
                             AuditRecord(
                                 ts=now_iso(),
@@ -540,7 +693,7 @@ class AgentRuntime:
                             attempt=attempt,
                             limit=limit,
                             summary=summary,
-                            issues=self._verification(last_verification).issues,
+                            issues=issues,
                         )
 
                     elif node == "respond":
@@ -548,6 +701,8 @@ class AgentRuntime:
                         input_tokens, output_tokens = _add_usage(
                             last, input_tokens, output_tokens
                         )
+                        progress["input_tokens"] = input_tokens
+                        progress["output_tokens"] = output_tokens
                         answer = text_of(last)
 
         except Exception as exc:  # noqa: BLE001 - 编排层异常也要以事件形式报给前端
@@ -564,7 +719,16 @@ class AgentRuntime:
                 )
             except Exception:  # noqa: BLE001, S110 - 已在错误路径上，不再二次抛出
                 pass
-            yield RunFailed(message=f"{type(exc).__name__}: {exc}")
+            # 异常可能发生在任何节点上：此刻还开着的步骤再也不会被 act 收口，
+            # 补发一个，免得前端把它显示成「仍在运行」
+            for event in _close_step(cancelled=True):
+                yield event
+            self._forget_thread(thread_id)
+            yield RunFailed(
+                message=f"{type(exc).__name__}: {exc}",
+                input_tokens=input_tokens or None,
+                output_tokens=output_tokens or None,
+            )
             return
 
         if interrupted:
@@ -583,7 +747,17 @@ class AgentRuntime:
                 output_tokens=output_tokens or None,
             )
         )
-        yield RunFinished(thread_id=thread_id, answer=final)
+        # 收尾兜底：正常路径下 act 已经收口（空操作），但若某条路径让 act 没能
+        # 跑（计划被砍、异常恢复等），这里补上，保证 StepStarted 一定有配对
+        for event in _close_step(cancelled=True):
+            yield event
+        self._forget_thread(thread_id)
+        yield RunFinished(
+            thread_id=thread_id,
+            answer=final,
+            input_tokens=input_tokens or None,
+            output_tokens=output_tokens or None,
+        )
 
     # ------------------------------------------------------------------
     # 回滚（用户主动发起，不走审批；审批管的是模型发起的动作）
@@ -798,6 +972,19 @@ class AgentRuntime:
                 preview=preview,
             )
 
+        if isinstance(artifact, CallArtifact):
+            # 非 shell / 非文件的工具（git_commit、deps_install、run_tests…）。
+            # 被拒时也走这里，level 用工具自身的等级，而不是「文件工具」。
+            return ToolCallFinished(
+                call_id=call_id,
+                name=name,
+                ok=artifact.ok,
+                rejected=artifact.rejected,
+                decision=artifact.decision,
+                level=artifact.level_label or None,
+                preview=preview,
+            )
+
         # 未提供 artifact 的工具：只能从文本粗判成败。新工具都应带 artifact。
         return ToolCallFinished(
             call_id=call_id,
@@ -807,16 +994,30 @@ class AgentRuntime:
         )
 
     @staticmethod
+    def _review(raw: dict[str, Any]) -> ReviewFinished:
+        findings = [
+            " ".join(
+                f"[{f.get('severity', '')}] {f.get('location', '')} {f.get('message', '')}".split()
+            )
+            for f in (raw.get("findings") or [])
+        ]
+        return ReviewFinished(
+            status=str(raw.get("status", "skipped")),
+            blocked=_review_blocked(raw),
+            summary=str(raw.get("summary", "")),
+            findings=findings,
+        )
+
+    @staticmethod
     def _verification(raw: dict[str, Any]) -> Verification:
-        status = str(raw.get("status", "skipped"))
         issues = [
             " ".join(f"{i.get('location', '')} {i.get('message', '')}".split())
             for i in (raw.get("issues") or [])
         ]
         return Verification(
-            status=status,
+            status=str(raw.get("status", "skipped")),
             command=str(raw.get("command", "")),
-            ok=status in ("ok", "skipped", "not_configured"),
+            ok=_verification_passed(raw),
             summary=str(raw.get("summary", "")),
             issues=issues,
         )

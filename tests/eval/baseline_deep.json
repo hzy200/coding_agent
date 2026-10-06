@@ -1,0 +1,87 @@
+{
+  "passed": 6,
+  "total": 6,
+  "pass_rate": 1.0,
+  "by_category": {
+    "cross_file": {
+      "passed": 1,
+      "total": 1
+    },
+    "debug": {
+      "passed": 2,
+      "total": 2
+    },
+    "spec": {
+      "passed": 3,
+      "total": 3
+    }
+  },
+  "by_tier": {
+    "deep": {
+      "passed": 6,
+      "total": 6
+    }
+  },
+  "tasks": [
+    {
+      "id": "deep/config_precedence",
+      "category": "debug",
+      "tier": "deep",
+      "verdict": "passed",
+      "tool_calls": 15,
+      "agent_seconds": 23.7
+    },
+    {
+      "id": "deep/import_chain",
+      "category": "debug",
+      "tier": "deep",
+      "verdict": "passed",
+      "tool_calls": 10,
+      "agent_seconds": 26.3
+    },
+    {
+      "id": "deep/spec_pagination",
+      "category": "spec",
+      "tier": "deep",
+      "verdict": "passed",
+      "tool_calls": 8,
+      "agent_seconds": 19.2
+    },
+    {
+      "id": "deep/spec_idempotent",
+      "category": "spec",
+      "tier": "deep",
+      "verdict": "passed",
+      "tool_calls": 9,
+      "agent_seconds": 19.9
+    },
+    {
+      "id": "deep/request_payload",
+      "category": "spec",
+      "tier": "deep",
+      "verdict": "passed",
+      "tool_calls": 6,
+      "agent_seconds": 20.7
+    },
+    {
+      "id": "deep/field_propagation",
+      "category": "cross_file",
+      "tier": "deep",
+      "verdict": "passed",
+      "tool_calls": 12,
+      "agent_seconds": 27.1
+    }
+  ],
+  "recorded_at": "2026-10-05T03:48:25+00:00",
+  "model": "deepseek-v4-flash",
+  "git_commit": "a88c822",
+  "git_dirty": true,
+  "sandbox_capabilities": {
+    "python3": true,
+    "pytest": false,
+    "make": false,
+    "node": false,
+    "cargo": false,
+    "go": false
+  }
+}

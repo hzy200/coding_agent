@@ -27,6 +27,7 @@ from coding_agent.events import (
     RepairStarted,
     RunFailed,
     RunFinished,
+    RunStarted,
     StepFinished,
     StepStarted,
     ToolCallFinished,
@@ -34,7 +35,7 @@ from coding_agent.events import (
     Verification,
 )
 from coding_agent.runtime import AgentRuntime
-from coding_agent.tools.artifacts import FileArtifact, ShellArtifact
+from coding_agent.tools.artifacts import CallArtifact, FileArtifact, ShellArtifact
 
 THREAD = "t-1"
 
@@ -144,6 +145,7 @@ def test_full_run_event_sequence(tmp_path) -> None:
     events = _run(_collect(runtime))
 
     assert _kinds(events) == [
+        "run_started",
         "plan_created",
         "step_started",
         "assistant_token",
@@ -154,6 +156,9 @@ def test_full_run_event_sequence(tmp_path) -> None:
         "verification",
         "step_started",
         "assistant_token",
+        # 第 2 步开了头却直接收尾（真实图里由 replan 砍掉剩余步骤触发），
+        # 收尾前必须补一个 step_finished —— 否则前端进度条永远停在「进行中」
+        "step_finished",
         "run_finished",
     ]
 
@@ -268,6 +273,47 @@ def test_denied_tool_call_is_marked(tmp_path) -> None:
     finished = next(e for e in events if isinstance(e, ToolCallFinished))
     assert finished.rejected is True
     assert finished.decision == "denied"
+
+
+def test_denied_non_file_tool_keeps_its_own_level(tmp_path) -> None:
+    """git_commit / deps_install / run_tests 被拒时，level 应是工具自身的等级。
+
+    早先这些调用一律产出 FileArtifact，事件层于是把它们标成「文件工具」，
+    审计里的 level 也跟着错。
+    """
+    script = [
+        _updates(act={"messages": [_tool_call("git_commit", {"message": "x"}, "c1")]}),
+        _updates(tools={"messages": [ToolMessage(
+            content="用户拒绝了这条命令",
+            tool_call_id="c1",
+            name="git_commit",
+            artifact=CallArtifact(
+                tool="git_commit", ok=False, rejected=True, decision="denied",
+                level=2, level_label="L2 变更性",
+            ).model_dump(),
+        )]}),
+    ]
+    runtime, _ = _runtime(tmp_path, script)
+    events = _run(_collect(runtime))
+
+    finished = next(e for e in events if isinstance(e, ToolCallFinished))
+    assert finished.level == "L2 变更性"
+    assert finished.rejected is True
+    assert not [e for e in events if isinstance(e, FileChanged)]
+
+
+def test_run_started_opens_the_stream_but_resume_does_not(tmp_path) -> None:
+    """事件流的起点标记只属于全新 run；resume 是同一次运行的延续，不重复发。"""
+    script = [_updates(respond={"messages": [AIMessage(content="好了")]})]
+    runtime, _ = _runtime(tmp_path, script)
+    events = _run(_collect(runtime))
+
+    assert isinstance(events[0], RunStarted)
+    assert len([e for e in events if isinstance(e, RunStarted)]) == 1
+
+    runtime._graph = FakeGraph([_updates(respond={"messages": [AIMessage(content="继续")]})])
+    resumed = _run(_collect_resume(runtime, {}))
+    assert not [e for e in resumed if isinstance(e, RunStarted)]
 
 
 def test_file_change_is_emitted_only_for_mutations(tmp_path) -> None:
@@ -419,6 +465,62 @@ def test_run_end_has_no_token_fields_when_provider_omits_usage(tmp_path) -> None
     assert end.input_tokens is None and end.output_tokens is None
 
 
+def test_token_usage_accumulates_across_suspend_and_resume(tmp_path) -> None:
+    """挂起前那一段的用量不能丢。
+
+    两个计数器曾经是 `_stream` 的局部变量，挂起时 `return` 把它们一起丢掉，
+    resume 后的收尾只记恢复段。而挂起最常见于 L2/L3 审批 —— 恰恰是最费 token
+    的路径，于是成本口径会系统性偏低。
+    """
+    request = {"call_id": "c1", "tool": "shell_exec", "command": "pip install x",
+               "level": "L2 变更性", "reason": "装依赖"}
+    runtime, graph = _runtime(tmp_path, [
+        _updates(act={"messages": [AIMessage(
+            content="",
+            tool_calls=[{"name": "shell_exec", "args": {"command": "pip install x"}, "id": "c1"}],
+            usage_metadata={"input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
+        )]}),
+        _updates(__interrupt__=(_Interrupt({"requests": [request]}),)),
+    ])
+    first = _run(_collect(runtime))
+    assert "run_finished" not in _kinds(first)  # 确实挂起了
+
+    # 恢复段：模型给出最终答复，也回报了用量
+    graph.script = [_updates(respond={"messages": [AIMessage(
+        content="好了",
+        usage_metadata={"input_tokens": 30, "output_tokens": 10, "total_tokens": 40},
+    )]})]
+    second = _run(_collect_resume(runtime, {"c1": True}))
+
+    end = next(e for e in second if isinstance(e, RunFinished))
+    assert (end.input_tokens, end.output_tokens) == (130, 30)
+
+    # 审计与事件同源：两边都应是 130/30
+    audit_end = next(r for r in read_records(runtime.audit_path) if r.kind == "run_end")
+    assert (audit_end.input_tokens, audit_end.output_tokens) == (130, 30)
+
+
+def test_run_failed_carries_token_usage(tmp_path) -> None:
+    """失败的那一轮花费可能最多（反复重试、长上下文）。
+
+    把它排除在成本口径外，均值就只由成功的任务贡献 —— 越难的任务系统性地
+    越"便宜"，这正是评测最需要避免的偏差。
+    """
+    boom = RuntimeError("模型炸了")
+    script = [
+        _updates(act={"messages": [AIMessage(
+            content="",
+            usage_metadata={"input_tokens": 70, "output_tokens": 5, "total_tokens": 75},
+        )]}),
+        ("updates", boom),
+    ]
+    runtime, _ = _runtime(tmp_path, script, error=boom)
+
+    failed = _run(_collect(runtime))[-1]
+    assert isinstance(failed, RunFailed)
+    assert (failed.input_tokens, failed.output_tokens) == (70, 5)
+
+
 def test_resume_is_capped_per_thread(tmp_path) -> None:
     """恢复次数有上限，防止前端反复 resume 绕开 recursion_limit。"""
     runtime, _ = _runtime(
@@ -519,6 +621,56 @@ def test_approved_tool_call_keeps_args_across_resume(tmp_path) -> None:
 class _BoomMemory:
     def load(self) -> list[str]:
         raise RuntimeError("记忆文件读不了")
+
+
+def test_thread_state_is_released_when_the_run_finishes(tmp_path) -> None:
+    """收尾后必须清掉按 thread_id 累积的状态。
+
+    `_pending_calls` / `_progress` 只为「挂起与恢复是两次 `_stream`」而存在，
+    跑完就再无用处。TUI 一个进程能跑几十轮，不清只增不减。
+    """
+    runtime, _ = _runtime(tmp_path, [_updates(respond={"messages": [AIMessage(content="完成")]})])
+    runtime._pending_calls[THREAD] = {"stale": None}  # type: ignore[dict-item]
+    runtime._resume_counts[THREAD] = 1
+
+    _run(_collect(runtime))
+
+    assert runtime._pending_calls == {}
+    assert runtime._progress == {}
+    # 恢复次数**不清**：它护栏的是「跑完还继续 resume」，清了就形同虚设
+    assert runtime._resume_counts == {THREAD: 0}
+
+
+def test_thread_state_is_released_when_the_run_fails(tmp_path) -> None:
+    boom = RuntimeError("模型炸了")
+    script = [_updates(act={"messages": [AIMessage(content="x")]})]
+    script.append(("updates", boom))
+    runtime, _ = _runtime(tmp_path, script, error=boom)
+    runtime._pending_calls[THREAD] = {"stale": None}  # type: ignore[dict-item]
+
+    events = _run(_collect(runtime))
+
+    assert isinstance(events[-1], RunFailed)
+    assert runtime._pending_calls == {}
+    assert runtime._progress == {}
+
+
+def test_thread_state_survives_a_suspension(tmp_path) -> None:
+    """反过来：挂起时**不能**清 —— resume 是另一次 _stream，全靠这些状态续上。"""
+    request = {"call_id": "c1", "tool": "shell_exec", "command": "pip install x",
+               "level": "L2 变更性", "reason": "装依赖"}
+    script = [
+        _updates(act={"messages": [
+            _tool_call("shell_exec", {"command": "pip install x"}, "c1")
+        ]}),
+        _updates(__interrupt__=(_Interrupt({"requests": [request]}),)),
+    ]
+    runtime, _ = _runtime(tmp_path, script)
+
+    _run(_collect(runtime))
+
+    assert THREAD in runtime._pending_calls
+    assert THREAD in runtime._progress
 
 
 def test_memory_read_failure_becomes_run_failed(tmp_path) -> None:
@@ -635,3 +787,125 @@ def test_prompt_is_recorded_within_limits(tmp_path, prompt: str) -> None:
     start = read_records(runtime.audit_path)[0]
     assert start.detail
     assert len(start.detail) <= 2100
+
+
+# ---------------- 步骤事件配对（B5） ----------------
+
+
+def _step_pairs(events: list[Event]) -> list[tuple[str, int]]:
+    """把步骤事件压成 [("start"|"finish", index)]，用于断言配对关系。"""
+    pairs: list[tuple[str, int]] = []
+    for event in events:
+        if isinstance(event, StepStarted):
+            pairs.append(("start", event.index))
+        elif isinstance(event, StepFinished):
+            pairs.append(("finish", event.index))
+    return pairs
+
+
+def test_replan_that_cancels_the_current_step_closes_it(tmp_path) -> None:
+    """计划被砍到当前这步之前时 act 再也不跑 —— 就地收口，别让进度条卡住。
+
+    这条路径是「反复修复都做不成 → 重规划判定放弃」，真实存在：
+    replan 返回 plan[:step_idx]，路由直接送 respond。
+    """
+    script = [
+        _updates(planner={"plan": ["甲", "乙", "丙"]}),
+        _updates(act={"messages": [AIMessage(content="甲做完了")]}),
+        _updates(advance={"step_idx": 1}),
+        _updates(act={"messages": [_tool_call("shell_exec", {"command": "ls"}, "c1")]}),
+        _updates(tools={"messages": [_shell_result("c1")]}),
+        _updates(verify={"verification": {"status": "failed", "summary": "1 failed"}}),
+        _updates(repair={"retry": 1}),
+        _updates(replan={"plan": ["甲"]}),
+        _updates(respond={"messages": [AIMessage(content="收尾")]}),
+    ]
+    runtime, _ = _runtime(tmp_path, script)
+    events = _run(_collect(runtime))
+
+    # 每个 StepStarted 都有配对，且第 2 步是被放弃的
+    assert _step_pairs(events) == [("start", 0), ("finish", 0), ("start", 1), ("finish", 1)]
+    cancelled = [e for e in events if isinstance(e, StepFinished) and e.cancelled]
+    assert len(cancelled) == 1
+    assert cancelled[0].index == 1
+    # 被放弃 ≠ 工具预算耗尽：它根本没试过，不能说成"试过但用完了"
+    assert cancelled[0].budget_exhausted is False
+
+
+def test_open_step_is_closed_before_run_finished(tmp_path) -> None:
+    """兜底：任何让 act 没能收口的路径，都要在收尾前补上 StepFinished。"""
+    script = [
+        _updates(planner={"plan": ["甲", "乙"]}),
+        _updates(respond={"messages": [AIMessage(content="收尾")]}),
+    ]
+    runtime, _ = _runtime(tmp_path, script)
+    events = _run(_collect(runtime))
+
+    assert _step_pairs(events) == [("start", 0), ("finish", 0)]
+    assert isinstance(events[-1], RunFinished)
+
+
+def test_open_step_is_closed_before_run_failed(tmp_path) -> None:
+    """异常路径同样要收口 —— 否则前端会把它显示成「仍在运行」。"""
+    boom = RuntimeError("模型炸了")
+    script = [
+        _updates(planner={"plan": ["甲", "乙"]}),
+        _updates(act={"messages": [_tool_call("shell_exec", {"command": "ls"}, "c1")]}),
+        ("updates", boom),
+    ]
+    runtime, _ = _runtime(tmp_path, script, error=boom)
+    events = _run(_collect(runtime))
+
+    assert _step_pairs(events) == [("start", 0), ("finish", 0)]
+    assert isinstance(events[-1], RunFailed)
+
+
+def test_a_completed_run_emits_no_extra_step_finished(tmp_path) -> None:
+    """正常路径不能因为加了兜底就多冒出一个 StepFinished。"""
+    script = [
+        _updates(planner={"plan": ["甲", "乙"]}),
+        _updates(act={"messages": [AIMessage(content="甲做完了")]}),
+        _updates(advance={"step_idx": 1}),
+        _updates(act={"messages": [AIMessage(content="乙做完了")]}),
+        _updates(respond={"messages": [AIMessage(content="收尾")]}),
+    ]
+    runtime, _ = _runtime(tmp_path, script)
+    events = _run(_collect(runtime))
+
+    assert _step_pairs(events) == [
+        ("start", 0), ("finish", 0), ("start", 1), ("finish", 1),
+    ]
+    assert not [e for e in events if isinstance(e, StepFinished) and e.cancelled]
+
+
+# ---------------- 验证「ok」口径（B7） ----------------
+
+
+@pytest.mark.parametrize("status", ["ok", "skipped", "not_configured", "failed"])
+def test_verification_ok_agrees_with_the_audit_record(tmp_path, status: str) -> None:
+    """事件与审计必须对同一次验证给出同样的结论 —— 审计是可信来源。
+
+    曾经事件按 `status in (ok, skipped, not_configured)` 判、审计按 `== "ok"` 判，
+    于是「没跑验证」在两边结论相反，事后对账对不上。
+    """
+    script = [_updates(verify={"verification": {
+        "status": status, "command": "pytest -q", "summary": "s",
+    }})]
+    runtime, _ = _runtime(tmp_path, script)
+    events = _run(_collect(runtime))
+
+    event = next(e for e in events if isinstance(e, Verification))
+    record = next(r for r in read_records(runtime.audit_path) if r.kind == "verify")
+    assert event.ok == record.ok
+    assert event.ok is (status != "failed")
+
+
+def test_not_running_verification_is_not_a_failure(tmp_path) -> None:
+    """skipped / not_configured 是「没验证」，不能记成验证失败。"""
+    runtime, _ = _runtime(tmp_path, [
+        _updates(verify={"verification": {"status": "skipped", "summary": "没有改动"}}),
+    ])
+    _run(_collect(runtime))
+
+    record = next(r for r in read_records(runtime.audit_path) if r.kind == "verify")
+    assert record.ok is True

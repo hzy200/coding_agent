@@ -1,11 +1,14 @@
 """respond 节点：汇总执行过程，产出面向用户的最终答复。
 
 用不带工具的模型实例，避免它在收尾阶段又发起新的动作。
+
+与 act 一样是 **async 节点**：收尾这次调用往往最长，若走同步 `invoke`，
+Ctrl-C 在它生成期间不生效（见 graph/nodes/act.py 的说明）。
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -38,10 +41,10 @@ def make_respond_node(
     *,
     max_repair_rounds: int = 0,
     budget: ContextBudget | None = None,
-) -> Callable[[AgentState, RunnableConfig], dict[str, Any]]:
+) -> Callable[[AgentState, RunnableConfig], Awaitable[dict[str, Any]]]:
     budget = budget or ContextBudget()
 
-    def respond(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+    async def respond(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         system = RESPOND_PROMPT
         verification = state.get("verification") or {}
         if verification.get("status") == "failed":
@@ -67,6 +70,6 @@ def make_respond_node(
             *history,
             HumanMessage(content=RESPOND_INSTRUCTION),
         ]
-        return {"messages": [llm.invoke(messages, config)]}
+        return {"messages": [await llm.ainvoke(messages, config)]}
 
     return respond

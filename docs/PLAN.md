@@ -448,7 +448,7 @@ W12 查清了成因，结论是**当前不修，只规避**。
 | W14 | ✅ 完成 | Web 最小验证（SSE 流式 / 多会话 / 联通测试，零构建链）、TUI 打磨、`scripts/demo.py` 四场景演示 |
 | W15 | ✅ 完成 | 文档拆分：`ARCHITECTURE.md`（分层/数据流/不变量/扩展点）、`USAGE.md`（工作流/配置/故障排查）、`DEMO.md`（讲稿） |
 | W16 | ✅ 完成 | 冻结前审计（删死字段、清理过时注释）、需求对照表 `ACCEPTANCE.md`、代码冻结 |
-| 冻结后 | 🚧 进行中 | 缺陷修复：P0×3 + P1×4 已修；阶段 A（缺陷收口）计划见 [PHASE_A.md](PHASE_A.md) |
+| 冻结后 | 🚧 进行中 | 多轮缺陷收口：冻结审计的 P0/P1、[BUG_AUDIT_2](BUG_AUDIT_2.md) 的 C1–C8、2026-10-06 的 P0×3（见下）。阶段 A 计划见 [PHASE_A.md](PHASE_A.md) |
 
 ### 冻结后记录：缺陷收口（P0 / P1 + 阶段 A）
 
@@ -469,6 +469,10 @@ W12 查清了成因，结论是**当前不修，只规避**。
 5. 危险模式原始全文匹配误伤（`grep "rm -rf"` 判 L3）→ 引号感知：屏蔽字面量，保留 `$()` 与 `sh -c` 内容。
 6. `budget_exhausted` 不参与路由，空转步骤被静默跳过 → 预算耗尽且无改动时停下如实上报。
 7. 审批 `call_id` 空/重复时串号 → 整批 fail-closed。
+8. `recursion_limit` 又偏小：第 4 条只算了一个执行周期，但 `repair` 会把 `tool_rounds` 清零、
+   让每轮修复**重新吃满一个完整周期** —— 一步反复失败且每轮烧光预算时会以 `GraphRecursionError`
+   收场，拿不到「试过但没修好」的收尾。改为 `(修复次数+1)×周期 + 修复次数 + advance`，
+   并补图级回归用例（`test_repair.py::test_maxed_out_repair_loop_fits_the_estimated_limit`）。
 
 **阶段 A（缺陷收口）**：A1 大文件读取上限在读前生效（100MB：6.68s→0.40s，并修出"空文件读不了"）；
 A2 `history()` 解耦建图（无 API Key 可用）；A3 上下文裁剪支持 content blocks；
@@ -484,6 +488,124 @@ A4 shell 变更也置 `dirty`（触发验证）；A5 工程卫生（124 消歧�
   `agent doctor` 增探测项。
 - **B4** 威胁模型归档 [THREAT_MODEL.md](THREAT_MODEL.md)：明确默认交付是"防误操作"（T1），
   逐层给出升到"防主动越狱"（T2）的前置条件与代价。
+
+### 2026-10-06 记录：第三轮 P0 收口（从测试系统体检入手）
+
+这一轮的入口不是读代码，而是**先量测试系统本身**。当时全量跑分是
+`1043 passed / 5 failed / 1 error`，而文档写的是"992 passed，无失败" —— 追这 5 个失败
+的过程中挖出一个一直存在、又被 CI 结构性地挡在视野外的功能缺陷。
+
+**1. 写文件超过约 96 KB 必然失败**（功能，直指创新点 4「可回滚的修改流程」）
+
+`limits.wrap_with_limits` 把整个脚本体作为**单个 argv** 传给
+`timeout … bash -c '<body>'`，撞上内核 `MAX_ARG_STRLEN`（128 KiB）→
+`Argument list too long`（exit 126）。而 `fs.write_text` 会把整份内容 base64 后内联进
+脚本（膨胀 4/3），于是 96 KB 成了实际写入天花板 —— 与此同时 `max_file_read_bytes`
+宣称 2 MB、`MAX_OPERATIONAL_BYTES` 宣称 10 MB，快照回滚同样写不回去。
+改为 `bash -s` + heredoc、脚本体经 **stdin** 传递。实测 96 KB / 256 KB / 2 MB / 5 MB
+写入与 1.5 MB 快照回滚全部通过。
+
+**2. 命令分级可被 `$'…'` / `~user` 绕过**（安全，直指创新点 2）
+
+`_HIDDEN_EXPANSION_RE` 不认 ANSI-C 与本地化引号，`_mask_quoted` 又把它们整段当字面量
+屏蔽，shlex 词元退化成 `$/etc/passwd`（不以 `/` 开头）→ `cat $'/etc/passwd'`、
+`cat $'\x2fetc\x2fpasswd'`、`cat ~root/.ssh/id_rsa` 全被判 **L0 自动放行**。
+
+修复**刻意没有采用"出现 `$'` 就升级"的一刀切**：那会让 `echo $'rm -rf /'` 这种完全
+惰性的字面量也进人工确认，把防线变成噪声（既有测试正是钉住这一点的）。判据改为
+**展开后的值是否像工作区外路径**（`policy.py::_ansi_quoted_path`）；转义写法无法便宜
+还原，按隐藏处理。`~user` 一并收进 `_is_external_path_token`。
+
+**3. 自动 verify 的命令可被模型决定**（安全，绕过整条审批链）
+
+`testrun._detect` 读工作区里的 `Makefile` / `package.json` 来决定自动 verify 跑什么，
+而这两个文件模型用 `file_write` 就写得到（`--write` 下 L1 自动放行）——
+「写个恶意 manifest → 下一次脏写自动执行」是一条**不过审批的任意 shell 执行路径**。
+`verify.py` 与 `ARCHITECTURE.md` 里"模型影响不了跑什么"的论断由此被证伪（两处已改正）。
+
+改为自动 verify 传 `allow_manifest=False`，只接受**命令文本由宿主写死**的
+`cargo test` / `go test` / `pytest`；`make test` / `npm test` 留给走审批的 `run_tests`
+—— 能力没丢，只是回到审批后面。探测缓存键带上该标志：两种口径答案不同，共用一个键
+会让审批口径的结果漏进无人审批的 verify。
+
+**顺带修掉的测试基建元缺陷**（第 1 条能藏这么久的直接原因）
+
+`tests/unit/test_snapshots.py` 与 `tests/integration/test_snapshots.py` 同名，而 tests/
+下没有 `__init__.py`，pytest 报 `import file mismatch`，**unit 那 7 条用例从未被执行**
+（该文件当时还没进 git）。加 `tests/{unit,integration}/__init__.py` 让模块名带上目录前缀。
+教训：**"跑绿"与"跑过"是两件事** —— 同名文件冲突的失败形态是静默跳过，不是变红，
+而 CI 只跑 `-m "not wsl and not llm"`，沙箱层的问题它结构性看不见。
+
+收口后：`pytest -m "not llm"` = **1070 passed / 0 failed**、覆盖率 **90.9%**。
+
+### 2026-10-06 记录：评测尺子修复 + review 节点
+
+需求侧的六阶段对照（理解需求与规划 → 代码生成与编辑 → **自动化代码审查** →
+自动化验证 → 迭代修复 → 交付与合并）里，**「自动化代码审查」是唯一完全缺失的一环**：
+`verify` 只跑测试命令，`ruff`/`mypy`/`tsc` 类问题零检出（IMPROVEMENT_PLAN P1-4），
+而「测试通过 ≠ 代码正确」的第二道关也不存在（P1-6）。这一轮补上它，同时先修了
+度量它的那把尺子。
+
+**一、评测尺子（先修，否则改了什么都看不出来）**
+
+三处缺陷，都不是"数字不够高"而是"数字说不清"：
+
+1. **没有机制指标**。只有通过率一个维度，于是不知道 verify / repair / replan
+   到底有没有被触发过。README 里记着一次真实误读：`--ab` 跑出「开 3/3 对 关 2/3」
+   看着像重规划有效，实际 `replans=0`（节点一次都没执行），那 33 个百分点是噪声。
+   现补 `mechanism` 块：`verifications`（**status → 次数**，`not_configured` 与 `ok`
+   的差别正是"验证脊柱有没有生效"的判据）、`repairs`、`replans`、token。
+2. **token 口径有系统性偏差**。`input/output_tokens` 原本是 `_stream` 的局部变量，
+   挂起、中断、`RunFailed` 路径都会丢 —— 而失败的那一轮往往花费最多，按审计汇总
+   会让成本只由成功任务贡献。改为累计进 `progress`（跨挂起-恢复不丢）并由
+   `RunFinished`/`RunFailed` 带出，评测读事件而非审计。
+3. **脏数字能冒充基线**。`baseline.json` 当时是 `git_dirty=true`；`--only debug`
+   会把 10 个任务的子集覆盖写到全量 baseline 上。现加可比性守卫：子集 / 脏工作区 /
+   沙箱无 pytest 时**在开跑之前**拒绝（不是烧完十分钟额度之后），需 `--force` 或
+   `--baseline <路径>` 绕过，且写入 `comparable: false` + 原因。
+
+另加 `--repeat k` 量化噪声地板：29 个任务翻一个是 3.4 个百分点，比它小的"提升"
+在单次运行里不可分辨。报告观测到的逐次波动与**翻转过的任务清单**（两次运行通过率
+可以相同而成员不同，只看通过率会得出"没有变化"）。措辞上刻意不写置信区间 ——
+重复 2~3 次没有那种统计效力。
+
+**二、`review` 节点（自动化代码审查）**
+
+位置在 `verify` **通过之后**、`advance` 之前 —— 两道关串联，任一关没过都进
+`repair` 重试。沙箱里**没有** ruff/mypy/node/tsc（实测），所以主干是零依赖的确定性
+检查，外部 linter 探到才用、探不到就如实说明，不假装审过。
+
+- **改动前从哪来**：直接复用 `SnapshotStore` 的留底（不变量 8），不另建基线。
+  只审**新增行**。
+- **水位线**（`review_watermark`）：只看 `snapshot_id > watermark` 的留底，
+  **跨步骤保留、只由 planner 归零**。这是最容易写错的地方 —— 留底记的是写前内容，
+  所以改过的文件永远与自己的留底不同，水位线一旦逐步清零，每一步都会重审前面
+  所有步骤的改动，同一个早已处理过的问题反复告警到把修复预算耗光。
+- **阻断 vs 告警**：语法坏、测试被改弱（新增跳过标记/`assert True`）、新增
+  `breakpoint()`/`pdb.set_trace()`、写进 `.agent/` → 阻断；新增 `print(`/`TODO`、
+  linter 输出 → 只告警。刻意**不做**「公共符号被删」规则：`rename_function` 这类
+  任务本就要求旧名字彻底消失，该规则会与评测任务直接冲突。
+- **共用修复预算**，不新开计数器：两个独立计数器会让 `estimate_recursion_limit`
+  多一层乘积，而它历史上算歪过三次。收敛性由 replan 的硬上限保证。
+
+过程中改出两个真缺陷（都由测试逮到）：
+
+1. `route_after_verify` 若**也**看 review，会因为 `repair` 刻意不清 `review`
+   （act 要靠它知道该改什么）而把"验证失败→修复→验证通过"这条路上**陈旧的阻断**
+   直接打回 repair —— **审查再也不重跑**。改为每一跳只看自己那道关。
+2. `replan` 只认 `verification` 失败，于是 review 的阻断会落进「步进微调」入口
+   （那条路允许返回"不改"），控制流回到 act 空转到额度耗尽。改为 `blocking_failure`
+   同时认两种阻断。
+
+**三、结果**
+
+`pytest -m "not llm"` = **1124 passed / 0 failed**（较本轮开工前 1070 增 54）。
+
+> 未做：评测集的**动态范围扩容**（几十文件的仓库、几十步长程、模糊需求）。
+> 当前 29 个任务最大也只有 9 文件 / 68 行，`tool_calls` 中位数约 7（预算 60），
+> 「自主性提升了多少」仍然测不出来 —— 那是 IMPROVEMENT_PLAN §3.2 W2 的量级工程。
+> 另：新基线必须在干净工作区上跑，并带上 `review_enabled` 戳（开关两态的机制
+> 指标不可比）。
 
 ### W15 记录：文档拆分的取舍
 

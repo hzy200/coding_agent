@@ -1,20 +1,25 @@
 from __future__ import annotations
 
+import pytest
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from coding_agent.graph.routing import (
     ADVANCE,
     APPROVE,
     REPAIR,
+    REPLAN,
     RESPOND,
+    REVIEW,
     VERIFY,
     has_more_steps,
+    make_route_after_review,
     make_route_after_verify,
     route_after_act,
 )
 
 MAX_REPAIRS = 3
 route_after_verify = make_route_after_verify(MAX_REPAIRS)
+route_after_review = make_route_after_review(MAX_REPAIRS)
 
 
 def _state(messages, plan=None, step_idx=0):
@@ -43,20 +48,26 @@ def test_tool_message_does_not_look_like_tool_call() -> None:
 
 # ---------------- verify 之后 ----------------
 
-def test_verify_then_advance_when_steps_remain() -> None:
+def test_verify_passing_goes_to_review_not_straight_to_advance() -> None:
+    """测试通过 ≠ 代码正确 —— 通过之后还有第二道关。"""
+    state = _state([AIMessage(content="step1 done")], ["a", "b"], 0)
+    assert route_after_verify(state) == REVIEW
+
+
+def test_review_then_advance_when_steps_remain() -> None:
     state = _state([AIMessage(content="step1 done")], ["a", "b"], 0)
     assert has_more_steps(state)
-    assert route_after_verify(state) == ADVANCE
+    assert route_after_review(state) == ADVANCE
 
 
-def test_verify_then_respond_on_last_step() -> None:
+def test_review_then_respond_on_last_step() -> None:
     state = _state([AIMessage(content="step2 done")], ["a", "b"], 1)
     assert not has_more_steps(state)
-    assert route_after_verify(state) == RESPOND
+    assert route_after_review(state) == RESPOND
 
 
-def test_verify_then_respond_when_plan_empty() -> None:
-    assert route_after_verify(_state([AIMessage(content="done")], [], 0)) == RESPOND
+def test_review_then_respond_when_plan_empty() -> None:
+    assert route_after_review(_state([AIMessage(content="done")], [], 0)) == RESPOND
 
 
 # ---------------- 失败驱动的修复循环 ----------------
@@ -68,13 +79,17 @@ def test_failed_verification_enters_repair_when_budget_remains() -> None:
     assert route_after_verify(state) == REPAIR
 
 
-def test_failed_verification_reports_when_budget_exhausted() -> None:
-    """上限是硬性的：没有它，自动修复就是个烧 token 的无限循环，
-    而且用户永远拿不到「我试过了但没修好」这个结论。"""
+def test_failed_verification_hands_over_to_replan() -> None:
+    """修复额度用尽不是直接收尾 —— 先交给 replan 判断「换个做法还能不能成」。
+
+    上限仍然是硬性的：没有它，自动修复就是个烧 token 的无限循环，而且用户
+    永远拿不到「我试过了但没修好」这个结论。replan 同样有硬性上限，
+    它也没辙时会把剩余步骤砍掉，再由 route_after_replan 送去收尾。
+    """
     state = _state([AIMessage(content="done")], ["a"], 0)
     state["verification"] = {"status": "failed"}
     state["retry"] = MAX_REPAIRS
-    assert route_after_verify(state) == RESPOND
+    assert route_after_verify(state) == REPLAN
 
 
 def test_repair_budget_counts_up_to_the_limit() -> None:
@@ -84,7 +99,7 @@ def test_repair_budget_counts_up_to_the_limit() -> None:
         state["retry"] = attempt
         assert route_after_verify(state) == REPAIR, attempt
     state["retry"] = MAX_REPAIRS
-    assert route_after_verify(state) == RESPOND
+    assert route_after_verify(state) == REPLAN
 
 
 def test_repair_budget_is_per_step_not_global() -> None:
@@ -92,22 +107,64 @@ def test_repair_budget_is_per_step_not_global() -> None:
     state = _state([AIMessage(content="done")], ["a", "b"], 0)
     state["verification"] = {"status": "failed"}
     state["retry"] = MAX_REPAIRS
-    assert route_after_verify(state) == RESPOND  # 本步放弃，交给收尾报告
+    assert route_after_verify(state) == REPLAN  # 本步交给 replan，再决定去留
 
 
 def test_passing_verification_ignores_retry_counter() -> None:
     state = _state([AIMessage(content="done")], ["a", "b"], 0)
     state["verification"] = {"status": "ok"}
     state["retry"] = MAX_REPAIRS
-    assert route_after_verify(state) == ADVANCE
+    assert route_after_verify(state) == REVIEW
 
 
-def test_zero_budget_disables_the_loop() -> None:
+# ---------------- 代码审查之后 ----------------
+
+def test_review_blocking_enters_repair_when_budget_remains() -> None:
+    """审查的阻断与验证的失败走同一条出口 —— 对这一步来说含义相同：做出来了但不合格。"""
+    state = _state([AIMessage(content="done")], ["a"], 0)
+    state["verification"] = {"status": "ok"}
+    state["review"] = {"status": "blocked", "summary": "1 个阻断问题"}
+    state["retry"] = 0
+    assert route_after_review(state) == REPAIR
+
+
+def test_review_blocking_goes_to_replan_when_budget_exhausted() -> None:
+    """额度用尽时换一种做法，而不是硬试 —— 与验证失败的处理一致。"""
+    state = _state([AIMessage(content="done")], ["a"], 0)
+    state["review"] = {"status": "blocked"}
+    state["retry"] = MAX_REPAIRS
+    assert route_after_review(state) == REPLAN
+
+
+@pytest.mark.parametrize("status", ["clean", "warned", "skipped"])
+def test_review_warnings_do_not_block(status: str) -> None:
+    """只有 blocking 才改控制流。告警是记录用的，不该把任务卡住。
+
+    `skipped` 也在这里：审查没跑起来（脚本坏了、开关关了）不该等于任务失败。
+    """
+    state = _state([AIMessage(content="done")], ["a", "b"], 0)
+    state["review"] = {"status": status}
+    assert route_after_review(state) == ADVANCE
+
+
+def test_verify_does_not_reroute_on_a_stale_review_block() -> None:
+    """verify 的路由只看验证本身 —— 审查阻断由 review 那一跳负责。
+
+    两边都判同一个字段会让"验证通过但审查阻断"被处理两次，修复预算被双倍消耗。
+    """
+    state = _state([AIMessage(content="done")], ["a"], 0)
+    state["verification"] = {"status": "ok"}
+    state["review"] = {"status": "blocked"}
+    assert route_after_verify(state) == REVIEW
+
+
+def test_zero_budget_disables_the_repair_loop() -> None:
+    """修复预算为 0 时一次都不重试，直接交给 replan。"""
     strict = make_route_after_verify(0)
     state = _state([AIMessage(content="done")], ["a"], 0)
     state["verification"] = {"status": "failed"}
     state["retry"] = 0
-    assert strict(state) == RESPOND
+    assert strict(state) == REPLAN
 
 
 # ---------------- 工具预算耗尽 ----------------
@@ -121,11 +178,15 @@ def test_budget_exhausted_without_changes_stops_to_report() -> None:
 
 
 def test_budget_exhausted_with_changes_still_advances() -> None:
-    """改过东西说明这一步有产出，不该被预算标记截断后续步骤。"""
+    """改过东西说明这一步有产出，不该被预算标记截断后续步骤。
+
+    预算标记的例外只发生在 verify 那一跳；真正的步进判定在 review 之后。
+    """
     state = _state([AIMessage(content="改完了")], ["a", "b"], 0)
     state["budget_exhausted"] = True
     state["dirty"] = True
-    assert route_after_verify(state) == ADVANCE
+    assert route_after_verify(state) == REVIEW
+    assert route_after_review(state) == ADVANCE
 
 
 def test_budget_exhausted_does_not_override_failed_verification() -> None:

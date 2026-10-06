@@ -36,7 +36,9 @@ from coding_agent.events import (
     Event,
     FileChanged,
     PlanCreated,
+    PlanRevised,
     RepairStarted,
+    ReviewFinished,
     RunFailed,
     RunFinished,
     StepFinished,
@@ -331,6 +333,20 @@ def _make_renderer() -> Callable[[Event], None]:
             if event.steps:
                 _render_plan(event.steps, 0)
                 console.print("\n[dim]开始执行…[/]")
+            if event.degraded:
+                # 不能静默：多步任务退化成单步，用户会以为它真的做了规划
+                console.print(
+                    "[yellow]! 规划未解析，已退化为单步执行"
+                    "（模型未返回可解析的步骤，请检查模型输出）[/]"
+                )
+
+        elif isinstance(event, PlanRevised):
+            # 执行中重建了剩余计划：先把新计划摆出来，再继续往下走
+            state["plan"] = list(event.steps)
+            state["total"] = max(len(event.steps), 1)
+            console.print("\n[yellow]↻ 计划已调整[/]")
+            if event.steps:
+                _render_plan(event.steps, event.step_idx)
 
         elif isinstance(event, StepStarted):
             # 单步计划下标题只是重复用户问题，省略
@@ -340,7 +356,13 @@ def _make_renderer() -> Callable[[Event], None]:
             console.print("[bold green]助手 › [/]", end="")
 
         elif isinstance(event, StepFinished):
-            suffix = "[dim]（工具预算耗尽）[/]" if event.budget_exhausted else ""
+            if event.budget_exhausted:
+                suffix = "[dim]（工具预算耗尽）[/]"
+            elif event.cancelled:
+                # 被重规划放弃的步骤：不能说成「预算耗尽」——它根本没试过
+                suffix = "[dim]（本步骤未执行完，已放弃）[/]"
+            else:
+                suffix = ""
             _emit(f"\n{suffix}\n")
 
         elif isinstance(event, AssistantToken):
@@ -398,6 +420,18 @@ def _make_renderer() -> Callable[[Event], None]:
                 console.print(f"[red]验证失败[/] [dim]{escape(event.summary)}[/]")
                 for issue in event.issues[:5]:
                     console.print(f"  [red]·[/] {escape(issue)}")
+
+        elif isinstance(event, ReviewFinished):
+            if event.status == "skipped":
+                pass
+            elif event.blocked:
+                console.print(f"[red]代码审查未通过[/] [dim]{escape(event.summary)}[/]")
+                for finding in event.findings[:5]:
+                    console.print(f"  [red]·[/] {escape(finding)}")
+            elif event.status == "warned":
+                console.print(f"[yellow]代码审查有告警[/] [dim]{escape(event.summary)}[/]")
+            else:
+                console.print(f"[green]代码审查通过[/] [dim]{escape(event.summary)}[/]")
 
         elif isinstance(event, RunFailed):
             console.print(f"\n[red]运行失败：{escape(event.message)}[/]")

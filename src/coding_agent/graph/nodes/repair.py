@@ -9,6 +9,10 @@
 诊断信息的传递不在这里：结构化错误一直在 `state["verification"]` 里，
 由 act 合成进系统提示。这样消息历史保持干净 —— 往里塞伪造成用户或助手口吻的
 「反馈消息」会污染后续所有轮次的上下文。
+
+**因此这里刻意不清 `verification` / `review`。** 清零它们看似"重置得更干净"，
+实际会让 repair 之后的 act 拿不到"到底哪里不合格"，只能瞎改。清空的责任在
+`planner` 与 `advance`（换了步骤或换了轮次，旧结论才算过期）。
 """
 
 from __future__ import annotations

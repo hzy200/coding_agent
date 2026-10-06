@@ -18,11 +18,22 @@
 四个选题创新点均已落地并有测试守着：双工具架构、可审计的命令安全策略、
 可回滚的修改流程、失败驱动的修复循环。
 
-**当前状态**：805 个测试通过（不含需 API Key 的 LLM 用例）、覆盖率 90%、lint 干净。
-代码冻结后又做了一轮**缺陷收口与安全纵深**：大文件读取上限在读前生效、shell 变更也触发验证、
-只读命令参数越界升级、可选 `bwrap` 内核级隔离等。逐条需求对照与已知限制见
-[ACCEPTANCE.md](docs/ACCEPTANCE.md)，加固记录见 [PLAN.md](docs/PLAN.md) §8 与
+**当前状态**：`pytest -m "not llm"` **1070 passed**、覆盖率 **90.9%**、lint 干净。
+（另有 3 个 `llm` 标记用例需要 `DEEPSEEK_API_KEY`，默认排除；不加 `-m` 时它们会真的调用模型。）
+CI 只跑不需要 WSL2 的子集（887 用例 / 覆盖 81.4%），覆盖率门槛设在 76 —— 沙箱层那部分
+只在本地守得住，原因与差距见 [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md) 的 Q1。
+代码冻结后又做了多轮**缺陷收口与安全纵深**：大文件读取上限在读前生效、shell 变更也触发验证、
+只读命令参数越界升级、可选 `bwrap` 内核级隔离、写入体积不再受 argv 上限卡住（此前超过约 96 KB
+必然失败）、`$'…'` 与 `~user` 形式的越界读不再漏判、自动 verify 不再执行模型可写的 manifest
+里的命令，等等。逐条需求对照与已知限制见 [ACCEPTANCE.md](docs/ACCEPTANCE.md)，加固记录见
+[PLAN.md](docs/PLAN.md) §8、[BUG_AUDIT_2.md](docs/BUG_AUDIT_2.md) 与
 [PHASE_A.md](docs/PHASE_A.md)。
+
+**两道质量关**：`verify` 跑项目自己的测试（行为对不对），`review` 在验证通过后做确定性
+代码审查（干不干净）——语法坏没坏、测试有没有被改弱、是否留下 `breakpoint()`、有没有写进
+`.agent/`。审查的「改动前」直接复用快照，只审新增行；阻断项与验证失败共用同一份修复预算。
+能力评测也随之补上**机制指标**（验证/修复/重规划次数、token）与**噪声地板**（`--repeat`），
+以及"不可比的数字不许冒充基线"的守卫。
 
 ## 文档
 
@@ -37,6 +48,9 @@
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | **保护什么、假设对手是谁**、T1（防误操作）/ T2（防越狱）的边界与达标前置条件 |
 | [docs/DEMO.md](docs/DEMO.md) | 答辩演示讲稿（配 `scripts/demo.py`） |
 | [docs/PLAN.md](docs/PLAN.md) | 开发方案、四个月排期、风险与进度 |
+| [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md) | **技术分析报告 + 三个月改进计划**：以「高性能自主编码智能体」为目标的缺陷分级（P0–P3）与 W1–W12 排期 |
+| [docs/BUG_AUDIT.md](docs/BUG_AUDIT.md) | **功能缺陷与 BUG 审计（第一轮）**：14 项按严重度归档的实测缺陷（含证据位置、触发路径、修复方向与优先级） |
+| [docs/BUG_AUDIT_2.md](docs/BUG_AUDIT_2.md) | **第二轮审计**：修复后重新审计出的 8 项（三份沙箱实例、文件工具冗余 `resolve`、上下文预算失效、审计每条扫目录、会话回溯单位、dirty 与 ok 耦合、异步不可取消等），含对第一轮一处收益记述的更正。**C1–C8 已全部修复** |
 
 ## 快速开始
 
@@ -125,7 +139,8 @@ TUI 快捷键 `Ctrl+Q` 退出 · `Ctrl+N` 新会话 · `Ctrl+L` 清屏。
                           └───────────┬──────────────┘
                                       │ LangGraph
    START → planner → act ─┬─→ approval_gate → tools ─→ act
-                          └─→ verify ─┬─(通过)──────→ advance ─→ act
+                          └─→ verify ─┬─(通过)─→ advance → replan ─┬─→ act
+                                      │                            └─→ respond → END
                                       ├─(失败，有预算)→ repair ─→ act
                                       └─(失败，预算尽)→ respond → END
                                       │ {tool, args}
@@ -179,10 +194,11 @@ CodingAgent/
 │  ├─ memory/                  # checkpoint(SQLite) · 会话索引(归纳审计) · 长期记忆
 │  ├─ audit/                   # JSONL 审计（按天分文件，可按大小轮转）
 │  └─ cli/ tui/ web/           # 三种前端：只消费事件，不得导入 tools/sandbox
-├─ tests/                      # 测试（三层，见「开发」）
+├─ tests/                      # 测试（四层，见「开发」）
 │  ├─ unit/                    #   纯逻辑（含假图驱动的 runtime 事件流）
 │  ├─ integration/             #   真实 WSL 沙箱（无环境自动跳过）
-│  └─ tui/                     #   无头驱动界面
+│  ├─ tui/                     #   无头驱动界面
+│  └─ eval/                    #   端到端能力评测（20 任务，需 API Key，不进 CI）
 ├─ docs/                       # 9 份文档（见上表）
 ├─ scripts/demo.py             # 四场景演示脚本（对应四个创新点）
 ├─ .github/workflows/ci.yml    # CI：ruff + `pytest -m "not wsl and not llm"`
@@ -351,20 +367,26 @@ python scripts/demo.py --only 3  # 只跑某个
 ## 开发
 
 环境准备（含 `dev` 依赖）见上方「快速开始 §1 环境准备」。注意 `pytest` 的 addopts
-默认带 `-n auto`，缺 `pytest-xdist` 会直接报错 —— 装 `.[dev]` 即可。
+默认带 `-n auto`，缺 `pytest-xdist` 会直接报错 —— 装 `.[dev]` 即可；
+`make cov` 另外需要 `pytest-cov`（同样在 `.[dev]` 里）。
 
 ```bash
 conda activate agent  # 先激活项目环境（或 .venv）
 
 make check            # lint + 快反馈测试（推荐）
 make test-all         # 全量（含真实 WSL 沙箱）
+make cov              # 与 CI 同口径：快反馈子集 + 覆盖率门槛
 
-pytest -m "not wsl"   # 快反馈循环：单元 + TUI，约 45 秒
-pytest                # 全量（含真实 WSL 沙箱），约 2 分钟
+pytest -m "not wsl and not llm"   # 快反馈循环：单元 + TUI + Web，约 1 分钟
+pytest -m "not llm"               # 全量（含真实 WSL 沙箱），约 2–3 分钟
 ruff check .          # lint
 ```
 
-CI（`.github/workflows/ci.yml`）在无 WSL 的托管 runner 上跑 `ruff` + `pytest -m "not wsl and not llm"`。
+CI（`.github/workflows/ci.yml`）在无 WSL 的托管 runner 上跑 `ruff` + 
+`pytest -m "not wsl and not llm" --cov`，覆盖率门槛 **76**（`pyproject.toml` 的
+`[tool.coverage.report]`）。**沙箱层不在 CI 覆盖范围内**：那部分用例由本地的
+`-m wsl` 守着，CI 会以 `::warning::` 显式提示这个缺口 —— 差距与原因见
+[docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md) 的 Q1。
 
 默认并行（`-n auto`）。集成测试的开销几乎全在 `wsl.exe` 进程启动上（每次约 0.3 秒），
 完全受 I/O 限制，所以并行几乎线性加速 —— 串行跑一遍要十分钟。
@@ -375,6 +397,16 @@ CI（`.github/workflows/ci.yml`）在无 WSL 的托管 runner 上跑 `ruff` + `p
 `tests/integration`（真实 WSL 沙箱，环境不具备时自动跳过）、
 `tests/tui` 与 `tests/unit/test_web_app.py`（无头驱动界面，注入假 runtime ——
 不需要 API Key 也不需要 WSL）。
+
+此外还有一层**能力评测**（`tests/eval`，20 个任务分单文件改动 / 跨文件重构 / 排障修复）：
+它度量"任务能不能做完"，不是回归，需要 API Key 且不进 CI。判定前会把测试文件
+还原成纯净副本，所以改测试没有收益。见 [tests/eval/README.md](tests/eval/README.md)：
+
+```bash
+python tests/eval/runner.py --verify-seeds   # 种子自检，不需要 API Key
+python tests/eval/runner.py --list           # 任务清单
+python tests/eval/runner.py                  # 全量，结果写 baseline.json
+```
 
 **非 WSL 用例不得真的执行沙箱命令**：`tests/conftest.py` 的守卫会把这类调用换成
 当场失败（任何平台，不只是 Linux CI）。确实要探测宿主 WSL 的用例（如 `doctor`）
@@ -405,8 +437,10 @@ CI（`.github/workflows/ci.yml`）在无 WSL 的托管 runner 上跑 `ruff` + `p
 | `AGENT_AUDIT_ENABLED` / `AGENT_AUDIT_DIR` / `AGENT_AUDIT_MAX_MB` | `true` / `<cwd>/.agent/audit` / `0` | 审计日志；超 `MAX_MB` 就轮转（0=不轮转） |
 | `AGENT_APPROVAL_MODE` | `ask` | `ask` / `approve` / `deny` |
 | `AGENT_VERIFY_ENABLED` / `AGENT_VERIFY_COMMAND` | `true` / 空 | 自动验证；命令留空则按清单识别 |
+| `AGENT_REVIEW_ENABLED` | `true` | 验证通过后的代码审查（检查语法/被改弱的测试/调试残留） |
 | `AGENT_CONTEXT_MAX_CHARS` / `_KEEP_RECENT` / `_TOOL_CHARS` | `60000` / `12` / `1500` | 上下文裁剪；max=0 关闭 |
 | `AGENT_MAX_PLAN_STEPS` / `_TOOL_ROUNDS` / `_REPAIR_ROUNDS` / `_MAX_RESUMES` | `5` / `12` / `3` / `50` | 循环与恢复次数上限 |
+| `AGENT_MAX_REPLANS` | `2` | 执行中重建剩余计划的次数上限（0 = 不重规划） |
 
 状态文件位置（宿主侧与沙箱侧是两处，别混淆）见
 [USAGE.md](docs/USAGE.md)。
