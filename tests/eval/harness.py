@@ -230,15 +230,43 @@ def clean_workspace(sandbox: WslSandbox, root: str, *, base: str) -> None:
         raise RuntimeError(f"无法准备工作区 {normalized}：{result.render(300)}")
 
 
-def materialize(task: EvalTask, fs: SandboxFs, root: str) -> None:
-    """把种子写进工作区（测试文件也在内，让智能体能自己跑）。
+def materialize(task: EvalTask, sandbox: WslSandbox, fs: SandboxFs, root: str) -> None:
+    """把种子写进工作区（测试文件也在内），并把工作区初始化成一个 git 仓库。
 
     **一次批量写**（`write_many`）而不是逐文件：长程档的工作区有 38 个文件，
     逐个写就是 38 次 `wsl.exe` 进程启动（约 10s），而每次跑都要付这笔钱。
+
+    **为什么要有 git**：实测里 `git_status` / `git_diff` 在长程任务中全部失败 ——
+    工作区压根不是仓库。于是「交付与合并」那一环（`git_add` / `git_commit`）
+    在长程档**根本测不到**，而它是六阶段需求里的最后一段。真实项目几乎都是 git
+    仓库，补上它既是现实性，也是让那一段可被测的前提。
     """
     files = dict(task.seed_files)
     files.setdefault(PYTEST_INI_PATH, PYTEST_INI)
     fs.write_many({f"{root}/{relpath}": content for relpath, content in files.items()})
+    _init_repo(sandbox, root)
+
+
+# 固定时间戳 + 显式身份：沙箱里通常没有全局 git 身份，不显式给会让 commit 失败；
+# 时间固定则让同一份种子每次得到同一个提交（评测要可复现）。
+_GIT_INIT = """\
+cd {root} &&
+git init -q &&
+git config user.email "eval@example.invalid" &&
+git config user.name "eval" &&
+git add -A &&
+GIT_AUTHOR_DATE="2020-01-01T00:00:00+00:00" \
+GIT_COMMITTER_DATE="2020-01-01T00:00:00+00:00" \
+git commit -q -m "初始提交"
+"""
+
+
+def _init_repo(sandbox: WslSandbox, root: str) -> None:
+    result = sandbox.run(_GIT_INIT.format(root=shlex.quote(root)))
+    if not result.ok:
+        # 初始化失败要**显式报出来**：否则 `git_*` 工具会在"环境没准备好"的前提下
+        # 静默失效，而任务看起来像是"模型不会用 git"。
+        raise RuntimeError(f"评测工作区 git 初始化失败：{result.render(400)}")
 
 
 def apply_reference(task: EvalTask, fs: SandboxFs, root: str) -> None:
@@ -300,7 +328,7 @@ async def run_task(
 ) -> TaskResult:
     """清理工作区 → 写种子 → 跑智能体 → 判定。"""
     clean_workspace(sandbox, root, base=eval_root(settings, sandbox))
-    materialize(task, fs, root)
+    materialize(task, sandbox, fs, root)
 
     # 评测里没有人在场，审批必须预先给定。这是 **harness 的显式选择**，
     # 不是智能体绕过了审批：审批链路本身仍原样生效，只是答案由 harness 给出。
@@ -758,7 +786,7 @@ def preflight(sandbox: WslSandbox, fs: SandboxFs, base: str) -> None:
     """
     root = f"{base}/{PREFLIGHT_TASK.id}"
     clean_workspace(sandbox, root, base=base)
-    materialize(PREFLIGHT_TASK, fs, root)
+    materialize(PREFLIGHT_TASK, sandbox, fs, root)
     passed, detail, _ = judge(PREFLIGHT_TASK, sandbox, fs, root)
     if not passed:
         raise RuntimeError(

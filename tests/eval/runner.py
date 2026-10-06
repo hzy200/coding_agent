@@ -117,7 +117,7 @@ def _verify_seeds(tasks: list[EvalTask], sandbox: WslSandbox, fs: SandboxFs, set
     for task in tasks:
         root = task_root(settings, sandbox, task.id)
         clean_workspace(sandbox, root, base=base)
-        materialize(task, fs, root)
+        materialize(task, sandbox, fs, root)
         passed, detail, _ = judge(task, sandbox, fs, root)
         if passed:
             bad.append(f"{task.id}：种子状态下判定就已通过（假阳性）\n    {detail}")
@@ -130,7 +130,7 @@ def _verify_seeds(tasks: list[EvalTask], sandbox: WslSandbox, fs: SandboxFs, set
 
         ref_root = f"{base}/_ref/{task.id}"
         clean_workspace(sandbox, ref_root, base=base)
-        materialize(task, fs, ref_root)
+        materialize(task, sandbox, fs, ref_root)
         apply_reference(task, fs, ref_root)
         ref_passed, ref_detail, _ = judge(task, sandbox, fs, ref_root)
         if ref_passed:

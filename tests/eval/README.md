@@ -175,6 +175,18 @@ python tests/eval/runner.py --repeat 3
 要测「带修复循环」的智能体：确保沙箱里有 `python3-pytest`。任务种子里已经
 统一带了 `pytest.ini`（`harness.py::materialize`），探测能命中。
 
+## 评测工作区是一个 git 仓库
+
+`materialize` 写完种子后跑一次 `git init` + 初始提交（时间戳固定，所以同一份种子
+每次得到同一个提交）。
+
+**为什么**：实测里 `git_status` / `git_diff` 在长程任务中全部失败 —— 工作区压根
+不是仓库。于是「交付与合并」那一环（`git_add` / `git_commit`）在长程档**根本测
+不到**，而它是六阶段需求里的最后一段。真实项目几乎都是 git 仓库。
+
+顺带多了一个宿主之外的独立视角：`git status --porcelain` 能看出智能体到底改了
+什么，与快照、`writes` 指标互为交叉验证。
+
 ## 两条判定原则
 
 **一、只看外部可观察结果。**
