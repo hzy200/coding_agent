@@ -189,12 +189,23 @@ def test_answer_falls_back_to_streamed_tokens(tmp_path) -> None:
 
 
 def test_planner_emits_plan_then_first_step(tmp_path) -> None:
-    runtime, _ = _runtime(tmp_path, [_updates(planner={"plan": ["甲", "乙"]})])
+    runtime, _ = _runtime(
+        tmp_path,
+        [
+            _updates(
+                planner={
+                    "plan": ["甲", "乙"],
+                    "plan_kinds": ["explore", "implement"],
+                }
+            )
+        ],
+    )
     events = _run(_collect(runtime))
 
     plan = next(e for e in events if isinstance(e, PlanCreated))
     started = next(e for e in events if isinstance(e, StepStarted))
     assert plan.steps == ["甲", "乙"]
+    assert plan.kinds == ["explore", "implement"]
     assert (started.index, started.total, started.text) == (0, 2, "甲")
 
 

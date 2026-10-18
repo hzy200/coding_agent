@@ -1,0 +1,125 @@
+{
+  "passed": 1,
+  "total": 1,
+  "pass_rate": 1.0,
+  "by_category": {
+    "cross_file": {
+      "passed": 1,
+      "total": 1
+    }
+  },
+  "by_tier": {
+    "long": {
+      "passed": 1,
+      "total": 1
+    }
+  },
+  "mechanism": {
+    "runs": 1,
+    "verifications": {
+      "ok": 1
+    },
+    "subagent_statuses": {},
+    "max_delegate_batch": 0,
+    "subagent_input_tokens": null,
+    "subagent_output_tokens": null,
+    "workflows": {
+      "orchestrated_implement": 1
+    },
+    "worker_statuses": {
+      "failed": 2
+    },
+    "max_worker_batch": 1,
+    "tasks_with_verification": 1,
+    "repairs": 0,
+    "tasks_with_repair": 0,
+    "replans": 1,
+    "tasks_reporting_tokens": 1,
+    "subagents": 0,
+    "tasks_with_subagents": 0,
+    "tasks_planned": 1,
+    "workers": 2,
+    "worker_retries": 1,
+    "worker_merged": 0,
+    "input_tokens": 698942,
+    "output_tokens": 7325
+  },
+  "tasks": [
+    {
+      "id": "long/discount_and_audit",
+      "category": "cross_file",
+      "tier": "long",
+      "verdict": "passed",
+      "tool_calls": 39,
+      "steps": 6,
+      "replans": 1,
+      "verifications": {
+        "ok": 1
+      },
+      "repairs": 0,
+      "writes": 15,
+      "subagents": 0,
+      "subagent_statuses": {},
+      "max_delegate_batch": 0,
+      "subagent_input_tokens": 0,
+      "subagent_output_tokens": 0,
+      "workflow": "orchestrated_implement",
+      "tasks_planned": 1,
+      "workers": 2,
+      "worker_statuses": {
+        "failed": 2
+      },
+      "max_worker_batch": 1,
+      "worker_retries": 1,
+      "worker_merged": 0,
+      "budget": {
+        "max_plan_steps": 8,
+        "max_tool_rounds": 16,
+        "max_repair_rounds": 5,
+        "max_replans": 3
+      },
+      "input_tokens": 698942,
+      "output_tokens": 7325,
+      "agent_seconds": 164.0
+    }
+  ],
+  "recorded_at": "2026-10-18T06:44:43+00:00",
+  "model": "deepseek-chat",
+  "git_commit": "d548603",
+  "git_dirty": true,
+  "aggregation": "single_run",
+  "noise": {
+    "repeats": 1,
+    "pass_rate_per_run": [
+      1.0
+    ],
+    "min": 1.0,
+    "max": 1.0,
+    "spread": 0.0,
+    "flipped": [],
+    "one_task_flip": 1.0,
+    "note": "观测到的逐次波动，不是置信区间；重复次数少时无统计效力。能分辨的最小差异由 spread 决定，不是由 one_task_flip 决定 —— 后者只是翻一个任务的算术粒度。"
+  },
+  "sandbox_capabilities": {
+    "python3": true,
+    "pytest": true,
+    "make": false,
+    "node": false,
+    "cargo": false,
+    "go": false
+  },
+  "max_replans": 2,
+  "review_enabled": true,
+  "nudge_empty_steps": true,
+  "explore_enabled": false,
+  "max_concurrent_agents": 4,
+  "orchestrator_enabled": true,
+  "orchestrator_max_tasks": 6,
+  "orchestrator_max_concurrent_workers": 4,
+  "orchestrator_task_retries": 1,
+  "orchestrator_write_enabled": true,
+  "suite": "long",
+  "subset_filter": "long/discount_and_audit",
+  "comparable": false,
+  "comparable_reason": "只跑了任务子集（--only）：统计口径与全量 baseline 不同；工作区有未提交改动：数字说不清对应哪版代码"
+}

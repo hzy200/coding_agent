@@ -35,6 +35,7 @@ from coding_agent.events import (
     AssistantToken,
     Event,
     FileChanged,
+    OrchestrationFinished,
     PlanCreated,
     PlanRevised,
     RepairStarted,
@@ -43,9 +44,15 @@ from coding_agent.events import (
     RunFinished,
     StepFinished,
     StepStarted,
+    SubAgentFinished,
+    SubAgentStarted,
+    TaskGraphCreated,
     ToolCallFinished,
     ToolCallStarted,
     Verification,
+    WorkerFinished,
+    WorkerStarted,
+    WorkflowSelected,
 )
 from coding_agent.llm.deepseek import MissingApiKeyError, build_llm
 from coding_agent.llm.prompts import SYSTEM_PROMPT
@@ -377,6 +384,61 @@ def _make_renderer() -> Callable[[Event], None]:
             label = f"[{event.level}] " if event.level else ""
             console.print(
                 f"\n[dim]→ {escape(label)}{escape(event.name)}: {escape(event.summary)}[/]"
+            )
+
+        elif isinstance(event, SubAgentStarted):
+            console.print(
+                f"[cyan]◈ 探索子智能体开始[/] [dim]{escape(event.goal)}[/]"
+            )
+
+        elif isinstance(event, SubAgentFinished):
+            style = "green" if event.status == "success" else "yellow"
+            console.print(
+                f"[{style}]◈ 探索子智能体 {escape(event.status)}[/] "
+                f"[dim]{escape(event.summary)}[/]"
+            )
+
+        elif isinstance(event, WorkflowSelected):
+            console.print(
+                f"[cyan]◈ 工作流：{escape(event.workflow)}[/] "
+                f"[dim]{escape(event.reason)}[/]"
+            )
+
+        elif isinstance(event, TaskGraphCreated):
+            suffix = " [yellow]（已降级）[/]" if event.degraded else ""
+            console.print(
+                f"[cyan]◈ 任务图：{len(event.tasks)} 个只读任务[/]{suffix}"
+            )
+            for task in event.tasks:
+                console.print(
+                    f"  [dim]{escape(str(task.get('id', '')))} "
+                    f"({escape(str(task.get('role', '')))}): "
+                    f"{escape(str(task.get('goal', '')))}[/]"
+                )
+
+        elif isinstance(event, WorkerStarted):
+            console.print(
+                f"[dim]  → worker {escape(event.role)}/{escape(event.task_id)}: "
+                f"{escape(event.goal)}[/]"
+            )
+
+        elif isinstance(event, WorkerFinished):
+            style = (
+                "green"
+                if event.status == "success"
+                else "yellow"
+                if event.status == "partial"
+                else "red"
+            )
+            console.print(
+                f"[{style}]  ← worker {escape(event.role)}/{escape(event.task_id)} "
+                f"{escape(event.status)}[/] [dim]{escape(event.summary)}[/]"
+            )
+
+        elif isinstance(event, OrchestrationFinished):
+            console.print(
+                f"[cyan]◈ 编排完成[/] [dim]成功 {event.completed}，"
+                f"失败/阻塞 {event.failed}：{escape(event.summary)}[/]"
             )
 
         elif isinstance(event, RepairStarted):

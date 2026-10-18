@@ -19,6 +19,7 @@ from coding_agent.graph.nodes.replan import (
     blocking_failure,
     make_replan_node,
 )
+from coding_agent.graph.plan import PlanStepModel
 from coding_agent.graph.routing import (
     ACT,
     REPAIR,
@@ -72,6 +73,26 @@ def _state(**overrides):
     }
     state.update(overrides)
     return state
+
+
+def test_revision_preserves_step_kinds() -> None:
+    node, _ = _node(
+        ReplanDecision(
+            revise=True,
+            steps=[PlanStepModel(text="新做法", kind="implement")],
+        )
+    )
+    out = node(
+        _state(
+            plan=["读代码", "旧做法"],
+            plan_kinds=["explore", "implement"],
+            step_idx=1,
+        ),
+        {},
+    )
+
+    assert out["plan"] == ["读代码", "新做法"]
+    assert out["plan_kinds"] == ["explore", "implement"]
 
 
 def test_replan_goes_through_the_async_llm_api() -> None:
@@ -458,7 +479,11 @@ def test_review_block_at_the_cap_still_returns_a_changed_plan() -> None:
 
     out = node(_state(review={"status": "blocked"}, step_idx=1, replan_count=MAX_REPLANS), {})
 
-    assert out == {"plan": ["读代码"], "replan_count": MAX_REPLANS}
+    assert out == {
+        "plan": ["读代码"],
+        "plan_kinds": ["unknown"],
+        "replan_count": MAX_REPLANS,
+    }
     assert llm.calls == 0  # 到顶之后不再问模型
 
 

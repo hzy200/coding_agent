@@ -19,6 +19,11 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
+from coding_agent.agents.policy import (
+    RepoProfile,
+    delegation_policy,
+    profile_workspace,
+)
 from coding_agent.audit import AuditLogger, AuditRecord
 from coding_agent.audit import models as audit_models
 from coding_agent.audit.logger import now_iso, sanitize_args, truncate
@@ -29,6 +34,7 @@ from coding_agent.events import (
     AssistantToken,
     Event,
     FileChanged,
+    OrchestrationFinished,
     PlanCreated,
     PlanRevised,
     RepairStarted,
@@ -36,13 +42,23 @@ from coding_agent.events import (
     RunFailed,
     RunFinished,
     RunStarted,
+    SteeringApplied,
     StepFinished,
     StepStarted,
+    SubAgentFinished,
+    SubAgentStarted,
+    TaskGraphCreated,
+    TaskGraphExtended,
     ToolCallFinished,
     ToolCallStarted,
     Verification,
+    WorkerFinished,
+    WorkerStarted,
+    WorkflowRevised,
+    WorkflowSelected,
 )
 from coding_agent.graph.build import build_graph, estimate_recursion_limit
+from coding_agent.graph.nodes.approve import tool_level
 from coding_agent.memory.checkpointer import CheckpointStore
 from coding_agent.memory.longterm import LongTermMemory
 from coding_agent.memory.sessions import SessionIndex
@@ -57,12 +73,15 @@ from coding_agent.sandbox.snapshots import (
     SnapshotStore,
 )
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
+from coding_agent.steering import SteeringCommand, SteeringController
 from coding_agent.tools.artifacts import (
     CallArtifact,
     FileArtifact,
     ShellArtifact,
+    SubAgentArtifact,
     parse_artifact,
 )
+from coding_agent.tools.delegate import DELEGATE_EXPLORE
 from coding_agent.tools.shell import SHELL_TOOL_NAME
 
 # 只有这几个 action 才真正改动了文件，read 与空回滚不发 FileChanged
@@ -126,6 +145,14 @@ def _last_message(update: dict[str, Any]) -> Any:
     return messages[-1] if messages else None
 
 
+def _worker_key(result: dict[str, Any]) -> str:
+    """去重键：同一任务的重试是不同的 worker 运行。"""
+    return (
+        f"{result.get('worker_id', '')}:"
+        f"{int(result.get('attempt', 1) or 1)}"
+    )
+
+
 def _preview(text: str, limit: int = _PREVIEW_CHARS) -> str:
     text = text.strip()
     return text if len(text) <= limit else f"{text[:limit]}…"
@@ -173,6 +200,11 @@ class AgentRuntime:
         self._sandbox = WslSandbox(self.settings)
         self._workspace = normalize_root(workspace) if workspace else None
         self._graph: Any = None
+        # Phase 3D：用户干预队列。图节点与 runtime 共用同一实例；
+        # 不放进 state —— 它是外部输入，且 worker 需要在运行中非破坏性轮询。
+        self.steering = SteeringController()
+        # 仓库画像每个 runtime 只探一次；工作区在本实例生命周期内固定。
+        self._repo_profile_cache: RepoProfile | None = None
         self._snapshots: SnapshotStore | None = None
         self._memory: LongTermMemory | None = None
         self._fs: SandboxFs | None = None
@@ -208,6 +240,12 @@ class AgentRuntime:
             self._workspace = resolve_workspace(self.settings, self._sandbox)
         return self._workspace
 
+    def _repo_profile(self) -> RepoProfile:
+        """仓库画像（文件数/测试文件数），按 runtime 缓存。"""
+        if self._repo_profile_cache is None:
+            self._repo_profile_cache = profile_workspace(self._sandbox, self.workspace)
+        return self._repo_profile_cache
+
     @property
     def audit_path(self) -> Path:
         return self.audit.path
@@ -229,6 +267,7 @@ class AgentRuntime:
             "approval_mode": self.policy.approval_mode,
             "verify": self.settings.verify_command or "auto",
             "persistent": self.persistent,
+            "orchestrator": self.settings.orchestrator_enabled,
         }
 
     @property
@@ -321,6 +360,8 @@ class AgentRuntime:
         """
         self._pending_calls.pop(thread_id, None)
         self._progress.pop(thread_id, None)
+        # 一轮结束：未消费的迟到指令与暂停标记都作废。
+        self.steering.clear(thread_id)
 
     @property
     def effective_settings(self) -> Settings:
@@ -352,6 +393,7 @@ class AgentRuntime:
                 policy=self.policy,
                 # 与 runtime 共用一份沙箱：探测缓存挂在实例上，各建一份就各探一遍
                 sandbox=self._sandbox,
+                steering=self.steering,
             )
         return self._graph
 
@@ -386,51 +428,160 @@ class AgentRuntime:
             yield RunFailed(message=detail)
             return
 
+        # 成本策略 / 编排策略都需要仓库画像；只开启其中任一功能时才探一次。
+        profile = (
+            self._repo_profile()
+            if self.settings.explore_enabled or self.settings.orchestrator_enabled
+            else RepoProfile()
+        )
+        policy = delegation_policy(profile, self.settings)
+        execution_mode = "direct"
+        if (
+            self.settings.orchestrator_enabled
+            and profile.known
+            and profile.file_count >= self.settings.orchestrator_min_files
+        ):
+            execution_mode = "orchestrated"
+
         inputs = {
             "messages": [HumanMessage(content=prompt)],
             "cwd": self.workspace,
             "tool_rounds": 0,
             "budget_exhausted": False,
+            "dirty": False,
+            "run_dirty": False,
             "approvals": {},
             # 每轮都从文件重新读：会话中途 /remember 加的事实应当立刻生效
             "memories": memories,
+            "repo_profile": {
+                "file_count": profile.file_count,
+                "test_file_count": profile.test_file_count,
+            },
+            "delegation_allowed": policy.allowed,
+            "delegation_budget": policy.max_calls,
+            # 每次 run 重置编排字段，避免同一 thread 的上一轮结果串味
+            "execution_mode": execution_mode,
+            "workflow": "",
+            "workflow_reason": "",
+            "repo_summary": {},
+            "tasks": [],
+            "task_status": {},
+            "task_attempts": {},
+            "worker_results": [],
+            "orchestrator_round": 0,
+            "orchestrator_degraded": False,
+            "orchestrator_summary": "",
+            "orchestrator_completed": 0,
+            "orchestrator_failed": 0,
+            "worker_context": "",
+            "task_extensions_seen": 0,
+            "task_extensions_applied": [],
+            "task_extension_errors": [],
+            # 每次 run 复位 steering；指令队列本身也清空（上一轮的迟到命令
+            # 不该影响新一轮）。
+            "steering_cancelled": False,
+            "steering_replan": False,
+            "steering_replans": 0,
+            "steering_applied": [],
+            "workflow_revised_reason": "",
         }
+        self.steering.clear(thread_id)
         async for event in self._stream(
             inputs, thread_id=thread_id, fresh_run=True, prompt=prompt
         ):
             yield event
 
+    def _resume_limit_error(self, thread_id: str) -> str:
+        """恢复次数护栏；返回空串表示还可以恢复。
+
+        `recursion_limit` 每次图调用都会重置，所以「挂起-恢复」必须在编排层
+        封顶，否则前端可以无限续命。
+        """
+        count = self._resume_counts.get(thread_id, 0) + 1
+        self._resume_counts[thread_id] = count
+        if count <= self.settings.max_resumes:
+            return ""
+        return (
+            f"会话 {thread_id} 的中断/恢复次数已超过上限 "
+            f"{self.settings.max_resumes}，已停止。"
+        )
+
+    def _fail_resume(self, thread_id: str, detail: str) -> None:
+        try:
+            self._audit(
+                AuditRecord(
+                    ts=now_iso(),
+                    kind=audit_models.RUN_ERROR,
+                    thread_id=thread_id,
+                    detail=detail,
+                )
+            )
+        except Exception:  # noqa: BLE001, S110 - 已在错误路径上，不再二次抛出
+            pass
+        self._forget_thread(thread_id)
+
     async def resume(self, thread_id: str, decisions: dict[str, bool]) -> AsyncIterator[Event]:
         """带着审批结果继续被挂起的图。
 
         decisions: call_id -> 是否批准。缺失的按拒绝处理（fail closed）。
-
-        恢复次数有上限（`AGENT_MAX_RESUMES`）：每次 resume 是一次新的图调用，
-        `recursion_limit` 会重置，所以要在编排层封顶，防止反复挂起-恢复耗不尽。
         """
-        count = self._resume_counts.get(thread_id, 0) + 1
-        self._resume_counts[thread_id] = count
-        if count > self.settings.max_resumes:
-            detail = (
-                f"会话 {thread_id} 的中断/恢复次数已超过上限 "
-                f"{self.settings.max_resumes}，已停止。"
-            )
-            try:
-                self._audit(
-                    AuditRecord(
-                        ts=now_iso(),
-                        kind=audit_models.RUN_ERROR,
-                        thread_id=thread_id,
-                        detail=detail,
-                    )
-                )
-            except Exception:  # noqa: BLE001, S110 - 已在错误路径上，不再二次抛出
-                pass
-            self._forget_thread(thread_id)
+        detail = self._resume_limit_error(thread_id)
+        if detail:
+            self._fail_resume(thread_id, detail)
             yield RunFailed(message=detail)
             return
 
         command = Command(resume=dict(decisions))
+        async for event in self._stream(command, thread_id=thread_id, fresh_run=False):
+            yield event
+
+    def steer(
+        self,
+        thread_id: str,
+        action: str,
+        *,
+        text: str = "",
+        role: str = "explore",
+        source: str = "user",
+    ) -> None:
+        """提交一条运行中干预指令（TUI 的 /pause /cancel /add /replan）。
+
+        指令在**节点边界**消费；pause/resume 通过 checkpoint 挂起与恢复。
+        审计在**提交时**落账（来源/时间/动作），即使进程随后重启也能追溯。
+        """
+        command = SteeringCommand(
+            action=action,
+            text=text,
+            role=role,
+            source=source,
+            ts=now_iso(),
+        )
+        detail = action if not text else f"{action}: {text}"
+        self._audit(
+            AuditRecord(
+                ts=now_iso(),
+                kind=audit_models.STEERING,
+                thread_id=thread_id,
+                detail=truncate(detail),
+                source=source,
+            )
+        )
+        self.steering.submit(thread_id, command)
+
+    def is_paused(self, thread_id: str) -> bool:
+        """图是否停在 steering 的 pause 上（同一进程内）。"""
+        return self.steering.is_paused(thread_id)
+
+    async def resume_steering(self, thread_id: str) -> AsyncIterator[Event]:
+        """从 steering pause 恢复。审批恢复请走 `resume()`。"""
+        detail = self._resume_limit_error(thread_id)
+        if detail:
+            self._fail_resume(thread_id, detail)
+            yield RunFailed(message=detail)
+            return
+
+        yield SteeringApplied(action="resume", detail="从暂停处继续")
+        command = Command(resume={"steering": "resume"})
         async for event in self._stream(command, thread_id=thread_id, fresh_run=False):
             yield event
 
@@ -446,6 +597,8 @@ class AgentRuntime:
                 settings.max_tool_rounds,
                 settings.max_repair_rounds,
                 settings.max_replans,
+                orchestrator_enabled=settings.orchestrator_enabled,
+                orchestrator_max_rounds=settings.orchestrator_max_rounds,
             ),
             # 这些会随 trace 一起上报，LangSmith 里可按会话/工作区/权限筛选
             "run_name": f"agent:{thread_id}",
@@ -469,6 +622,7 @@ class AgentRuntime:
         input_tokens = int(progress.get("input_tokens", 0))
         output_tokens = int(progress.get("output_tokens", 0))
         plan: list[str] = progress.setdefault("plan", [])
+        plan_kinds: list[str] = progress.setdefault("plan_kinds", [])
         step_idx: int = progress.get("step_idx", 0)
         interrupted = False
         # 最近一次验证结果：repair 事件要带上它说明「在修什么」
@@ -518,8 +672,41 @@ class AgentRuntime:
 
             graph = await self._ensure_graph()
             async for mode, data in graph.astream(
-                payload, config, stream_mode=["messages", "updates"]
+                payload, config, stream_mode=["messages", "updates", "custom"]
             ):
+                if mode == "custom":
+                    # Phase 4：dispatch 通过 get_stream_writer 实时推送 worker
+                    # 开始/结束；updates 分支只补齐没被流式发过的事件。
+                    payload_data = data if isinstance(data, dict) else {}
+                    kind = str(payload_data.get("type", ""))
+                    if kind == "worker_started":
+                        key = _worker_key(payload_data)
+                        seen = progress.setdefault("worker_started_keys", set())
+                        if key not in seen:
+                            seen.add(key)
+                            yield WorkerStarted(
+                                worker_id=str(
+                                    payload_data.get("worker_id", "")
+                                ),
+                                task_id=str(payload_data.get("task_id", "")),
+                                role=str(payload_data.get("role", "")),
+                                goal=str(payload_data.get("goal", "")),
+                                attempt=int(payload_data.get("attempt", 1)),
+                            )
+                    elif kind == "worker_finished":
+                        result = payload_data.get("result") or {}
+                        key = _worker_key(result)
+                        seen = progress.setdefault(
+                            "worker_finished_keys", set()
+                        )
+                        if key not in seen:
+                            seen.add(key)
+                            for event in self._worker_events(
+                                result, thread_id, progress
+                            ):
+                                yield event
+                    continue
+
                 if mode == "messages":
                     chunk, meta = data
                     node = meta.get("langgraph_node", "")
@@ -534,18 +721,43 @@ class AgentRuntime:
                 suspension = data.get("__interrupt__")
                 if suspension:
                     interrupted = True
-                    for request in self._interrupt_requests(suspension):
-                        yield request
+                    for item in suspension:
+                        payload = getattr(item, "value", None) or {}
+                        if payload.get("steering") == "pause":
+                            yield SteeringApplied(
+                                action="pause",
+                                detail=str(payload.get("message", "")),
+                            )
+                        else:
+                            for request in self._interrupt_requests([item]):
+                                yield request
                     continue
 
                 for node, update in data.items():
                     if not isinstance(update, dict):
                         continue
 
+                    # Phase 3D：四个 steering 消费点共用同一套事件载荷。
+                    if node.startswith("steering"):
+                        for applied in update.get("steering_applied") or []:
+                            yield SteeringApplied(
+                                action=str(applied.get("action", "")),
+                                task_id=str(applied.get("task_id", "")),
+                                detail=str(applied.get("detail", "")),
+                            )
+                        if update.get("steering_cancelled"):
+                            for event in _close_step(cancelled=True):
+                                yield event
+                        continue
+
                     if node == "planner":
                         plan = [s for s in (update.get("plan") or []) if s]
+                        plan_kinds = [
+                            str(k) for k in (update.get("plan_kinds") or [])
+                        ]
                         step_idx = 0
                         progress["plan"] = plan
+                        progress["plan_kinds"] = plan_kinds
                         progress["step_idx"] = 0
                         if plan:
                             # 降级必须同时进事件与审计：只在事件里说的话，
@@ -557,14 +769,150 @@ class AgentRuntime:
                                     kind=audit_models.PLAN,
                                     thread_id=thread_id,
                                     steps=plan,
+                                    kinds=plan_kinds or None,
                                     detail=_PLAN_DEGRADED_DETAIL if degraded else "",
                                 )
                             )
-                            yield PlanCreated(steps=plan, degraded=degraded)
+                            yield PlanCreated(
+                                steps=plan, kinds=plan_kinds, degraded=degraded
+                            )
                         for event in _open_step(
                             0, max(len(plan), 1), plan[0] if plan else ""
                         ):
                             yield event
+
+                    elif node == "select_workflow":
+                        if "workflow" not in update:
+                            continue
+                        workflow = str(update.get("workflow", ""))
+                        reason = str(update.get("workflow_reason", ""))
+                        progress["workflow"] = workflow
+                        self._audit(
+                            AuditRecord(
+                                ts=now_iso(),
+                                kind=audit_models.WORKFLOW,
+                                thread_id=thread_id,
+                                workflow=workflow,
+                                detail=truncate(reason),
+                            )
+                        )
+                        yield WorkflowSelected(workflow=workflow, reason=reason)
+
+                    elif node == "plan_tasks":
+                        tasks = update.get("tasks") or []
+                        if "tasks" not in update:
+                            continue
+                        degraded = bool(update.get("orchestrator_degraded"))
+                        degradation_note = str(
+                            update.get("orchestrator_summary", "")
+                        ).strip()
+                        self._audit(
+                            AuditRecord(
+                                ts=now_iso(),
+                                kind=audit_models.TASK_GRAPH,
+                                thread_id=thread_id,
+                                workflow=progress.get("workflow"),
+                                steps=[
+                                    str(task.get("goal", "")) for task in tasks
+                                ],
+                                detail=(
+                                    "任务图已降级"
+                                    + (f"：{degradation_note}" if degradation_note else "")
+                                    if degraded
+                                    else ""
+                                ),
+                            )
+                        )
+                        yield TaskGraphCreated(tasks=tasks, degraded=degraded)
+                        revised_reason = str(
+                            update.get("workflow_revised_reason") or ""
+                        )
+                        if revised_reason:
+                            yield WorkflowRevised(
+                                reason=revised_reason, tasks=tasks
+                            )
+
+                    elif node == "extend_tasks":
+                        added = update.get("task_extensions_applied") or []
+                        rejected = update.get("task_extension_errors") or []
+                        if added or rejected:
+                            if added:
+                                self._audit(
+                                    AuditRecord(
+                                        ts=now_iso(),
+                                        kind=audit_models.TASK_GRAPH,
+                                        thread_id=thread_id,
+                                        workflow=progress.get("workflow"),
+                                        steps=[
+                                            str(task.get("goal", ""))
+                                            for task in added
+                                        ],
+                                        detail=(
+                                            f"运行中扩展 {len(added)} 个只读任务"
+                                            + (
+                                                f"；拒绝 {len(rejected)} 个"
+                                                if rejected
+                                                else ""
+                                            )
+                                        ),
+                                    )
+                                )
+                            yield TaskGraphExtended(
+                                added=added, rejected=rejected
+                            )
+
+                    elif node == "dispatch":
+                        results = update.get("worker_results") or []
+                        emitted = int(progress.get("workers_emitted", 0))
+                        fresh = results[emitted:]
+                        # custom 流已经实时发过的事件不再重复；直接调用节点
+                        # （单测）没有 custom writer 时，这里负责补齐。
+                        started_seen = progress.setdefault(
+                            "worker_started_keys", set()
+                        )
+                        finished_seen = progress.setdefault(
+                            "worker_finished_keys", set()
+                        )
+                        for result in fresh:
+                            key = _worker_key(result)
+                            if key in started_seen:
+                                continue
+                            started_seen.add(key)
+                            yield WorkerStarted(
+                                worker_id=str(result.get("worker_id", "")),
+                                task_id=str(result.get("task_id", "")),
+                                role=str(result.get("role", "")),
+                                goal=str(result.get("goal", "")),
+                                attempt=int(result.get("attempt", 1)),
+                            )
+                        for result in fresh:
+                            key = _worker_key(result)
+                            if key in finished_seen:
+                                continue
+                            finished_seen.add(key)
+                            for event in self._worker_events(
+                                result, thread_id, progress
+                            ):
+                                yield event
+                        progress["workers_emitted"] = len(results)
+
+                    elif node == "synthesize":
+                        completed = int(update.get("orchestrator_completed", 0))
+                        failed = int(update.get("orchestrator_failed", 0))
+                        summary = str(update.get("orchestrator_summary", ""))
+                        self._audit(
+                            AuditRecord(
+                                ts=now_iso(),
+                                kind=audit_models.ORCHESTRATION,
+                                thread_id=thread_id,
+                                workflow=progress.get("workflow"),
+                                ok=failed == 0,
+                                detail=truncate(summary),
+                            )
+                        )
+                        yield OrchestrationFinished(
+                            completed=completed, failed=failed, summary=summary
+                        )
 
                     elif node == "advance":
                         # 先收口再推进：补发的 StepFinished 必须带**旧**的 index，
@@ -583,22 +931,29 @@ class AgentRuntime:
                         if "plan" not in update:
                             continue
                         revised = [s for s in (update.get("plan") or []) if s]
+                        plan_kinds = [
+                            str(k) for k in (update.get("plan_kinds") or [])
+                        ]
                         detail = (
                             f"剩余 {max(len(plan) - step_idx, 0)} 步"
                             f" → {max(len(revised) - step_idx, 0)} 步"
                         )
                         plan = revised
                         progress["plan"] = plan
+                        progress["plan_kinds"] = plan_kinds
                         self._audit(
                             AuditRecord(
                                 ts=now_iso(),
                                 kind=audit_models.REPLAN,
                                 thread_id=thread_id,
                                 steps=plan,
+                                kinds=plan_kinds or None,
                                 detail=detail,
                             )
                         )
-                        yield PlanRevised(steps=plan, step_idx=step_idx)
+                        yield PlanRevised(
+                            steps=plan, kinds=plan_kinds, step_idx=step_idx
+                        )
                         # 计划被砍到当前这步之前（含当前这步）时，路由会直接去收尾，
                         # act 再也不跑 —— 这一步必须在这里收口，否则前端的进度条
                         # 永远停在「进行中」
@@ -622,6 +977,15 @@ class AgentRuntime:
                             )
                             pending[started.call_id] = started
                             yield started
+                            # 与 ToolCallStarted 并列：delegate 本身也是一次工具调用，
+                            # 但前端需要知道「这是一次委派、目标是什么」。
+                            if started.name == DELEGATE_EXPLORE:
+                                yield SubAgentStarted(
+                                    agent_id=started.call_id,
+                                    parent_call_id=started.call_id,
+                                    role="explore",
+                                    goal=str(dict(call.get("args") or {}).get("goal", "")),
+                                )
                         if not calls:
                             step_open = False
                             progress["step_open"] = False
@@ -637,6 +1001,34 @@ class AgentRuntime:
                             started = pending.pop(finished.call_id, None)
                             self._audit_tool_call(started, finished, thread_id)
                             yield finished
+
+                            if started is not None and started.name == DELEGATE_EXPLORE:
+                                artifact = parse_artifact(
+                                    getattr(message, "artifact", None)
+                                )
+                                if isinstance(artifact, SubAgentArtifact):
+                                    # 子智能体的 token 也算进本轮总量：不记的话，
+                                    # 开启委派后成本会系统性偏低。
+                                    input_tokens += artifact.input_tokens
+                                    output_tokens += artifact.output_tokens
+                                    progress["input_tokens"] = input_tokens
+                                    progress["output_tokens"] = output_tokens
+                                    self._audit_subagent(artifact, thread_id)
+                                    yield self._subagent_finished(artifact)
+                                else:
+                                    # 被拒 / 预算耗尽 / 子智能体异常：没有结构化产物，
+                                    # 但 started 已经发过，必须配对收口。
+                                    # `rejected` 与 `failed` 必须分开：前者是宿主
+                                    # 没让它跑（预算/审批），后者是跑了但没成。
+                                    yield SubAgentFinished(
+                                        agent_id=started.call_id,
+                                        status=(
+                                            "rejected" if finished.rejected else "failed"
+                                        ),
+                                        summary=_preview(
+                                            str(getattr(message, "content", ""))
+                                        ),
+                                    )
 
                             changed = self._file_changed(message)
                             if changed is not None:
@@ -757,11 +1149,23 @@ class AgentRuntime:
             # 补发一个，免得前端把它显示成「仍在运行」
             for event in _close_step(cancelled=True):
                 yield event
+            worker_in = (
+                int(progress.get("worker_input_tokens", 0))
+                if progress.get("worker_tokens_reported")
+                else None
+            )
+            worker_out = (
+                int(progress.get("worker_output_tokens", 0))
+                if progress.get("worker_tokens_reported")
+                else None
+            )
             self._forget_thread(thread_id)
             yield RunFailed(
                 message=f"{type(exc).__name__}: {exc}",
                 input_tokens=input_tokens or None,
                 output_tokens=output_tokens or None,
+                worker_input_tokens=worker_in,
+                worker_output_tokens=worker_out,
             )
             return
 
@@ -785,12 +1189,24 @@ class AgentRuntime:
         # 跑（计划被砍、异常恢复等），这里补上，保证 StepStarted 一定有配对
         for event in _close_step(cancelled=True):
             yield event
+        worker_in = (
+            int(progress.get("worker_input_tokens", 0))
+            if progress.get("worker_tokens_reported")
+            else None
+        )
+        worker_out = (
+            int(progress.get("worker_output_tokens", 0))
+            if progress.get("worker_tokens_reported")
+            else None
+        )
         self._forget_thread(thread_id)
         yield RunFinished(
             thread_id=thread_id,
             answer=final,
             input_tokens=input_tokens or None,
             output_tokens=output_tokens or None,
+            worker_input_tokens=worker_in,
+            worker_output_tokens=worker_out,
         )
 
     # ------------------------------------------------------------------
@@ -925,6 +1341,51 @@ class AgentRuntime:
             )
         )
 
+    def _audit_subagent(self, artifact: SubAgentArtifact, thread_id: str) -> None:
+        """把一次子智能体运行记进审计。
+
+        - 一条 `subagent` 汇总记录（目标、状态、摘要、token）；
+        - 子智能体实际执行的每个只读工具一条 `tool_call` 记录。
+          没有后者的话，主审计里只能看到一次 delegate，子智能体读了什么完全不可见。
+        """
+        verdict = (
+            True
+            if artifact.status == "success"
+            else False if artifact.status == "failed" else None
+        )
+        self._audit(
+            AuditRecord(
+                ts=now_iso(),
+                kind=audit_models.SUBAGENT,
+                thread_id=thread_id,
+                agent_id=artifact.agent_id,
+                parent_call_id=artifact.parent_call_id or None,
+                task=truncate(artifact.goal),
+                ok=verdict,
+                detail=truncate(artifact.summary),
+                input_tokens=artifact.input_tokens or None,
+                output_tokens=artifact.output_tokens or None,
+                duration_ms=artifact.duration_ms,
+            )
+        )
+        for call in artifact.tool_calls:
+            self._audit(
+                AuditRecord(
+                    ts=now_iso(),
+                    kind=audit_models.TOOL_CALL,
+                    thread_id=thread_id,
+                    call_id=str(call.get("call_id", "")),
+                    tool=str(call.get("name", "")),
+                    args=sanitize_args(dict(call.get("args") or {})),
+                    level="L0 只读",
+                    decision=audit_models.DECISION_AUTO,
+                    ok=bool(call.get("ok")),
+                    duration_ms=call.get("duration_ms"),
+                    agent_id=artifact.agent_id,
+                    parent_call_id=artifact.parent_call_id or None,
+                )
+            )
+
     def _audit_file_change(self, changed: FileChanged, thread_id: str) -> None:
         self._audit(
             AuditRecord(
@@ -960,6 +1421,104 @@ class AgentRuntime:
                     )
                 )
         return requests
+
+    def _worker_events(
+        self,
+        result: dict[str, Any],
+        thread_id: str,
+        progress: dict[str, Any],
+    ) -> Iterator[Event]:
+        """一个 worker 结果 → WorkerFinished + 审计（custom/updates 共用）。
+
+        只在结果首次被消费时调用；调用方用 `_worker_key` 去重。
+        """
+        status = str(result.get("status", ""))
+        input_tokens = int(result.get("input_tokens") or 0)
+        output_tokens = int(result.get("output_tokens") or 0)
+        if input_tokens or output_tokens:
+            progress["worker_input_tokens"] = (
+                int(progress.get("worker_input_tokens", 0)) + input_tokens
+            )
+            progress["worker_output_tokens"] = (
+                int(progress.get("worker_output_tokens", 0)) + output_tokens
+            )
+            progress["worker_tokens_reported"] = True
+
+        yield WorkerFinished(
+            worker_id=str(result.get("worker_id", "")),
+            task_id=str(result.get("task_id", "")),
+            role=str(result.get("role", "")),
+            status=status,
+            summary=str(result.get("summary", "")),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            duration_ms=int(result.get("duration_ms") or 0),
+            attempt=int(result.get("attempt", 1)),
+            merged=bool(result.get("merged")),
+            merge_error=str(result.get("merge_error", "")),
+            tool_calls=len(result.get("tool_calls") or []),
+        )
+        self._audit(
+            AuditRecord(
+                ts=now_iso(),
+                kind=audit_models.WORKER,
+                thread_id=thread_id,
+                task_id=str(result.get("task_id", "")),
+                role=str(result.get("role", "")),
+                worker_id=str(result.get("worker_id", "")),
+                attempt=int(result.get("attempt", 1)),
+                merged=bool(result.get("merged")),
+                ok=(
+                    True
+                    if status == "success"
+                    else False
+                    if status == "failed"
+                    else None
+                ),
+                detail=truncate(
+                    str(result.get("summary", ""))
+                    + (
+                        f" | error={result.get('error')}"
+                        if result.get("error")
+                        else ""
+                    )
+                    + (
+                        " | snapshots="
+                        + ",".join(
+                            str(item)
+                            for item in (result.get("snapshot_ids") or [])
+                        )
+                        if result.get("snapshot_ids")
+                        else ""
+                    )
+                ),
+                input_tokens=input_tokens or None,
+                output_tokens=output_tokens or None,
+                duration_ms=int(result.get("duration_ms") or 0),
+            )
+        )
+        # worker 内部的工具调用逐条落账；否则子智能体改了哪些文件只存在于
+        # 摘要里，审计无法追溯。
+        for call in result.get("tool_calls") or []:
+            call_name = str(call.get("name", ""))
+            call_args = dict(call.get("args") or {})
+            level = tool_level(call_name, call_args)
+            self._audit(
+                AuditRecord(
+                    ts=now_iso(),
+                    kind=audit_models.TOOL_CALL,
+                    thread_id=thread_id,
+                    call_id=str(call.get("call_id", "")),
+                    tool=call_name,
+                    args=sanitize_args(call_args),
+                    level=level.label,
+                    decision=audit_models.DECISION_AUTO,
+                    ok=bool(call.get("ok")),
+                    duration_ms=call.get("duration_ms"),
+                    agent_id=str(result.get("worker_id", "")) or None,
+                    task_id=str(result.get("task_id", "")) or None,
+                )
+            )
 
     def _tool_started(self, name: str, args: dict[str, Any], call_id: str = "") -> ToolCallStarted:
         # 这里重新判一次等级纯粹是为了给前端着色；真正的放行/拒绝在工具内部，
@@ -1019,12 +1578,39 @@ class AgentRuntime:
                 preview=preview,
             )
 
+        if isinstance(artifact, SubAgentArtifact):
+            return ToolCallFinished(
+                call_id=call_id,
+                name=name,
+                # 只有 success 才算真正完成；partial 仍会把摘要给模型，
+                # 但审计与事件都不该把它记成「通过」。
+                ok=artifact.status == "success",
+                rejected=False,
+                decision=artifact.decision,
+                duration_ms=artifact.duration_ms,
+                level="探索子智能体",
+                preview=preview,
+            )
+
         # 未提供 artifact 的工具：只能从文本粗判成败。新工具都应带 artifact。
         return ToolCallFinished(
             call_id=call_id,
             name=name,
             ok=not content.startswith(_FAILURE_MARKERS),
             preview=preview,
+        )
+
+    @staticmethod
+    def _subagent_finished(artifact: SubAgentArtifact) -> SubAgentFinished:
+        return SubAgentFinished(
+            agent_id=artifact.agent_id,
+            status=artifact.status,
+            summary=artifact.summary,
+            relevant_files=list(artifact.relevant_files),
+            findings=list(artifact.findings),
+            input_tokens=artifact.input_tokens,
+            output_tokens=artifact.output_tokens,
+            duration_ms=artifact.duration_ms,
         )
 
     @staticmethod
@@ -1055,6 +1641,7 @@ class AgentRuntime:
             ok=_verification_verdict(raw),
             summary=str(raw.get("summary", "")),
             issues=issues,
+            failed_tests=[str(t) for t in (raw.get("failed_tests") or [])],
         )
 
     @staticmethod

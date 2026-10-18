@@ -178,9 +178,14 @@ async def _run_all(
 
 
 def _short_mechanism(result) -> str:  # noqa: ANN001 - TaskResult，避免循环导入注解
-    if not result.verifications:
-        return "未触发"
-    return "+".join(f"{k}×{v}" for k, v in sorted(result.verifications.items()))
+    parts = []
+    if result.verifications:
+        parts.append("+".join(f"{k}×{v}" for k, v in sorted(result.verifications.items())))
+    if getattr(result, "subagents", 0):
+        parts.append(f"sub×{result.subagents}")
+    if getattr(result, "workers", 0):
+        parts.append(f"worker×{result.workers}")
+    return " ".join(parts) or "未触发"
 
 
 def _print_summary(summary: dict) -> None:
@@ -208,6 +213,53 @@ def _print_summary(summary: dict) -> None:
         )
         print(f"    token：{tokens}"
               f"（{mechanism.get('tasks_reporting_tokens', 0)}/{summary['total']} 个任务有回报）")
+        print(
+            f"    子智能体：{mechanism.get('subagents', 0)} 次"
+            f"（{mechanism.get('tasks_with_subagents', 0)} 个任务）"
+            f"   最大同批：{mechanism.get('max_delegate_batch', 0)}"
+            f"   状态：{mechanism.get('subagent_statuses') or '{}'}"
+        )
+        if mechanism.get("subagent_input_tokens") is not None:
+            print(
+                f"      子智能体 token：in {mechanism['subagent_input_tokens']} "
+                f"/ out {mechanism['subagent_output_tokens']}"
+            )
+        if mechanism.get("workflows") or mechanism.get("workers"):
+            print(
+                f"    编排：工作流 {mechanism.get('workflows') or '{}'}"
+                f"   任务 {mechanism.get('tasks_planned', 0)}"
+                f"   worker {mechanism.get('workers', 0)}"
+                f"（最大同批 {mechanism.get('max_worker_batch', 0)}）"
+                f"   角色 {mechanism.get('worker_roles') or '{}'}"
+                f"   状态 {mechanism.get('worker_statuses') or '{}'}"
+                f"   重试 {mechanism.get('worker_retries', 0)}"
+                f"   worker 工具 {mechanism.get('worker_tool_calls', 0)}"
+            )
+            worker_tokens = (
+                f"in {mechanism.get('worker_input_tokens')} "
+                f"/ out {mechanism.get('worker_output_tokens')}"
+                if mechanism.get("worker_input_tokens") is not None
+                else "未回报"
+            )
+            total_tokens = (
+                f"in {mechanism.get('total_input_tokens')} "
+                f"/ out {mechanism.get('total_output_tokens')}"
+                if mechanism.get("total_input_tokens") is not None
+                else "未回报"
+            )
+            print(
+                f"    worker token：{worker_tokens}"
+                f"   总 token（主 + worker）：{total_tokens}"
+            )
+            print(
+                f"    worker 秒 {mechanism.get('worker_seconds', 0)}"
+                f"   并行度 {mechanism.get('worker_parallelism')}"
+                f"   合并 {mechanism.get('worker_merged', 0)}"
+                f"/{mechanism.get('worker_merge_attempts', 0)}"
+                f"（成功率 {mechanism.get('merge_success_rate')}）"
+                f"   冲突 {mechanism.get('worker_conflicts', 0)}"
+                f"（冲突率 {mechanism.get('conflict_rate')}）"
+            )
 
 
 def _ab(
@@ -401,6 +453,21 @@ def main(argv: list[str] | None = None) -> int:
     summary["review_enabled"] = settings.review_enabled
     # 同样是会改变 agent 行为、从而改变机制指标的开关 —— 开与关的数字不可比
     summary["nudge_empty_steps"] = settings.nudge_empty_steps
+    # 子智能体会把探索挪进独立上下文：主工具轮次/上下文占用都会变，
+    # 开与关的通过率与 token 不可直接对照。
+    summary["explore_enabled"] = settings.explore_enabled
+    # 并发度影响墙钟与 WSL 进程压力；记录它，避免把不同的并发配置当同一基线。
+    summary["max_concurrent_agents"] = settings.max_concurrent_agents
+    # Phase 3A：编排开关与预算会改变工作流/机制指标，必须一起报。
+    summary["orchestrator_enabled"] = settings.orchestrator_enabled
+    summary["orchestrator_max_tasks"] = settings.orchestrator_max_tasks
+    summary["orchestrator_max_concurrent_workers"] = (
+        settings.orchestrator_max_concurrent_workers
+    )
+    summary["orchestrator_task_retries"] = settings.orchestrator_task_retries
+    summary["orchestrator_write_enabled"] = settings.orchestrator_write_enabled
+    summary["orchestrator_worker_rounds"] = settings.orchestrator_worker_rounds
+    summary["orchestrator_worker_repairs"] = settings.orchestrator_worker_repairs
     # 口径戳：这份数字属于哪个套件、有没有被 --only 收窄
     summary["suite"] = args.suite
     summary["subset_filter"] = args.only or ""

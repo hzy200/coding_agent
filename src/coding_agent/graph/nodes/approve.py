@@ -19,6 +19,7 @@ from coding_agent.graph.state import AgentState
 from coding_agent.sandbox.policy import APPROVED, ASK, DENIED, SessionPolicy
 from coding_agent.sandbox.policy import CommandLevel as _Level
 from coding_agent.sandbox.policy import classify as _classify
+from coding_agent.tools.delegate import DELEGATE_EXPLORE
 from coding_agent.tools.deps import DEPS_INSTALL, DEPS_LIST
 from coding_agent.tools.files import (
     EDIT_TOOL_NAME,
@@ -31,9 +32,20 @@ from coding_agent.tools.search import FIND_FILES, SEARCH_CODE
 from coding_agent.tools.shell import SHELL_TOOL_NAME
 from coding_agent.tools.testrun import RUN_TESTS_TOOL
 
-# 只读工具：无条件放行
+# 只读工具：无条件放行。
+# `delegate_explore` 也算只读：它只是把只读工具的执行挪进子智能体，
+# 子智能体侧另有白名单断言（EXPLORE_TOOL_NAMES），不存在写路径。
 _READ_TOOLS = frozenset(
-    {READ_TOOL_NAME, GIT_STATUS, GIT_DIFF, GIT_LOG, DEPS_LIST, SEARCH_CODE, FIND_FILES}
+    {
+        READ_TOOL_NAME,
+        GIT_STATUS,
+        GIT_DIFF,
+        GIT_LOG,
+        DEPS_LIST,
+        SEARCH_CODE,
+        FIND_FILES,
+        DELEGATE_EXPLORE,
+    }
 )
 
 # 低风险写：由 --write 一次性授权，不逐条询问。
@@ -71,6 +83,8 @@ def _describe(name: str, args: dict[str, Any]) -> str:
         return f"git add {' '.join(args.get('paths') or [])}"
     if name == RUN_TESTS_TOOL:
         return "运行本项目的测试"
+    if name == DELEGATE_EXPLORE:
+        return f"探索：{args.get('goal', '')}"
     return str(args.get("path") or args.get("command") or name)
 
 

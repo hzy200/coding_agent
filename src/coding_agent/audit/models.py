@@ -21,6 +21,12 @@ VERIFY = "verify"
 REVIEW = "review"
 NUDGE = "nudge"
 REPAIR = "repair"
+SUBAGENT = "subagent"
+WORKFLOW = "workflow"
+TASK_GRAPH = "task_graph"
+WORKER = "worker"
+ORCHESTRATION = "orchestration"
+STEERING = "steering"
 RUN_END = "run_end"
 RUN_ERROR = "run_error"
 
@@ -50,6 +56,9 @@ class AuditRecord(BaseModel):
 
     # ---- plan / run ----
     steps: list[str] = Field(default_factory=list)
+    # 与 steps 逐项对齐的步骤类型（explore / implement / verify / unknown）。
+    # 只在 plan/replan 记录里出现；None 会被 exclude_none 省略。
+    kinds: list[str] | None = None
     # 提示词与最终答复都可能很长，落库前已截断
     detail: str = ""
 
@@ -63,3 +72,21 @@ class AuditRecord(BaseModel):
     added: int = 0
     removed: int = 0
     snapshot_id: str | None = None
+
+    # ---- subagent / 子智能体产生的工具调用 ----
+    # 子智能体的动作必须能追溯到「哪个委派、哪个子 agent」，否则主审计里
+    # 只看到一次 delegate 调用，实际读了哪些文件完全不可见。
+    agent_id: str | None = None
+    parent_call_id: str | None = None
+    task: str | None = None
+
+    # ---- steering：干预来源（user / system / test）----
+    source: str | None = None
+
+    # ---- orchestrator / worker ----
+    workflow: str | None = None
+    task_id: str | None = None
+    role: str | None = None
+    worker_id: str | None = None
+    attempt: int | None = None
+    merged: bool | None = None

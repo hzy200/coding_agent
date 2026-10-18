@@ -22,9 +22,11 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
+from coding_agent.graph.plan import UNKNOWN, PlanStepModel, align_kinds
 from coding_agent.graph.state import AgentState
 from coding_agent.llm.deepseek import with_json_output
 from coding_agent.llm.prompts import (
+    PLANNER_DELEGATION_NOTE,
     PLANNER_PERMISSION_READONLY,
     PLANNER_PERMISSION_WRITE,
     PLANNER_PROMPT,
@@ -35,9 +37,9 @@ from coding_agent.messages import last_human_text
 class TaskPlan(BaseModel):
     """规划结果。"""
 
-    steps: list[str] = Field(
+    steps: list[PlanStepModel] = Field(
         default_factory=list,
-        description="有序子任务列表，每项一句话，描述做什么以及如何算完成",
+        description="有序子任务列表，每项含 text 与 kind",
     )
 
 
@@ -46,42 +48,71 @@ def make_planner_node(
     *,
     max_steps: int,
     allow_write: bool,
+    delegate_enabled: bool = False,
 ) -> Callable[[AgentState, RunnableConfig], Awaitable[dict[str, Any]]]:
     structured = with_json_output(llm, TaskPlan).with_retry(stop_after_attempt=3)
-    prompt = PLANNER_PROMPT.format(
-        max_steps=max_steps,
-        permission_note=PLANNER_PERMISSION_WRITE if allow_write else PLANNER_PERMISSION_READONLY,
+    permission_note = (
+        PLANNER_PERMISSION_WRITE if allow_write else PLANNER_PERMISSION_READONLY
     )
 
     async def plan(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         request = last_human_text(state["messages"])
+        worker_context = str(state.get("worker_context") or "").strip()
+        if worker_context:
+            request = f"{request}\n\n{worker_context}"
         degraded = False
+        # 委派提示依赖本次运行的仓库规模策略，所以按调用时组装。
+        delegation_note = (
+            PLANNER_DELEGATION_NOTE
+            if delegate_enabled and state.get("delegation_allowed", True)
+            else ""
+        )
+        prompt = PLANNER_PROMPT.format(
+            max_steps=max_steps,
+            permission_note=permission_note,
+            delegation_note=delegation_note,
+        )
         try:
             result = await structured.ainvoke(
                 [SystemMessage(content=prompt), HumanMessage(content=request)],
                 config,
             )
-            steps = [s.strip() for s in (result.steps or []) if s.strip()][:max_steps]
+            parsed = [
+                (step.text.strip(), step.kind)
+                for step in (result.steps or [])
+                if step.text and step.text.strip()
+            ][:max_steps]
+            steps = [text for text, _kind in parsed]
+            kinds = [kind for _text, kind in parsed]
         except Exception:  # noqa: BLE001 - 规划失败不能拖垮整张图
             steps = []
+            kinds = []
             degraded = True
 
         if not steps:
             steps = [request or "完成用户请求"]
+            # 降级计划不知道任务类型：用 unknown 保留原有的宽松行为，
+            # 避免把只读问答误判成「必须改文件」。
+            kinds = [UNKNOWN]
             # 模型给了合法 JSON 但 steps 为空，同样是「没规划出来」，
             # 与抛异常走的是同一条降级路径，也要如实标记。
             degraded = True
 
         return {
             "plan": steps,
+            "plan_kinds": align_kinds(steps, kinds),
             "plan_degraded": degraded,
             "step_idx": 0,
             # 两个重规划额度都是整个任务的，开局归零
             "replan_count": 0,
             "tweak_count": 0,
+            # 子智能体委派次数同样是任务级的（不是每步）
+            "delegate_calls": 0,
             "tool_rounds": 0,
             "budget_exhausted": False,
             "dirty": False,
+            # run_dirty 是**整轮**的：orchestrator 合并写 worker 的补丁后会置 True，
+            # planner 不能把它清掉（新一轮由 runtime.run 的 inputs 重置）。
             "empty_step_nudged": False,
             "verification": {},
             "review": {},
@@ -89,6 +120,9 @@ def make_planner_node(
             # 只有这里归零，advance / repair 都不许碰它（详见 graph/state.py）。
             "review_watermark": "",
             "retry": 0,
+            "same_failure_count": 0,
+            "last_failure_signature": "",
+            "last_verification": {},
         }
 
     return plan

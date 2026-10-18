@@ -23,6 +23,14 @@ from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 
+from coding_agent.graph.plan import (
+    EXPLORE,
+    IMPLEMENT,
+    current_step_kind,
+)
+from coding_agent.graph.plan import (
+    VERIFY as VERIFY_KIND,
+)
 from coding_agent.graph.state import AgentState
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
 from coding_agent.tools.testrun import run_verification
@@ -41,10 +49,65 @@ def make_verify_node(
     root = root or resolve_workspace(sandbox.settings, sandbox)
 
     def verify(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-        if not sandbox.settings.verify_enabled or not state.get("dirty"):
+        if not sandbox.settings.verify_enabled:
             return {"verification": {}}
 
-        result = run_verification(sandbox, root, allow_manifest=False)
-        return {"verification": result.model_dump()}
+        kind = current_step_kind(state)
+        # 探索步是只读的。即便某条 shell 命令被误判成写（dirty=True），
+        # 也不该让它跑全量测试 —— 后续实现/验证步会兜住真正的问题。
+        if kind == EXPLORE:
+            return {"verification": {}}
+
+        # kind=verify 的步骤就是用来跑全量验证的：即使这一步没有新改动
+        # （dirty=False，比如前面的实现步已经写完），也要跑。
+        if kind != VERIFY_KIND and not state.get("dirty"):
+            return {"verification": {}}
+
+        # 多步任务：早期 implement 步只完成了一部分，跑全量套件必然因为
+        # 后面还没做的步骤而失败，会把 agent 钉死在这一步。只在最终实现步
+        # 或 kind=verify 的步骤验证；单步任务（也是最后一步）照常验证。
+        if sandbox.settings.verify_only_final:
+            plan = state.get("plan") or []
+            step_idx = int(state.get("step_idx", 0))
+            is_last = step_idx >= len(plan) - 1
+            if kind == IMPLEMENT and not is_last:
+                return {"verification": {}}
+
+        previous = state.get("verification") or {}
+        # repair 的快速通道：只重跑上次失败的测试；子集通过后 runner 会自动
+        # 补跑完整命令，所以不会漏掉回归。
+        only: tuple[str, ...] = ()
+        if int(state.get("retry", 0)) > 0:
+            only = tuple(str(t) for t in (previous.get("failed_tests") or ()))
+
+        result = run_verification(sandbox, root, allow_manifest=False, only=only)
+
+        # 停滞检测：签名相同说明上一次修复/换做法都没有改变失败本身。
+        # repair 与 replan 都不清这个计数；只有换了步骤（planner/advance）才归零。
+        previous_signature = str(
+            state.get("last_failure_signature")
+            or previous.get("failure_signature")
+            or ""
+        )
+        result_status = str(getattr(result, "status", ""))
+        result_signature = str(getattr(result, "failure_signature", "") or "")
+        if (
+            result_status == "failed"
+            and result_signature
+            and result_signature == previous_signature
+        ):
+            same_failure_count = int(state.get("same_failure_count", 0)) + 1
+        else:
+            same_failure_count = 0
+
+        return {
+            "verification": result.model_dump(),
+            # 运行级快照：replan 会清 verification，但收尾要靠它判断真实结论
+            "last_verification": result.model_dump(),
+            "same_failure_count": same_failure_count,
+            "last_failure_signature": (
+                result_signature if result_status == "failed" else ""
+            ),
+        }
 
     return verify

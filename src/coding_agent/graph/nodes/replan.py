@@ -47,6 +47,7 @@ from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemM
 from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
+from coding_agent.graph.plan import PlanStepModel, align_kinds
 from coding_agent.graph.state import AgentState
 from coding_agent.llm.deepseek import with_json_output
 from coding_agent.llm.prompts import REPLAN_AFTER_FAILURE_PROMPT, REPLAN_PROMPT
@@ -57,18 +58,20 @@ class ReplanDecision(BaseModel):
     """重规划决定。"""
 
     revise: bool = Field(description="剩下的步骤是否需要调整")
-    steps: list[str] = Field(
+    steps: list[PlanStepModel] = Field(
         default_factory=list,
         description="调整之后的剩余步骤（revise 为真时给出；剩余工作已做完就给空列表）",
     )
 
 
-def _plan_view(plan: list[str], step_idx: int, *, failed: bool) -> str:
+def _plan_view(
+    plan: list[str], kinds: list[str], step_idx: int, *, failed: bool
+) -> str:
     """把计划画给模型看。
 
     `step_idx` 指向的是**当前要处理的那一步**：从 advance 进来时它是下一步，
     从「修复用尽」进来时它是那步没做成的。两种情形的标注不同，混淆了会让模型
-    以为某步已经做完。
+    以为某步已经做完。kind 一并给出，便于模型保持「探索/实现/验证」的划分。
     """
     lines = []
     for index, step in enumerate(plan):
@@ -78,7 +81,8 @@ def _plan_view(plan: list[str], step_idx: int, *, failed: bool) -> str:
             mark = "（没做成）" if failed else "（下一步）"
         else:
             mark = "（待办）"
-        lines.append(f"{index + 1}. {step}{mark}")
+        kind = kinds[index] if index < len(kinds) else "unknown"
+        lines.append(f"{index + 1}. [{kind}] {step}{mark}")
     return "\n".join(lines)
 
 
@@ -110,6 +114,9 @@ def _failure_note(failure: dict, attempts: int) -> str:
     summary = failure.get("summary", "")
     if summary:
         lines.append(f"结果：{summary}")
+    failed_tests = failure.get("failed_tests") or []
+    if failed_tests:
+        lines.append("失败测试：" + "、".join(str(t) for t in failed_tests[:10]))
     issues = list(failure.get("issues") or []) + list(failure.get("findings") or [])
     for issue in issues[:5]:
         where = issue.get("location", "")
@@ -142,6 +149,7 @@ def make_replan_node(
 
     async def replan(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         plan = [step for step in (state.get("plan") or []) if step]
+        kinds = align_kinds(plan, state.get("plan_kinds"))
         step_idx = state.get("step_idx", 0)
 
         # 两种入口：步进后（上一步做完了）与修复用尽后（这一步没做成）。
@@ -151,6 +159,10 @@ def make_replan_node(
         failed = blocked is not None
         failure = blocked[1] if blocked else {}
         failure_source = blocked[0] if blocked else ""
+        # 用户显式 /replan：即使没有失败，也交给模型重新审视剩余步骤。
+        user_requested = bool(state.get("steering_replan"))
+        # 只有用户请求过才需要清标志；普通步进返回空更新，保持既有契约。
+        cleared = {"steering_replan": False} if user_requested else {}
 
         # 两个入口各用各的额度，互不挤占（见模块文档第 1 条）
         counter = "replan_count" if failed else "tweak_count"
@@ -158,17 +170,22 @@ def make_replan_node(
         remaining = plan[step_idx:]
 
         if not remaining:
-            return {}
+            return cleared
 
         # 从「修复用尽」进来时，额度用尽就等于没辙了 —— 砍掉剩余步骤，
         # 让任务如实收尾。**必须返回一个改过的 plan**：返回 {} 会被路由送回 act，
         # 而这一步已经确定做不成，那就成了死循环。
         if failed and used >= max_replans:
-            return {"plan": plan[:step_idx], counter: used}
+            return {
+                "plan": plan[:step_idx],
+                "plan_kinds": kinds[:step_idx],
+                counter: used,
+                **cleared,
+            }
 
         # 步进入口下额度用尽 → 直接放行，不多花一次模型调用
         if used >= max_replans:
-            return {}
+            return cleared
 
         if failed:
             prompt = REPLAN_AFTER_FAILURE_PROMPT.format(
@@ -181,14 +198,14 @@ def make_replan_node(
 
         request = last_human_text(state["messages"])
         if not failed:
-            head = "刚做完这步"
+            head = "用户明确要求重新规划剩余步骤" if user_requested else "刚做完这步"
         elif failure_source == "review":
             head = "这一步的改动没通过代码审查"
         else:
             head = "没能做成这一步"
         body = (
             f"用户请求：{request}\n\n"
-            f"计划：\n{_plan_view(plan, step_idx, failed=failed)}\n\n"
+            f"计划：\n{_plan_view(plan, kinds, step_idx, failed=failed)}\n\n"
             f"{head}：\n{context}"
         )
 
@@ -198,24 +215,44 @@ def make_replan_node(
             )
         except Exception:  # noqa: BLE001 - 重规划失败不能拖垮整张图
             # 步进入口沿用原计划；失败入口没有退路，只能收尾
-            return {"plan": plan[:step_idx], counter: used} if failed else {}
+            if failed:
+                return {
+                    "plan": plan[:step_idx],
+                    "plan_kinds": kinds[:step_idx],
+                    counter: used,
+                    **cleared,
+                }
+            return cleared
 
         if not decision.revise and not failed:
             # 步进入口说"不用改"就是真不改 —— 返回空更新，连事件都不该发。
             # （失败入口不能这么返回，见上文：那会被路由送回 act 变成死循环。）
-            return {}
+            return cleared
 
-        revised = [step.strip() for step in (decision.steps or []) if step and step.strip()]
+        revised = [
+            (step.text.strip(), step.kind)
+            for step in (decision.steps or [])
+            if step.text and step.text.strip()
+        ]
         budget = max(max_plan_steps - step_idx, 0)
-        new_plan = plan[:step_idx] + revised[:budget]
+        new_plan = plan[:step_idx] + [text for text, _kind in revised][:budget]
+        new_kinds = kinds[:step_idx] + [kind for _text, kind in revised][:budget]
 
-        update: dict[str, Any] = {"plan": new_plan, counter: used + 1}
+        update: dict[str, Any] = {
+            "plan": new_plan,
+            "plan_kinds": align_kinds(new_plan, new_kinds),
+            counter: used + 1,
+            **cleared,
+        }
         if failed and revised:
             # 换了新做法，就该有新的修复预算与轮次 —— 否则 act 一看轮次用尽
             # 就直接放弃，新做法根本没机会被执行。
             # 两道质量关的旧结论一并作废：它们是针对**上一个做法**的。
             update.update(
                 retry=0,
+                # same_failure_count / last_failure_signature 刻意不清：
+                # 新做法如果仍然撞同一个失败，停滞检测要继续累积，避免
+                # 「replan 清零 → 再修两轮 → 再 replan」的循环。
                 tool_rounds=0,
                 budget_exhausted=False,
                 verification={},

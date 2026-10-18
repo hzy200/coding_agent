@@ -107,6 +107,10 @@ class Settings(BaseSettings):
 
     # ---------- 验证 ----------
     verify_enabled: bool = Field(default=True, alias="AGENT_VERIFY_ENABLED")
+    # 多步计划里，非最终的 implement 步不跑全量测试：早期步骤只完成了一部分，
+    # 全量套件必然因为后面还没做的步骤而失败，会把 agent 卡死在这一步。
+    # 只在 kind=verify 或最后一步验证；单步任务不受影响。
+    verify_only_final: bool = Field(default=True, alias="AGENT_VERIFY_ONLY_FINAL")
     # 留空表示按项目清单自动识别（pytest / cargo / go / npm / make）
     verify_command: str = Field(default="", alias="AGENT_VERIFY_COMMAND")
 
@@ -126,6 +130,69 @@ class Settings(BaseSettings):
     # 任何"配置"。关掉它等于去掉「测试通过 ≠ 代码正确」那第二道关。
     review_enabled: bool = Field(default=True, alias="AGENT_REVIEW_ENABLED")
 
+    # ---------- 子智能体（Phase 1：只读 Explore）----------
+    # **默认关闭**：它会给主模型多一个工具、改变 agent 行为，打开后旧评测基线
+    # 不再可比。评测时显式设置 AGENT_EXPLORE_ENABLED=true 做 A/B。
+    explore_enabled: bool = Field(default=False, alias="AGENT_EXPLORE_ENABLED")
+    # 子智能体最多几轮「模型 → 工具」；到顶后强制生成报告，状态记 partial。
+    # 定位一个跨文件功能通常需要 6–10 轮只读检索；6 轮实测会频繁 partial。
+    explore_max_rounds: int = Field(default=8, alias="AGENT_EXPLORE_MAX_ROUNDS")
+    # 整个子智能体的墙钟上限（秒）
+    explore_timeout: int = Field(default=120, alias="AGENT_EXPLORE_TIMEOUT")
+    # 返回给主模型的摘要上限（字符）
+    explore_max_report_chars: int = Field(default=4_000, alias="AGENT_EXPLORE_MAX_REPORT_CHARS")
+    # 单个任务最多委派几次探索 —— 与主 agent 的工具轮次预算相互独立。
+    # 默认给到 6：提示词鼓励把互不依赖的区域拆成多个并发 delegate，
+    # 预算若只有 2 会与这条建议直接冲突（实测 5 个里 3 个被预算拒绝）。
+    max_delegate_calls: int = Field(default=6, alias="AGENT_MAX_DELEGATE_CALLS")
+    # 同一条消息里的多个 delegate 调用最多同时跑几个。
+    # 子智能体只读，所以并发不会产生写冲突；限制主要是控制成本与 wsl.exe 压力。
+    max_concurrent_agents: int = Field(default=4, alias="AGENT_MAX_CONCURRENT_AGENTS")
+    # ---- 成本感知的委派预算（按仓库文件数分级）----
+    # 小于 min_files：不委派，直接读；[min, medium)：medium_calls；
+    # [medium, large)：large_calls；>= large：max_delegate_calls。
+    delegate_min_files: int = Field(default=30, alias="AGENT_DELEGATE_MIN_FILES")
+    delegate_medium_files: int = Field(default=100, alias="AGENT_DELEGATE_MEDIUM_FILES")
+    delegate_large_files: int = Field(default=300, alias="AGENT_DELEGATE_LARGE_FILES")
+    delegate_medium_calls: int = Field(default=2, alias="AGENT_DELEGATE_MEDIUM_CALLS")
+    delegate_large_calls: int = Field(default=4, alias="AGENT_DELEGATE_LARGE_CALLS")
+
+    # ---------- Orchestrator（Phase 3A）----------
+    # 默认关闭：打开后 START 会根据仓库规模进入编排路径；关闭时完全走旧图。
+    orchestrator_enabled: bool = Field(default=False, alias="AGENT_ORCHESTRATOR_ENABLED")
+    # 小于该文件数不做编排，直接单 agent。
+    orchestrator_min_files: int = Field(default=30, alias="AGENT_ORCHESTRATOR_MIN_FILES")
+    orchestrator_max_tasks: int = Field(default=6, alias="AGENT_ORCHESTRATOR_MAX_TASKS")
+    # 同一批 ready 任务最多并发几个只读 worker。
+    orchestrator_max_concurrent_workers: int = Field(
+        default=4, alias="AGENT_ORCHESTRATOR_MAX_CONCURRENT_WORKERS"
+    )
+    # dispatch ⇄ collect 的轮次上限。
+    orchestrator_max_rounds: int = Field(default=3, alias="AGENT_ORCHESTRATOR_MAX_ROUNDS")
+    # 单个任务失败后最多重试几次（0 = 不重试）。重试仍失败才把依赖方标 blocked。
+    orchestrator_task_retries: int = Field(
+        default=1, alias="AGENT_ORCHESTRATOR_TASK_RETRIES"
+    )
+    # ---- Phase 3C：并发写 worker（默认关闭）----
+    # 打开后，orchestrator 才可能生成 implement 任务；还要求 --write、工作区是
+    # git 仓库且干净。worker 在独立 git worktree 中修改，完成后由宿主合并补丁。
+    orchestrator_write_enabled: bool = Field(
+        default=False, alias="AGENT_ORCHESTRATOR_WRITE_ENABLED"
+    )
+    orchestrator_worker_rounds: int = Field(
+        default=12, alias="AGENT_ORCHESTRATOR_WORKER_ROUNDS"
+    )
+    orchestrator_worker_repairs: int = Field(
+        default=2, alias="AGENT_ORCHESTRATOR_WORKER_REPAIRS"
+    )
+    orchestrator_worker_timeout: int = Field(
+        default=240, alias="AGENT_ORCHESTRATOR_WORKER_TIMEOUT"
+    )
+    # 交给主 agent 的 worker 汇总上限（字符）。
+    orchestrator_context_chars: int = Field(
+        default=8_000, alias="AGENT_ORCHESTRATOR_CONTEXT_CHARS"
+    )
+
     # ---------- 持久化与审计 ----------
     # 留空表示自动用 <当前目录>/.agent/checkpoints.sqlite；填 :memory: 强制不落盘
     checkpoint_path: str = Field(default="", alias="AGENT_CHECKPOINT_PATH")
@@ -137,6 +204,9 @@ class Settings(BaseSettings):
 
     # ---------- Agent 循环 ----------
     max_repair_rounds: int = Field(default=3, alias="AGENT_MAX_REPAIR_ROUNDS")
+    # 连续出现同一失败签名多少次后停止 repair、改走 replan。
+    # 24 次相同失败验证的教训：没有这道闸，repair 会把同一类修改重复到额度耗尽。
+    max_same_failures: int = Field(default=2, alias="AGENT_MAX_SAME_FAILURES")
     # 执行中「重建剩余计划」的次数上限。计划可以修正，但不能无限改 ——
     # 边做边改没有收敛点，而每次重规划都要多一次模型调用
     max_replans: int = Field(default=2, alias="AGENT_MAX_REPLANS")

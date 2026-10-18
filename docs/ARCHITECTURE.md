@@ -1,6 +1,7 @@
 # 架构
 
-面向实现：分层、数据流、不变量与取舍理由。开发方案与排期见 [PLAN.md](PLAN.md)。
+面向实现：分层、数据流、不变量与取舍理由。Harness 阶段方案见
+[HARNESS.md](HARNESS.md)，当前状态与已知限制见 [ACCEPTANCE.md](ACCEPTANCE.md)。
 
 ## 1. 一条原则
 
@@ -35,11 +36,21 @@ LLM 拿不到操作系统句柄，只能产出结构化调用 `{tool, args}`；�
 ┌───────────────────────▼──────────────────────────────────┐
 │ graph/  state.py routing.py build.py nodes/               │
 │   planner → act ⇄ (approval_gate → tools) → verify        │
-│   → review → advance → replan → …                         │
+│   → review → advance → steering_step → replan → …         │
+│   编排路径：plan_tasks → steering_plan → dispatch         │
+│             ⇄ steering_dispatch → synthesize              │
+│   所有收尾路径经 steering_final → respond                  │
 │   两道质量关：verify 管行为对不对，review 管代码干不干净      │
 │   一步没有产生任何改动 → nudge 打回重做一次（上限一次）        │
 │   步进后经 replan：计划可在执行中被修正（修的是"后面"）        │
 │   节点只读状态、返回状态增量；不碰 I/O 以外的宿主资源         │
+└───────────────────────┬──────────────────────────────────┘
+                        │
+┌───────────────────────▼──────────────────────────────────┐
+│ agents/  explore.py（只读 Explore 子智能体）                │
+│   独立 messages；只绑定 EXPLORE_TOOL_NAMES 白名单；         │
+│   由 tools 节点在宿主侧执行，不产生第二条写路径；            │
+│   同一消息的多个 delegate 由 Semaphore+gather 并发（fan-out）│
 └───────────────────────┬──────────────────────────────────┘
                         │
 ┌───────────────────────▼──────────────────────────────────┐
@@ -69,10 +80,11 @@ Web 页面上一个按钮就能跳过命令分级。这条约束是安全属性�
 | 路径 | 职责 | 不该做的事 |
 |---|---|---|
 | `runtime.py` | 编排、事件翻译、审计、生命周期 | 不含业务规则（分级在 policy） |
-| `events.py` | 前端契约（9 个事件） | 不含逻辑 |
+| `events.py` | 前端契约（领域事件） | 不含逻辑 |
 | `graph/state.py` | 跨节点传递的状态 | 不放能推导出来的派生值 |
-| `graph/nodes/` | 单个节点的纯函数 | 不直接 yield 事件（节点只返回状态增量） |
+| `graph/nodes/` | 单个节点的纯函数 | 不直接 yield 事件（例外：`dispatch` 用 custom stream 发 worker 实时事件） |
 | `graph/routing.py` | 条件边 | 不做副作用 |
+| `agents/` | 子智能体循环（独立上下文） | 不直接写主 state、不产生写路径 |
 | `tools/` | 能力：执行 + 回报 | 不做安全判定（判定在 approval_gate） |
 | `sandbox/policy.py` | 命令分级、会话策略 | 不执行命令 |
 | `sandbox/fs.py` | 沙箱内文件读写 + 路径双重校验 | 不做业务判断 |
@@ -129,9 +141,13 @@ Web 页面上一个按钮就能跳过命令分级。这条约束是安全属性�
 
 要点：
 
-- **节点不产生事件**。节点只返回状态增量；事件由 runtime 从 `updates` 里翻译出来。
+- **节点不直接调用前端**。绝大多数事件由 runtime 从 `updates` 里翻译；
+  `dispatch` 是唯一例外：它通过 LangGraph `get_stream_writer()` 推送 worker
+  开始/结束的 custom 事件（实时进度），runtime 用 `worker_id:attempt` 去重后
+  翻译成领域事件。
   这样节点的测试不需要关心事件，前端的测试不需要关心图。
-- **审计与事件同源**。两者都从同一份 `updates` 产生，不存在"界面显示了但没记账"。
+- **审计与事件同源**。绝大多数事件来自同一份 `updates`；`dispatch` 的 worker
+  事件来自 custom stream，runtime 同样在翻译时写审计，不存在“界面显示了但没记账”。
 - **挂起时以 `ApprovalRequested` 收尾**，不发 `RunFinished` —— 前端据此判断该 resume 还是收工。
 
 ## 5. 图状态与生命周期
@@ -141,7 +157,7 @@ Web 页面上一个按钮就能跳过命令分级。这条约束是安全属性�
 | `messages` | 对话与工具轨迹 | `add_messages` 追加 |
 | `cwd` | 沙箱内工作目录 | 每次 run 由 runtime 注入 |
 | `memories` | 项目长期事实 | 每次 run 从文件重读 |
-| `plan` / `step_idx` | 子任务与进度 | planner 初始化，advance 递增，replan 改写剩余部分 |
+| `plan` / `plan_kinds` / `step_idx` | 子任务、类型与进度 | planner 初始化，advance 递增，replan 改写剩余部分（文本与 kind 同步） |
 | `replan_count` | 已重建计划的次数 | planner 清零、replan 递增；**整个任务**的额度，advance 不动 |
 | `tool_rounds` | 当前步骤已用轮次 | planner / advance / repair 清零 |
 | `budget_exhausted` | 本步因预算耗尽收尾 | 同上 |
@@ -150,10 +166,20 @@ Web 页面上一个按钮就能跳过命令分级。这条约束是安全属性�
 | `review` | 最近一次代码审查结果 | 同 `verification`：planner / advance 清空，**repair 刻意不清**（act 要靠它知道该改什么） |
 | `review_watermark` | 已审过的最大快照 id | **只由 planner 归零**；advance / repair 都不许碰（见下方不变量 19） |
 | `retry` | 当前步骤的修复次数 | planner / advance 清零，repair 递增。**verify 与 review 共用这一份预算** |
+| `same_failure_count` / `last_failure_signature` | 连续同一失败签名的次数与签名 | verify 写入；repair 与 replan 都刻意不清；只有 planner / advance（换步骤）归零 |
+| `repo_profile` / `delegation_allowed` / `delegation_budget` | 仓库画像与本次运行的委派预算 | runtime 在 `run()` 时注入；planner / advance 不动 |
 | `approvals` | call_id → 审批结果 | approval_gate 写入，tools **消费后清空** |
+| `steering_cancelled` / `steering_replan` / `steering_replans` | 用户干预结果与次数 | runtime 每轮归零；steering 节点写入；plan_tasks 消费 replan |
+| `steering_applied` / `workflow_revised_reason` | runtime 翻译事件用 | steering / plan_tasks 每次写入 |
+| `tasks` / `task_status` / `task_attempts` / `worker_results` | 编排任务图与每轮结果 | plan_tasks 初始化；dispatch / extend_tasks 增量写入 |
+| `task_extensions_seen` / `task_extensions_applied` | worker 提议只读任务的扫描位置与本轮新增 | extend_tasks 写入；runtime 每轮归零 |
 
 `approvals` 的一次性语义是安全属性：不清空的话，下一轮的调用会复用上一轮的批准。
 有测试守着（`test_approvals_do_not_leak_into_next_round`）。
+
+steering 的**指令队列不在 state 里**：它是外部输入，worker 需要一边运行一边
+非破坏性轮询 `cancel_requested`，而 state 更新与图执行是串行的。暂停状态由
+checkpoint 保存，队列只活在当前进程。
 
 ## 6. 不变量
 
@@ -187,6 +213,12 @@ Web 页面上一个按钮就能跳过命令分级。这条约束是安全属性�
 | 26 | **语法错在落盘前就拒** | 原先「先写下去 → review 事后查 → 不合格再 repair」，白烧一轮工具预算与一次模型往返。语法错是这里最便宜就能确定的错误（纯解析、零 I/O），没理由等到事后。**判据是「有没有变坏」而不是「是不是好的」** —— 原本就坏的文件允许继续改，否则会堵死模型自己的分步修复 | `test_write_rejects_broken_python`、`test_edit_rejects_a_change_that_breaks_syntax`、`test_an_already_broken_file_can_still_be_edited` |
 | 25 | **「没验证」不等于「通过」** | 识别不出测试命令时原先是 `not_configured` → 路由判为非 failed → **审计记成 `ok=True`**，于是"没做"与"做对了"在账上分不开（P0-2）。现在：① 有源码就做**语法解析级降级验证**（`kind=syntax`），② 事件与审计的 `ok` 都是**三态**（True/False/**None=没验证**） | `test_a_python_project_without_tests_falls_back_to_a_syntax_check`、`test_the_audit_records_not_configured_as_unverified_not_passed`、`test_verification_ok_is_three_state` |
 | 24 | **空步骤的重做有界，且必须给退路** | 只读步骤是合法的（计划第一步常常就是探索）。无限要求"必须有改动"会逼出无意义的改动，所以只给一次机会，且提示里明确写了"这一步确实只需只读就说明理由停下" | `test_the_nudge_happens_only_once_per_step`、`test_nudge_tells_the_model_why_it_is_back` |
+| 27 | **`delegate_explore` 子智能体只能绑定只读白名单工具** | 子智能体输入包含仓库内容，不能让它获得写/执行能力。构造时校验工具集合，运行时再按名字二次校验；委托调用本身仍走 `approval_gate → tools` 唯一咽喉。编排 implement worker 是另一条受控路径（见 32） | `test_runner_refuses_non_readonly_tools_at_construction`、`test_non_whitelisted_tool_call_is_refused` |
+| 28 | **主 agent 的并发只发生在只读子智能体之间** | 多个 delegate 同批并发；主 agent 的普通工具（含写）仍串行。写操作与探索混在同一条消息时，提示词要求模型拆开，避免读到改动前的状态 | `test_multiple_delegate_calls_run_concurrently`、`test_concurrent_batch_respects_the_task_budget` |
+| 29 | **`implement` 步骤必须有实际改动才能推进** | 委派探索可以把「读」做完，但不能因此把实现步当成完成。`plan_kinds` 与 `plan` 逐项对齐：explore/verify 允许零改动直接步进；implement 先 nudge 一次，仍无 `dirty` 就收尾，不再静默 advance | `test_an_implement_step_nudged_without_changes_responds`、`test_an_explore_step_without_changes_advances_without_nudge` |
+| 30 | **同一失败签名连续出现就改走 replan，且跨 replan 继续累积** | 24 次相同失败验证说明 repair 只是重复同一类修改。失败签名由失败测试 id + 归一化错误消息组成；连续达到 `max_same_failures` 后不再 repair。replan 会清空 `verification`，所以签名另存 `last_failure_signature`：新做法若仍撞同一个失败，计数继续增长，不会「清零→再修两轮→再 replan」循环。repair 时只重跑上次失败的 pytest 测试，子集通过后自动补跑全量。 | `test_the_same_failure_signature_goes_to_replan`、`test_stagnation_survives_a_replan_that_clears_the_verification`、`test_selected_pass_is_confirmed_by_a_full_run` |
+| 31 | **委派只在 explore 步、且受仓库规模预算约束** | 38 文件的任务实测会拆 3–5 个子智能体，成本 +43%。默认：<30 文件不委派；30–99 最多 2 次；100–299 最多 4 次；≥300 用配置上限。实现/验证步一律拒绝委派 | `test_small_repo_disables_delegation`、`test_delegate_is_rejected_outside_an_explore_step`、`test_delegate_budget_comes_from_the_cost_policy` |
+| 32 | **编排写 worker 只能在隔离 worktree 中并发，且写范围不重叠** | 多个 implement 同时改主工作区会互相覆盖。每个 worker 一个 worktree；dispatch 顺序 `git apply --check` → 留快照 → `git apply`；越界修改由 worker 事后 diff 校验拒绝 | `test_concurrent_implement_workers_ignore_agent_state`、`test_merged_patch_takes_snapshots_so_undo_can_restore`、`test_dispatch_marks_a_conflicting_patch_failed` |
 
 ## 7. 关键取舍
 
@@ -219,6 +251,25 @@ Web 页面上一个按钮就能跳过命令分级。这条约束是安全属性�
 会完全逃过审查** —— 这条质量关不是安全边界，「禁止用 shell 改源码」只是系统
 提示里的软约束。
 
+### 为什么 nudge 后的实现步强制一次工具动作
+
+实测 deepseek-chat 在 implement 步偶尔会连续返回「无 tool_calls」的空动作：
+文件已经读过了，但就是不落笔。`act` 在被 nudge 之后的**第一次**调用上使用
+`tool_choice="required"`，至少强制出一个动作（通常是先读目标文件）；后续调用
+恢复自动选择，留出编辑机会。provider 不支持强制 tool_choice 时回退到普通调用。
+
+### 为什么多步任务只在最后验证
+
+全量测试覆盖的是**整个功能**。计划第 2 步只做了模型/服务层时，报表与审批的
+测试必然还是红的 —— 每步都跑全量，agent 会卡在第 2 步反复 repair，永远到不了
+后面的实现步骤（实测 `long/discount_pipeline` 就是卡在这里）。
+
+所以多步计划里，`kind=implement` 的非最终步骤不跑全量；只在 `kind=verify`
+或最后一步验证。单步任务（也是最后一步）照常验证。
+**`kind=verify` 的步骤即使 `dirty=False` 也会跑** —— 它的职责就是全量确认，
+不应因为「这一步没有新改动」被短路。
+`AGENT_VERIFY_ONLY_FINAL=false` 可以恢复旧行为。
+
 ### 为什么自动 verify 不走审批
 
 区别在**谁决定执行什么**：verify 只能跑**命令文本由宿主写死**的命令
@@ -243,7 +294,41 @@ Git、依赖、检索都有专用工具。换来三件事：参数无法逃逸�
 往进程环境注入值，用户既看不到来源也删不掉，导致改 `.env` 完全不生效。
 项目目录里的 `.env` 是显式写下、看得见、可编辑的意图。详见 [USAGE.md](USAGE.md#配置来源)。
 
-## 8. 扩展点
+## 8. Orchestrator（Phase 3A–4D 已实现，默认关闭）
+
+> 完整方案与阶段拆解见 [HARNESS.md](HARNESS.md)。
+
+编排层位于 runtime 与 graph 之间，**复用现有能力**：
+
+- `orchestrator/`：survey、工作流选择、TaskSpec 校验、dispatch、synthesize；
+- `graph/`：`START` 条件入口按 `execution_mode` 分流；`direct` 路径保持现状；
+- `agents/`：explore worker 复用现有只读 runner；test worker 复用测试 runner；
+- `events.py` / `audit/`：workflow/task/worker 事件与字段；
+- 审批、沙箱、快照、审计仍是唯一执行与安全路径。
+
+**已实现**（默认 `AGENT_ORCHESTRATOR_ENABLED=false`）：
+
+- `direct` / `parallel_readonly` 模板；
+- 只读 explore/test/review worker 的并发 dispatch、依赖阻塞、fan-in；
+- 任务级失败重试；默认 `partial` 不满足依赖，但 `depends_mode=any` 的
+  review/test 可以消费 partial 产出；fan-in 只看最后尝试并报告文件重叠；
+- **动态任务图**：explore/review 可提议最多 2 个只读任务；`extend_tasks`
+  做 host 校验（角色/去重/依赖/总量/无环）后加入 pending；
+- `worker_context` 注入 planner/act；
+- 事件/审计/eval 机制指标。
+
+**Phase 3C 已实现（默认关闭）**：`implement` worker 在独立 git worktree 中修改，
+导出 patch 后由 dispatch 顺序 `git apply`；写范围必须不重叠，合并前 `--check`。
+合并前还会为主工作区目标文件留快照（`worker_results.snapshot_ids`），使
+`agent undo` 覆盖编排写。写编排要求工作区是 git 仓库根；`.agent/` 与
+`__pycache__/` 不算用户脏改动。
+
+**Phase 3D 已实现**：`runtime.steer()` → `SteeringController`（按 thread 隔离），
+四个图节点在边界消费 `/pause` `/cancel` `/add` `/replan`；pause 用
+`interrupt()` + checkpoint，worker 在轮次/工具边界协作式响应 cancel；
+事件 `SteeringApplied` / `WorkflowRevised`，审计 `kind=steering`。
+
+## 9. 扩展点
 
 ### 加一个工具
 
@@ -268,6 +353,8 @@ Git、依赖、检索都有专用工具。换来三件事：参数无法逃逸�
 7. 前端（`cli/app.py`、`tui/app.py`）补事件映射
 
 节点里不要 yield 事件、不要写审计 —— 那些是 runtime 的职责。
+唯一例外是 `dispatch` 的 `get_stream_writer()` custom 事件（worker 实时进度），
+它只推事件载荷，审计仍由 runtime 统一写。
 
 第 4 与第 7 步都有守卫：`test_graph_event_coverage.py` 用 AST 断言「每个图节点要么
 有事件翻译、要么在 `SILENT_NODES` 里显式登记」，漏翻译会当场变红；前端漏映射则

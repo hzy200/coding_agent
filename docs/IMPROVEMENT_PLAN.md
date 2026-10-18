@@ -1,5 +1,9 @@
 # 技术分析报告与工程改进计划
 
+> **历史记录（已归档）**：这是 2026-10-05 的分析与 W1–W12 排期。文中的测试数、
+> 覆盖率与“待办”均为当时状态；当前状态见 [ACCEPTANCE.md](ACCEPTANCE.md) 与
+> [HARNESS.md](HARNESS.md)。
+
 **目标定位**：高性能自主编码智能体 —— 能**理解**代码、能**生产**代码、能通过**自主工作流**推进执行  
 **周期**：3 个月（W1–W12）  
 **基线版本**：M4 完成版 + 缺陷收口（**992** 用例通过（全量，不含 LLM）· 覆盖率 **90.5%** 全量 / **78.9%** CI 子集，门槛已设为 **76**，见 Q1 · lint 干净）  
@@ -382,6 +386,20 @@
 | 评测集通过率 | 未度量 | **建立基线** | ≥B+25 | **≥B+35** |
 | 测试覆盖率 | 90% | ≥90% | ≥88% | ≥85% |
 
+### 3.7 Harness 化（历史：Phase 3A–4D 已实现，见 HARNESS.md）
+
+> 完整方案见 [HARNESS.md](HARNESS.md)。本节只登记路线图，不改变 W1–W12 的既有优先级。
+
+| 阶段 | 主题 | 首个可验证变化 |
+|---|---|---|
+| **3A** ✅ | 动态工作流选择 + 最小只读 worker | 已实现：`direct` / `parallel_readonly` 选择；explore/test worker 并发；汇总后主 agent 实现。烟雾：`long/discount_and_audit` 通过，4 个 worker 并发 |
+| **3B** ✅ | 显式任务 DAG + 只读 worker 扩展 | 已实现：任务级重试、partial/blocked、review worker、fan-in 文件重叠报告 |
+| **3C** ✅ | 并发写 worker | 已实现：implement worker + git worktree 隔离 + write_scope 校验 + patch 合并/冲突（默认关闭） |
+| **3D** | 实时用户干预 | pause/resume/cancel/add/replan；checkpoint 恢复 |
+| **4** | 评测与调优 | worker 利用率、冲突率、干预延迟；成本感知预算 |
+
+Phase 3A 的验收标准见 [ACCEPTANCE.md](ACCEPTANCE.md) 第 5 节。
+
 ---
 
 ## 第四部分 · 风险与对策
@@ -446,7 +464,7 @@
 
 ## 附：相关文档
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) —— 分层、15 条不变量、扩展点
+- [ARCHITECTURE.md](ARCHITECTURE.md) —— 分层、关键不变量、扩展点
 - [WORKFLOW.md](WORKFLOW.md) —— 三套工作流、状态生命周期、防失控的闸
 - [COMPLEXITY.md](COMPLEXITY.md) —— AST 度量、复杂度热点、降复杂度建议
 - [ACCEPTANCE.md](ACCEPTANCE.md) —— 需求逐条对照、已知限制

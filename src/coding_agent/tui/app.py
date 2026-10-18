@@ -25,6 +25,7 @@ from coding_agent.events import (
     AssistantToken,
     Event,
     FileChanged,
+    OrchestrationFinished,
     PlanCreated,
     PlanRevised,
     RepairStarted,
@@ -32,11 +33,20 @@ from coding_agent.events import (
     RunFailed,
     RunFinished,
     RunStarted,
+    SteeringApplied,
     StepFinished,
     StepStarted,
+    SubAgentFinished,
+    SubAgentStarted,
+    TaskGraphCreated,
+    TaskGraphExtended,
     ToolCallFinished,
     ToolCallStarted,
     Verification,
+    WorkerFinished,
+    WorkerStarted,
+    WorkflowRevised,
+    WorkflowSelected,
 )
 from coding_agent.runtime import AgentRuntime
 
@@ -54,6 +64,11 @@ HELP_TEXT = """\
 /memory            查看项目记忆
 /remember <事实>   记下一条跨会话的项目事实
 /forget <序号>     删除第 N 条记忆
+/pause             在下一个节点边界暂停（不再派发新 worker）
+/resume            从暂停处继续
+/cancel            取消运行；未合并的改动不会落盘
+/add [角色] <目标> 追加一个只读任务（explore/test/review）
+/replan            要求重新规划剩余工作
 /quit              退出
 
 快捷键  Ctrl+Q 退出 · Ctrl+N 新会话 · Ctrl+L 清屏
@@ -176,6 +191,9 @@ class AgentTuiApp(App[None]):
         self._stream: list[str] = []
         self._answering = False
         self._busy = False
+        # steering pause 后图已挂起、busy 会变回 False；用独立标记阻止用户
+        # 在暂停期间误开新任务。
+        self._paused = False
 
     # ------------------------------------------------------------------
     # 组装
@@ -236,12 +254,21 @@ class AgentTuiApp(App[None]):
         info.append(level, style="bold yellow" if self._allow_write else "dim")
         self.query_one("#session-info", Static).update(info)
 
+    def _refresh_subtitle(self) -> None:
+        if self._busy:
+            suffix = "（执行中…）"
+        elif self._paused:
+            suffix = "（已暂停）"
+        else:
+            suffix = ""
+        self.sub_title = f"会话 {self._session_id}{suffix}"
+
     def _set_busy(self, value: bool) -> None:
         """忙碌状态要看得见：输入框描边变色，并在副标题上标出来。"""
         self._busy = value
         prompt = self.query_one("#prompt", Input)
         prompt.set_class(value, "busy")
-        self.sub_title = f"会话 {self._session_id}" + ("（执行中…）" if value else "")
+        self._refresh_subtitle()
 
     @property
     def session_id(self) -> str:
@@ -378,10 +405,106 @@ class AgentTuiApp(App[None]):
             else:
                 self._write(f"代码审查通过  {event.summary}", "green")
 
+        elif isinstance(event, SubAgentStarted):
+            self._flush_stream()
+            self._write(f"◈ 探索子智能体开始  {event.goal}", "cyan")
+
+        elif isinstance(event, SubAgentFinished):
+            self._flush_stream()
+            style = "green" if event.status == "success" else "yellow"
+            self._write(f"◈ 探索子智能体 {event.status}  {event.summary}", style)
+
+        elif isinstance(event, WorkflowSelected):
+            self._write(f"◈ 工作流：{event.workflow}  {event.reason}", "cyan")
+
+        elif isinstance(event, TaskGraphCreated):
+            suffix = "（已降级）" if event.degraded else ""
+            self._write(f"◈ 任务图：{len(event.tasks)} 个只读任务{suffix}", "cyan")
+            for task in event.tasks:
+                self._write(
+                    f"  {task.get('id', '')} ({task.get('role', '')}): "
+                    f"{task.get('goal', '')}",
+                    "dim",
+                )
+
+        elif isinstance(event, TaskGraphExtended):
+            self._write(
+                f"＋ 动态扩展 {len(event.added)} 个只读任务", "cyan"
+            )
+            for task in event.added[:5]:
+                self._write(
+                    f"  {task.get('id', '')} ({task.get('role', '')}): "
+                    f"{task.get('goal', '')}",
+                    "dim",
+                )
+            if event.rejected:
+                self._write(
+                    f"  （拒绝 {len(event.rejected)} 个不合规提议）", "dim"
+                )
+
+        elif isinstance(event, WorkerStarted):
+            retry = f"（第 {event.attempt} 次）" if event.attempt > 1 else ""
+            self._write(
+                f"  → worker {event.role}/{event.task_id}{retry}: {event.goal}",
+                "dim",
+            )
+
+        elif isinstance(event, WorkerFinished):
+            style = (
+                "green"
+                if event.status == "success"
+                else "yellow"
+                if event.status == "partial"
+                else "red"
+            )
+            merge_note = ""
+            if event.merged:
+                merge_note = "  · 已合并"
+            elif event.merge_error:
+                merge_note = f"  · 合并失败：{event.merge_error[:80]}"
+            self._write(
+                f"  ← worker {event.role}/{event.task_id} {event.status}"
+                f"{merge_note}  {event.summary}",
+                style,
+            )
+
+        elif isinstance(event, OrchestrationFinished):
+            self._write(
+                f"◈ 编排完成  成功 {event.completed}，失败/阻塞 {event.failed}  "
+                f"{event.summary}",
+                "cyan",
+            )
+
         elif isinstance(event, RepairStarted):
             self._write(
                 f"↻ 第 {event.attempt}/{event.limit} 次修复  {event.summary}", "yellow"
             )
+
+        elif isinstance(event, SteeringApplied):
+            self._flush_stream()
+            if event.action == "pause":
+                self._paused = True
+                self._refresh_subtitle()
+                self._write(
+                    f"⏸ {event.detail or '已暂停'}（/resume 继续，/cancel 取消）",
+                    "yellow",
+                )
+            elif event.action == "resume":
+                self._paused = False
+                self._refresh_subtitle()
+                self._write("▶ 已恢复", "green")
+            elif event.action == "cancel":
+                self._paused = False
+                self._refresh_subtitle()
+                self._write(f"⛔ {event.detail or '已取消'}", "yellow")
+            elif event.action == "add":
+                self._write(f"＋ {event.detail or '已追加任务'}", "cyan")
+            elif event.action == "replan":
+                self._write(f"↻ {event.detail or '已请求重规划'}", "cyan")
+
+        elif isinstance(event, WorkflowRevised):
+            self._flush_stream()
+            self._write(f"↻ 已重规划任务图：{event.reason}", "cyan")
 
         elif isinstance(event, ApprovalRequested):
             self._flush_stream()
@@ -393,6 +516,16 @@ class AgentTuiApp(App[None]):
 
         elif isinstance(event, RunFinished):
             self._flush_stream()
+            if (
+                event.worker_input_tokens is not None
+                or event.worker_output_tokens is not None
+            ):
+                self._write(
+                    "worker token："
+                    f"in {event.worker_input_tokens or 0} / "
+                    f"out {event.worker_output_tokens or 0}",
+                    "dim",
+                )
 
     # ------------------------------------------------------------------
     # 执行
@@ -442,6 +575,9 @@ class AgentTuiApp(App[None]):
         if text.startswith("/"):
             self._command(text)
             return
+        if self._paused:
+            self._write("（已暂停，请用 /resume 继续或 /cancel 取消）", "yellow")
+            return
         if self._busy:
             self._write("（当前任务执行中，请等待完成）", "yellow")
             return
@@ -485,8 +621,114 @@ class AgentTuiApp(App[None]):
             self._remember(rest)
         elif name == "/forget":
             self._forget(rest)
+        elif name == "/pause":
+            self._pause()
+        elif name == "/resume":
+            self._resume()
+        elif name == "/cancel":
+            self._cancel()
+        elif name == "/add":
+            self._add_task(rest)
+        elif name == "/replan":
+            self._replan()
         else:
             self._write(f"未知命令：{name}。输入 /help 查看可用命令。", "yellow")
+
+    # ------------------------------------------------------------------
+    # 实时干预（Phase 3D）
+    # ------------------------------------------------------------------
+
+    def _steer(self, action: str, **payload: Any) -> bool:
+        """提交一条干预指令；返回是否成功入队。"""
+        runtime = self._runtime
+        if runtime is None or not hasattr(runtime, "steer"):
+            self._write("当前运行时不支持实时干预。", "yellow")
+            return False
+        if not self._busy and not self._paused:
+            self._write("当前没有正在运行的任务。", "yellow")
+            return False
+        try:
+            runtime.steer(self._session_id, action, **payload)
+        except Exception as exc:  # noqa: BLE001 - 审计/参数错误要显示而不是崩
+            self._write(f"干预失败：{type(exc).__name__}: {exc}", "red")
+            return False
+        return True
+
+    def _pause(self) -> None:
+        if self._paused:
+            self._write("已处于暂停状态。", "yellow")
+            return
+        if self._steer("pause"):
+            self._write("⏸ 暂停请求已提交，将在当前节点结束后生效。", "yellow")
+
+    def _resume(self) -> None:
+        runtime = self._runtime
+        paused = self._paused
+        if not paused and runtime is not None and hasattr(runtime, "is_paused"):
+            paused = bool(runtime.is_paused(self._session_id))
+        if not paused:
+            self._write("当前没有处于暂停的任务。", "yellow")
+            return
+        if runtime is None or not hasattr(runtime, "resume_steering"):
+            self._write("当前运行时不支持恢复。", "yellow")
+            return
+        self._paused = False
+        self._refresh_subtitle()
+        self._resume_stream()
+
+    @work(exclusive=True)
+    async def _resume_stream(self) -> None:
+        self._set_busy(True)
+        try:
+            await self._consume(
+                self._runtime.resume_steering(self._session_id)
+            )
+        except Exception as exc:  # noqa: BLE001 - 恢复失败要显示
+            self._flush_stream()
+            self._write(f"恢复异常：{type(exc).__name__}: {exc}", "red")
+        finally:
+            self._set_busy(False)
+            self._refresh_subtitle()
+
+    def _cancel(self) -> None:
+        if not self._busy and not self._paused:
+            self._write("当前没有正在运行的任务。", "yellow")
+            return
+        if not self._steer("cancel"):
+            return
+        self._write("⛔ 取消请求已提交。", "yellow")
+        # 暂停时图停在 interrupt 上，必须恢复一次才能让 cancel 被消费。
+        if self._paused:
+            self._resume()
+
+    def _add_task(self, raw: str) -> None:
+        text = raw.strip()
+        if not text:
+            self._write(
+                "用法：/add [explore|test|review] <任务目标>", "yellow"
+            )
+            return
+        role = "explore"
+        parts = text.split(maxsplit=1)
+        if parts[0] in {"explore", "test", "review"}:
+            role = parts[0]
+            text = parts[1].strip() if len(parts) > 1 else ""
+        elif parts[0] == "implement":
+            self._write(
+                "/add 只支持只读任务（explore/test/review）；"
+                "写任务请让 planner 生成。",
+                "yellow",
+            )
+            return
+        if not text:
+            self._write("用法：/add [explore|test|review] <任务目标>", "yellow")
+            return
+        if self._steer("add", text=text, role=role):
+            self._write(f"＋ 已追加 {role} 任务：{text}", "cyan")
+
+    def _replan(self) -> None:
+        if self._steer("replan"):
+            self._write("↻ 重规划请求已提交。", "cyan")
 
     # ------------------------------------------------------------------
     # 会话与记忆
@@ -535,6 +777,9 @@ class AgentTuiApp(App[None]):
         self._transcript.clear()
 
         self._render_session_info()
+        is_paused = getattr(self._runtime, "is_paused", None)
+        self._paused = bool(is_paused(thread_id)) if callable(is_paused) else False
+        self._refresh_subtitle()
 
         try:
             history = await self._runtime.history(thread_id)
@@ -679,11 +924,13 @@ class AgentTuiApp(App[None]):
         self._step_idx = 0
         self._stream.clear()
         self._answering = False
+        self._paused = False
         self._plan_panel.render_plan([], 0)
         self.query_one("#streaming", Static).update("")
         self._transcript.clear()
         if self._runtime is not None:
             self._render_session_info()
+        self._refresh_subtitle()
         self._write(f"已开始新会话 {self._session_id}", "dim")
 
     def action_clear_log(self) -> None:

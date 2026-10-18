@@ -70,6 +70,9 @@ def test_advance_increments_step_and_resets_per_step_state() -> None:
         "review": {},
         "empty_step_nudged": False,
         "retry": 0,
+        "same_failure_count": 0,
+        "last_failure_signature": "",
+        "last_verification": {},
     }
     # review_watermark **不在这里清**：它必须跨步骤保留，否则每一步都会重审
     # 前面所有步骤的改动（留底记的是写前内容，老文件永远与自己的留底不同）
@@ -240,11 +243,16 @@ def _approved_state(message: AIMessage, **extra) -> dict:
     return {"messages": [message], "cwd": "/home/u/ws", "approvals": approvals, **extra}
 
 
+def _tools_run(node, state, config=None):  # noqa: ANN001
+    """tools 节点是 async 的（要 await 子智能体），单测里同步驱动。"""
+    return asyncio.run(node(state, config))
+
+
 def test_tools_injects_state_cwd_when_model_omits_it() -> None:
     tool = _FakeTool("shell_exec")
     node = make_tools_node([tool])
     message = _tool_call("shell_exec", {"command": "ls", "reason": "r"})
-    node(_approved_state(message), None)
+    _tools_run(node, _approved_state(message), None)
     assert tool.seen["cwd"] == "/home/u/ws"
 
 
@@ -252,7 +260,7 @@ def test_tools_keeps_explicit_cwd() -> None:
     tool = _FakeTool("shell_exec")
     node = make_tools_node([tool])
     message = _tool_call("shell_exec", {"command": "ls", "reason": "r", "cwd": "/tmp"})
-    node(_approved_state(message), None)
+    _tools_run(node, _approved_state(message), None)
     assert tool.seen["cwd"] == "/tmp"
 
 
@@ -260,25 +268,25 @@ def test_tools_does_not_inject_cwd_for_other_tools() -> None:
     tool = _FakeTool("file_read")
     node = make_tools_node([tool])
     message = _tool_call("file_read", {"path": "a.py"})
-    node(_approved_state(message), None)
+    _tools_run(node, _approved_state(message), None)
     assert tool.seen == {"path": "a.py"}
 
 
 def test_unknown_tool_is_reported_to_model() -> None:
     node = make_tools_node([_FakeTool("shell_exec")])
-    out = node(_approved_state(_tool_call("nope", {})), None)
+    out = _tools_run(node, _approved_state(_tool_call("nope", {})), None)
     assert "不存在名为 nope 的工具" in out["messages"][0].content
 
 
 def test_tool_exception_is_captured_not_raised() -> None:
     node = make_tools_node([_BoomTool()])
-    out = node(_approved_state(_tool_call("boom", {})), None)
+    out = _tools_run(node, _approved_state(_tool_call("boom", {})), None)
     assert "工具执行异常：RuntimeError: kaboom" in out["messages"][0].content
 
 
 def test_tool_results_are_paired_with_call_ids() -> None:
     node = make_tools_node([_FakeTool("shell_exec")])
-    out = node(_approved_state(_tool_call("shell_exec", {}, call_id="abc123")), None)
+    out = _tools_run(node, _approved_state(_tool_call("shell_exec", {}, call_id="abc123")), None)
     assert isinstance(out["messages"][0], ToolMessage)
     assert out["messages"][0].tool_call_id == "abc123"
 
@@ -301,7 +309,7 @@ def test_denied_call_is_not_executed() -> None:
     tool = _RecordingTool("shell_exec")
     node = make_tools_node([tool])
     message = _tool_call("shell_exec", {"command": "rm -rf /", "reason": "r"}, call_id="c1")
-    out = node({"messages": [message], "approvals": {"c1": "denied"}}, None)
+    out = _tools_run(node, {"messages": [message], "approvals": {"c1": "denied"}}, None)
 
     assert tool.invoked is False
     assert "用户拒绝了这条命令" in out["messages"][0].content
@@ -311,7 +319,8 @@ def test_missing_approval_fails_closed() -> None:
     """没有审批记录的调用一律不执行 —— 编排出问题时必须往安全侧倒。"""
     tool = _RecordingTool("shell_exec")
     node = make_tools_node([tool])
-    out = node({"messages": [_tool_call("shell_exec", {"command": "ls"}, call_id="c1")]}, None)
+    state = {"messages": [_tool_call("shell_exec", {"command": "ls"}, call_id="c1")]}
+    out = _tools_run(node, state, None)
 
     assert tool.invoked is False
     assert "没有获得审批记录" in out["messages"][0].content
@@ -321,23 +330,44 @@ def test_approved_call_is_executed() -> None:
     tool = _RecordingTool("shell_exec")
     node = make_tools_node([tool])
     message = _tool_call("shell_exec", {"command": "pip install x", "reason": "r"}, call_id="c1")
-    out = node({"messages": [message], "approvals": {"c1": "approved"}}, None)
+    out = _tools_run(node, {"messages": [message], "approvals": {"c1": "approved"}}, None)
 
     assert tool.invoked is True
     assert out["messages"][0].artifact["decision"] == "approved"
 
 
+def test_tools_sets_run_dirty_for_a_mutation() -> None:
+    """run_dirty 是运行级的：advance 每步清 dirty，但不能清掉它。"""
+    tool = _FakeTool("file_edit")
+    node = make_tools_node([tool])
+    message = _tool_call("file_edit", {"path": "a.py"})
+    out = _tools_run(node, _approved_state(message), None)
+
+    assert out["dirty"] is True
+    assert out["run_dirty"] is True
+
+
+def test_tools_does_not_set_run_dirty_for_a_read() -> None:
+    tool = _FakeTool("file_read")
+    node = make_tools_node([tool])
+    message = _tool_call("file_read", {"path": "a.py"})
+    out = _tools_run(node, _approved_state(message), None)
+
+    assert out["dirty"] is False
+    assert out["run_dirty"] is False
+
+
 def test_approvals_are_consumed_after_use() -> None:
     """审批结果一次性有效，避免跨轮次误放行。"""
     node = make_tools_node([_FakeTool("shell_exec")])
-    out = node(_approved_state(_tool_call("shell_exec", {}, call_id="c1")), None)
+    out = _tools_run(node, _approved_state(_tool_call("shell_exec", {}, call_id="c1")), None)
     assert out["approvals"] == {}
 
 
 def test_denied_call_artifact_marks_decision() -> None:
     node = make_tools_node([_FakeTool("shell_exec")])
     message = _tool_call("shell_exec", {"command": "pip install x"}, call_id="c1")
-    out = node({"messages": [message], "approvals": {"c1": "denied"}}, None)
+    out = _tools_run(node, {"messages": [message], "approvals": {"c1": "denied"}}, None)
 
     artifact = out["messages"][0].artifact
     assert artifact["rejected"] is True
@@ -349,7 +379,7 @@ def test_denied_non_file_tool_is_not_labeled_as_a_file_tool() -> None:
     被拒时不该产出 FileArtifact —— 那会让事件层标成「文件工具」。"""
     node = make_tools_node([_FakeTool("git_commit")])
     message = _tool_call("git_commit", {"message": "x"}, call_id="c1")
-    out = node({"messages": [message], "approvals": {"c1": "denied"}}, None)
+    out = _tools_run(node, {"messages": [message], "approvals": {"c1": "denied"}}, None)
 
     artifact = out["messages"][0].artifact
     assert artifact["kind"] == "call"
@@ -360,7 +390,7 @@ def test_denied_non_file_tool_is_not_labeled_as_a_file_tool() -> None:
 def test_denied_file_tool_still_gets_a_file_artifact() -> None:
     node = make_tools_node([_FakeTool("file_edit")])
     message = _tool_call("file_edit", {"path": "a.py"}, call_id="c1")
-    out = node({"messages": [message], "approvals": {"c1": "denied"}}, None)
+    out = _tools_run(node, {"messages": [message], "approvals": {"c1": "denied"}}, None)
     assert out["messages"][0].artifact["kind"] == "file"
 
 
@@ -369,22 +399,35 @@ def test_denied_file_tool_still_gets_a_file_artifact() -> None:
 def test_named_mutation_tool_marks_dirty() -> None:
     node = make_tools_node([_FakeTool("file_edit")])
     message = _tool_call("file_edit", {"path": "a.py"})
-    out = node(_approved_state(message), None)
+    out = _tools_run(node, _approved_state(message), None)
     assert out["dirty"] is True
+
+
+def test_read_only_sed_does_not_mark_dirty() -> None:
+    """`sed -n` 只写 stdout；误判成写会让探索步被拉去跑全量测试。"""
+    tool = _FakeTool("shell_exec")
+    node = make_tools_node([tool])
+    message = _tool_call(
+        "shell_exec", {"command": "sed -n '1,5p' f.py", "reason": "看"}
+    )
+    out = _tools_run(node, _approved_state(message), None)
+
+    assert out["dirty"] is False
+    assert out["run_dirty"] is False
 
 
 def test_shell_mutation_marks_dirty() -> None:
     """经 shell 的变更（sed -i 等）也必须置 dirty，否则 verify 会被跳过。"""
     node = make_tools_node([_FakeTool("shell_exec")])
     message = _tool_call("shell_exec", {"command": "sed -i 's/a/b/' f.py", "reason": "r"})
-    out = node(_approved_state(message), None)
+    out = _tools_run(node, _approved_state(message), None)
     assert out["dirty"] is True
 
 
 def test_shell_git_add_marks_dirty() -> None:
     node = make_tools_node([_FakeTool("shell_exec")])
     message = _tool_call("shell_exec", {"command": "git add src/", "reason": "r"})
-    out = node(_approved_state(message), None)
+    out = _tools_run(node, _approved_state(message), None)
     assert out["dirty"] is True
 
 
@@ -398,7 +441,7 @@ def test_failed_shell_mutation_still_marks_dirty() -> None:
     tool = _FakeTool("shell_exec", ok=False)
     node = make_tools_node([tool])
     message = _tool_call("shell_exec", {"command": "sed -i 's/a/b/' f.py && false", "reason": "r"})
-    out = node(_approved_state(message), None)
+    out = _tools_run(node, _approved_state(message), None)
 
     assert out["dirty"] is True
     # 提示同样要给出：改动确实发生了，而且没有留底
@@ -409,7 +452,7 @@ def test_failed_file_edit_does_not_mark_dirty() -> None:
     """文件工具的 ok=False 就是没写成（路径越界、替换没命中），不该触发验证。"""
     tool = _FakeTool("file_edit", ok=False)
     node = make_tools_node([tool])
-    out = node(_approved_state(_tool_call("file_edit", {"path": "a.py"})), None)
+    out = _tools_run(node, _approved_state(_tool_call("file_edit", {"path": "a.py"})), None)
 
     assert out["dirty"] is False
 
@@ -417,14 +460,14 @@ def test_failed_file_edit_does_not_mark_dirty() -> None:
 def test_shell_read_does_not_mark_dirty() -> None:
     node = make_tools_node([_FakeTool("shell_exec")])
     message = _tool_call("shell_exec", {"command": "ls -la", "reason": "r"})
-    out = node(_approved_state(message), None)
+    out = _tools_run(node, _approved_state(message), None)
     assert out["dirty"] is False
 
 
 def test_denied_shell_mutation_does_not_mark_dirty() -> None:
     node = make_tools_node([_FakeTool("shell_exec")])
     message = _tool_call("shell_exec", {"command": "sed -i 's/a/b/' f.py"}, call_id="c1")
-    out = node({"messages": [message], "approvals": {"c1": "denied"}}, None)
+    out = _tools_run(node, {"messages": [message], "approvals": {"c1": "denied"}}, None)
     assert out["dirty"] is False
 
 
@@ -432,21 +475,21 @@ def test_shell_mutation_warns_about_missing_snapshot() -> None:
     """经 shell 的改动没有留底、无法 file_restore —— 要提示模型改用文件工具。"""
     node = make_tools_node([_FakeTool("shell_exec")])
     message = _tool_call("shell_exec", {"command": "sed -i 's/a/b/' f.py", "reason": "r"})
-    out = node(_approved_state(message), None)
+    out = _tools_run(node, _approved_state(message), None)
     assert "没有快照留底" in out["messages"][0].content
 
 
 def test_shell_read_has_no_snapshot_warning() -> None:
     node = make_tools_node([_FakeTool("shell_exec")])
     message = _tool_call("shell_exec", {"command": "ls -la", "reason": "r"})
-    out = node(_approved_state(message), None)
+    out = _tools_run(node, _approved_state(message), None)
     assert "没有快照留底" not in out["messages"][0].content
 
 
 def test_file_edit_has_no_snapshot_warning() -> None:
     """文件工具本身就有快照，不该出现这条提示。"""
     node = make_tools_node([_FakeTool("file_edit")])
-    out = node(_approved_state(_tool_call("file_edit", {"path": "a.py"})), None)
+    out = _tools_run(node, _approved_state(_tool_call("file_edit", {"path": "a.py"})), None)
     assert "没有快照留底" not in out["messages"][0].content
 
 

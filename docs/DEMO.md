@@ -141,6 +141,31 @@ cat calc.py          # 确认已还原
 **注意**：Web 端**固定拒绝**变更类命令（没有做审批交互），
 所以它只适合演示只读分析与多会话，不适合演示改动。要演示改动请用 TUI 或 CLI。
 
+## 备选：Harness 与评测（Phase 3A–4D）
+
+如果时间允许，演示“动态工作流 + 并发 worker + 实时干预”：
+
+```bash
+AGENT_ORCHESTRATOR_ENABLED=true agent tui
+```
+
+- 输入一个多交付物请求（例如“两件事一起做，分别改 app/alpha.py 与 app/beta.py”）；
+- 侧栏计划面板会显示任务图，worker 启动/结束是**实时**的；
+- 运行中输入 `/pause` 暂停、`/resume` 继续、`/cancel` 取消、`/add review 检查边界`；
+- 写模式下每个 implement 在独立 worktree 中修改，合并前留快照，`agent undo` 可回滚。
+
+评测与对比（不需要演示交互）：
+
+```bash
+python tests/eval/runner.py --verify-seeds          # 判定自检，无 API Key
+python tests/eval/runner.py --suite default --repeat 2
+python tests/eval/compare.py a.json b.json          # Δ 在 spread 内会拒绝下结论
+python tests/eval/steering_bench.py --repeat 3      # 干预延迟，无模型/WSL
+```
+
+> 口径提醒：`default` 套件当前已饱和（29/29 ×2），不要用它的单轮差异证明改进；
+> 要看并发/成本收益请用 `long` 套件并跑 `--repeat 2`。
+
 ---
 
 ## 常见现场问题

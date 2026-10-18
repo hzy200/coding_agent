@@ -226,8 +226,16 @@ def _classify_segment(segment: str) -> Verdict:
     if name in READ_ONLY_COMMANDS:
         return Verdict(CommandLevel.READ, f"{name} 属于只读命令", segment)
     if name in LOW_WRITE_COMMANDS:
-        if name == "sed" and any(w.startswith("-i") for w in words[1:]):
-            return Verdict(CommandLevel.MUTATE, "sed -i 会原地改写文件", segment)
+        if name == "sed":
+            in_place = any(
+                w.startswith(("-i", "--in-place")) for w in words[1:]
+            )
+            if in_place:
+                return Verdict(CommandLevel.MUTATE, "sed -i 会原地改写文件", segment)
+            # 不带 -i 的 sed 只写 stdout；输出重定向已在 classify() 单独拦截。
+            # 早先一律按 LOW_WRITE 处理，导致 `sed -n '1,5p' file` 这种纯读
+            # 也会置 dirty，探索步被误拉去跑全量测试。
+            return Verdict(CommandLevel.READ, "sed 不带 -i 时只读", segment)
         return Verdict(CommandLevel.LOW_WRITE, f"{name} 属于低风险写命令", segment)
 
     return Verdict(CommandLevel.MUTATE, f"未在白名单中的命令：{name}", segment)

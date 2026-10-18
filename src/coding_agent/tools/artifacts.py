@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 _TEXT_KEY = "text"
 _ARTIFACT_KEY = "artifact"
@@ -83,10 +83,43 @@ class CallArtifact(ToolArtifact):
     level_label: str = ""
 
 
+class SubAgentArtifact(ToolArtifact):
+    """一次子智能体运行的产物。
+
+    主模型只看到 `summary` 等压缩信息；这里保留结构化结果供事件层与审计层使用。
+    `tool_calls` 是子智能体实际执行过的只读工具调用，runtime 据此写逐条审计
+    （带 `agent_id`），否则子智能体的动作在主审计里不可见。
+    """
+
+    kind: Literal["subagent"] = "subagent"
+
+    agent_id: str = ""
+    # 触发这次委派的 delegate tool_call id，用于把子智能体动作挂回主调用
+    parent_call_id: str = ""
+    role: str = "explore"
+    goal: str = ""
+    # success / partial / failed / cancelled
+    status: Literal["success", "partial", "failed", "cancelled"] = "failed"
+    summary: str = ""
+    relevant_files: list[str] = Field(default_factory=list)
+    findings: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+    recommended_next_steps: list[str] = Field(default_factory=list)
+    # Phase 4D：只读 worker 建议追加的任务（host 会校验/去重/限量）。
+    proposed_tasks: list[dict[str, Any]] = Field(default_factory=list)
+    rounds: int = 0
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    duration_ms: int = 0
+    error: str = ""
+
+
 _ARTIFACT_TYPES: dict[str, type[ToolArtifact]] = {
     "shell": ShellArtifact,
     "file": FileArtifact,
     "call": CallArtifact,
+    "subagent": SubAgentArtifact,
 }
 
 

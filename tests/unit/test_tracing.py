@@ -45,6 +45,7 @@ def test_metadata_does_not_leak_prompts_or_file_contents() -> None:
         "approval_mode",
         "verify",
         "persistent",
+        "orchestrator",
     }
 
 

@@ -18,39 +18,41 @@
 四个选题创新点均已落地并有测试守着：双工具架构、可审计的命令安全策略、
 可回滚的修改流程、失败驱动的修复循环。
 
-**当前状态**：`pytest -m "not llm"` **1194 passed**、覆盖率 **90.0%**、lint 干净。
+**当前状态**：`pytest -m "not llm"` **1403 passed**、覆盖率 **89.9%**、lint 干净。
 （另有 3 个 `llm` 标记用例需要 `DEEPSEEK_API_KEY`，默认排除；不加 `-m` 时它们会真的调用模型。）
-CI 只跑不需要 WSL2 的子集（993 用例 / 覆盖 80.2%），覆盖率门槛设在 76 —— 沙箱层那部分
+CI 只跑不需要 WSL2 的子集（1196 用例 / 覆盖 81.3%），覆盖率门槛设在 76 —— 沙箱层那部分
 只在本地守得住，原因与差距见 [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md) 的 Q1。
-代码冻结后又做了多轮**缺陷收口与安全纵深**：大文件读取上限在读前生效、shell 变更也触发验证、
-只读命令参数越界升级、可选 `bwrap` 内核级隔离、写入体积不再受 argv 上限卡住（此前超过约 96 KB
-必然失败）、`$'…'` 与 `~user` 形式的越界读不再漏判、自动 verify 不再执行模型可写的 manifest
-里的命令，等等。逐条需求对照与已知限制见 [ACCEPTANCE.md](docs/ACCEPTANCE.md)，加固记录见
-[PLAN.md](docs/PLAN.md) §8、[BUG_AUDIT_2.md](docs/BUG_AUDIT_2.md) 与
+代码冻结后完成了多轮**缺陷收口与安全纵深**（读取上限、shell 变更验证、参数越界
+升级、可选 `bwrap`、manifest 命令隔离等）。当前已知限制见
+[ACCEPTANCE.md](docs/ACCEPTANCE.md)；历史加固记录见
+[PLAN.md](docs/PLAN.md)、[BUG_AUDIT_2.md](docs/BUG_AUDIT_2.md) 与
 [PHASE_A.md](docs/PHASE_A.md)。
 
 **两道质量关**：`verify` 跑项目自己的测试（行为对不对），`review` 在验证通过后做确定性
 代码审查（干不干净）——语法坏没坏、测试有没有被改弱、是否留下 `breakpoint()`、有没有写进
 `.agent/`。审查的「改动前」直接复用快照，只审新增行；阻断项与验证失败共用同一份修复预算。
-能力评测也随之补上**机制指标**（验证/修复/重规划次数、token）与**噪声地板**（`--repeat`），
-以及"不可比的数字不许冒充基线"的守卫。
+能力评测补上了**机制指标**（验证/修复/重规划、token、worker 成本/并发/冲突）、
+**噪声地板**（`--repeat`）、**噪声感知对比**（`compare.py`）与**干预延迟基准**
+（`steering_bench.py`），以及“不可比的数字不许冒充基线”的守卫。
 
 ## 文档
 
 | 文档 | 内容 |
 |---|---|
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 分层与依赖方向、一次运行的数据流、图状态生命周期、**15 条不变量**、取舍理由、扩展点 |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 分层与依赖方向、一次运行的数据流、图状态生命周期、**32 条不变量**、取舍理由、扩展点 |
 | [docs/WORKFLOW.md](docs/WORKFLOW.md) | **三套工作流**（运行 / 开发 / 使用）的设计、路由与状态生命周期、**评价与改进项** |
+| [docs/HARNESS.md](docs/HARNESS.md) | **Harness 化改进方案（Phase 3A–4D 已实现）**：动态工作流、并发 worker、worktree 写隔离、fan-in、运行中干预、worker 提议任务与噪声感知评测 |
 | [docs/COMPLEXITY.md](docs/COMPLEXITY.md) | **复杂度分析**：AST 度量、热点分布、耦合方向、**本质/偶然复杂度**区分与降复杂度建议 |
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | **环境配置完整流程**、前置条件、**实测依赖版本快照**、复现与导出、常见问题 |
 | [docs/USAGE.md](docs/USAGE.md) | 常见工作流、配置来源、**故障排查** |
 | [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) | **需求逐条对照**、自检清单、已知限制 |
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | **保护什么、假设对手是谁**、T1（防误操作）/ T2（防越狱）的边界与达标前置条件 |
 | [docs/DEMO.md](docs/DEMO.md) | 答辩演示讲稿（配 `scripts/demo.py`） |
-| [docs/PLAN.md](docs/PLAN.md) | 开发方案、四个月排期、风险与进度 |
-| [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md) | **技术分析报告 + 三个月改进计划**：以「高性能自主编码智能体」为目标的缺陷分级（P0–P3）与 W1–W12 排期 |
-| [docs/BUG_AUDIT.md](docs/BUG_AUDIT.md) | **功能缺陷与 BUG 审计（第一轮）**：14 项按严重度归档的实测缺陷（含证据位置、触发路径、修复方向与优先级） |
-| [docs/BUG_AUDIT_2.md](docs/BUG_AUDIT_2.md) | **第二轮审计**：修复后重新审计出的 8 项（三份沙箱实例、文件工具冗余 `resolve`、上下文预算失效、审计每条扫目录、会话回溯单位、dirty 与 ok 耦合、异步不可取消等），含对第一轮一处收益记述的更正。**C1–C8 已全部修复** |
+| [docs/PLAN.md](docs/PLAN.md) | **历史记录**：四个月开发排期与冻结后的缺陷收口 |
+| [docs/IMPROVEMENT_PLAN.md](docs/IMPROVEMENT_PLAN.md) | **历史记录**：技术分析、P0–P3 缺陷分级与 W1–W12 改进排期 |
+| [docs/BUG_AUDIT.md](docs/BUG_AUDIT.md) | **历史记录**：第一轮功能缺陷审计（14 项） |
+| [docs/BUG_AUDIT_2.md](docs/BUG_AUDIT_2.md) | **历史记录**：第二轮审计（8 项，C1–C8 已修） |
+| [docs/PHASE_A.md](docs/PHASE_A.md) | **历史记录**：阶段 A 的安全纵深计划 |
 
 ## 快速开始
 
@@ -125,6 +127,7 @@ agent tui                         # 终端界面
 TUI 快捷键 `Ctrl+Q` 退出 · `Ctrl+N` 新会话 · `Ctrl+L` 清屏。
 斜杠命令：`/help` `/new` `/clear` `/workspace` `/audit` `/snapshots` `/diff` `/undo`
 `/sessions` `/switch` `/memory` `/remember` `/forget` `/quit`。
+运行中干预：`/pause` `/resume` `/cancel` `/add [角色] <目标>` `/replan`（Phase 3D）。
 
 ## 架构
 
@@ -138,11 +141,12 @@ TUI 快捷键 `Ctrl+Q` 退出 · `Ctrl+N` 新会话 · `Ctrl+L` 清屏。
                           │  图 + 沙箱 + 安全策略 + 审计 │
                           └───────────┬──────────────┘
                                       │ LangGraph
-   START → planner → act ─┬─→ approval_gate → tools ─→ act
-                          └─→ verify ─┬─(通过)─→ advance → replan ─┬─→ act
-                                      │                            └─→ respond → END
-                                      ├─(失败，有预算)→ repair ─→ act
-                                      └─(失败，预算尽)→ respond → END
+   START → route_entry ─┬─ direct → planner → act ⇄ approval_gate → tools
+                        │                  → verify → review → advance
+                        │                  → steering_step → replan → act/respond
+                        └─ orchestrated → survey → select_workflow → plan_tasks
+                                          → dispatch ⇄ extend_tasks/steering_dispatch
+                                          → synthesize → planner
                                       │ {tool, args}
                           ┌───────────▼──────────────┐
                           │   WSL2 沙箱（非 root）     │
@@ -174,7 +178,10 @@ CodingAgent/
 │  │  ├─ state.py              #   跨节点状态（生命周期见 ARCHITECTURE §5）
 │  │  ├─ routing.py            #   条件边（纯函数）
 │  │  ├─ build.py              #   组装图 + recursion_limit 推导
-│  │  └─ nodes/                #   planner·act·approve·tools·verify·repair·advance·respond
+│  │  └─ nodes/                #   planner·act·approve·tools·verify·review
+│  │                           #   repair·advance·nudge·replan·respond·steering
+│  ├─ orchestrator/            # survey·工作流选择·任务图·dispatch·extend·fan-in
+│  ├─ agents/                  # explore/review 子智能体循环（独立上下文）
 │  ├─ sandbox/                 # 执行安全层
 │  │  ├─ wsl_exec.py           #   WSL2 执行（脚本经 stdin）+ 可选 bwrap 隔离
 │  │  ├─ limits.py             #   ulimit / timeout 资源上限
@@ -198,8 +205,8 @@ CodingAgent/
 │  ├─ unit/                    #   纯逻辑（含假图驱动的 runtime 事件流）
 │  ├─ integration/             #   真实 WSL 沙箱（无环境自动跳过）
 │  ├─ tui/                     #   无头驱动界面
-│  └─ eval/                    #   端到端能力评测（20 任务，需 API Key，不进 CI）
-├─ docs/                       # 9 份文档（见上表）
+│  └─ eval/                    #   能力评测（default 29 + long 6，需 API Key，不进 CI）
+├─ docs/                       # 14 份文档（含 5 份历史记录，见上表）
 ├─ scripts/demo.py             # 四场景演示脚本（对应四个创新点）
 ├─ .github/workflows/ci.yml    # CI：ruff + `pytest -m "not wsl and not llm"`
 ├─ Makefile                    # `make check` / `make test-all`
@@ -380,6 +387,13 @@ make cov              # 与 CI 同口径：快反馈子集 + 覆盖率门槛
 pytest -m "not wsl and not llm"   # 快反馈循环：单元 + TUI + Web，约 1 分钟
 pytest -m "not llm"               # 全量（含真实 WSL 沙箱），约 2–3 分钟
 ruff check .          # lint
+
+# 能力评测（真实模型，成本自负）
+python tests/eval/runner.py --suite default --repeat 2
+# 两份 baseline 的噪声感知对比（Δ 在 spread 内会拒绝下结论）
+python tests/eval/compare.py tests/eval/baseline.json tests/eval/phase4_baseline.json
+# 干预延迟基准（不调用模型、不需要 WSL）
+python tests/eval/steering_bench.py --repeat 3
 ```
 
 CI（`.github/workflows/ci.yml`）在无 WSL 的托管 runner 上跑 `ruff` + 
@@ -398,9 +412,11 @@ CI（`.github/workflows/ci.yml`）在无 WSL 的托管 runner 上跑 `ruff` +
 `tests/tui` 与 `tests/unit/test_web_app.py`（无头驱动界面，注入假 runtime ——
 不需要 API Key 也不需要 WSL）。
 
-此外还有一层**能力评测**（`tests/eval`，20 个任务分单文件改动 / 跨文件重构 / 排障修复）：
-它度量"任务能不能做完"，不是回归，需要 API Key 且不进 CI。判定前会把测试文件
-还原成纯净副本，所以改测试没有收益。见 [tests/eval/README.md](tests/eval/README.md)：
+此外还有一层**能力评测**（`tests/eval`）：`default` 29 个短任务（单文件 / 跨文件 /
+排障 / 需求未覆盖）+ `long` 6 个几十文件的长程任务。它度量“任务能不能做完”，
+不是回归，需要 API Key 且不进 CI。default 套件当前已饱和（两轮 29/29），
+后续调优应换更难任务或 `long`。判定前会把测试文件还原成纯净副本，所以改测试
+没有收益。见 [tests/eval/README.md](tests/eval/README.md)：
 
 ```bash
 python tests/eval/runner.py --verify-seeds   # 种子自检，不需要 API Key
@@ -442,6 +458,12 @@ python tests/eval/runner.py                  # 全量，结果写 baseline.json
 | `AGENT_CONTEXT_MAX_CHARS` / `_KEEP_RECENT` / `_TOOL_CHARS` | `60000` / `12` / `1500` | 上下文裁剪；max=0 关闭 |
 | `AGENT_MAX_PLAN_STEPS` / `_TOOL_ROUNDS` / `_REPAIR_ROUNDS` / `_MAX_RESUMES` | `5` / `12` / `3` / `50` | 循环与恢复次数上限 |
 | `AGENT_MAX_REPLANS` | `2` | 执行中重建剩余计划的次数上限（0 = 不重规划） |
+| `AGENT_ORCHESTRATOR_ENABLED` | `false` | **Phase 3A–4D**：启用 orchestrator + 动态工作流/并发 worker（默认关闭）；3D 干预命令不依赖此开关 |
+| `AGENT_ORCHESTRATOR_MIN_FILES` | `30` | 仓库文件数达到该值才进入编排模式 |
+| `AGENT_ORCHESTRATOR_MAX_TASKS` / `_MAX_ROUNDS` / `_MAX_CONCURRENT_WORKERS` | `6` / `3` / `4` | 任务总数（含 worker 提议扩展）/ 调度轮次 / 并发 worker 上限 |
+| `AGENT_ORCHESTRATOR_TASK_RETRIES` | `1` | 单个编排任务失败后的重试次数（0 = 不重试） |
+| `AGENT_ORCHESTRATOR_WRITE_ENABLED` | `false` | **Phase 3C**：并发写 worker（需 `--write` + git 仓库根 + 干净工作区；worker 在 worktree 中修改） |
+| `AGENT_ORCHESTRATOR_WORKER_ROUNDS` / `_REPAIRS` / `_TIMEOUT` | `12` / `2` / `240` | implement worker 的单轮工具预算 / 修复轮次 / 墙钟上限 |
 
 状态文件位置（宿主侧与沙箱侧是两处，别混淆）见
 [USAGE.md](docs/USAGE.md)。

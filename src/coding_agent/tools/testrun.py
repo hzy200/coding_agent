@@ -13,7 +13,9 @@ verify 节点与 `run_tests` 工具共用这一套：探测项目用哪个测试
 
 from __future__ import annotations
 
+import hashlib
 import re
+import shlex
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -53,6 +55,13 @@ _TRACEBACK = re.compile(
 _PYTEST_FAILED = re.compile(
     r"^FAILED\s+(?P<loc>\S+?)(?:\s+-\s+(?P<msg>.+))?$", re.MULTILINE
 )
+# unittest 的失败行：FAIL: test_x (module.Class.test_x)
+_UNITTEST_FAILED = re.compile(
+    r"^(?:FAIL|ERROR):\s+\S+\s+\((?P<loc>[A-Za-z_][\w.]*)\)", re.MULTILINE
+)
+# 允许的 pytest nodeid：路径段 + ::测试名；不接受空白、shell 元字符与 `..`
+_PYTEST_NODEID = re.compile(r"^[A-Za-z0-9_./-]+(?:::[A-Za-z0-9_\[\].-]+)*$")
+_UNITTEST_NODEID = re.compile(r"^[A-Za-z_][\w.]*$")
 # pytest 的断言细节行：E   assert 1 == 2
 _ASSERTION_LINE = re.compile(r"^E\s+(?P<msg>\S.*)$", re.MULTILINE)
 # 异常收尾行：AssertionError: 0 != 2（unittest 与 pytest 都有）
@@ -80,6 +89,15 @@ class VerifyResult(BaseModel):
     summary: str = ""
     issues: list[VerifyIssue] = Field(default_factory=list)
     output_tail: str = ""
+    # 解析出的失败测试 nodeid（pytest）或 module.Class.test（unittest）。
+    # 用于 repair 时只跑失败测试，以及识别「同一个失败反复出现」。
+    failed_tests: list[str] = Field(default_factory=list)
+    # 失败签名的稳定哈希：测试 id + 归一化后的错误消息（去掉行号/地址/耗时）。
+    # 连续两次相同签名说明上一次修复没有改变失败本身。
+    failure_signature: str = ""
+    # full：跑了完整验证命令；selected：repair 时只跑了上次失败的测试；
+    # selected 通过后会自动补跑 full，所以最终落盘的通常是 full。
+    scope: Literal["full", "selected"] = "full"
     # 这次验证**有多强**：`tests`（跑了项目自己的测试）| `syntax`（只做了语法解析级兜底）
     # | `none`（什么都没跑）。
     #
@@ -179,6 +197,92 @@ def parse_issues(output: str, *, limit: int = MAX_ISSUES) -> list[VerifyIssue]:
         add_exception_reasons()
 
     return issues
+
+
+def _safe_nodeid(nodeid: str) -> bool:
+    """拒绝绝对路径与 `..`：nodeid 会被拼进下一条命令。"""
+    path = nodeid.split("::", 1)[0]
+    if nodeid.startswith(("/", "\\")):
+        return False
+    return ".." not in path.split("/") and ".." not in path.split("\\")
+
+
+def parse_failed_tests(output: str, *, limit: int = MAX_ISSUES) -> list[str]:
+    """从测试输出里抽出失败测试 id，保持出现顺序并去重。
+
+    只接受白名单形状的 nodeid：repair 会把它拼进下一条测试命令，
+    不能让测试输出（可能由模型写的测试文件产生）注入任意参数或路径。
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    for match in _PYTEST_FAILED.finditer(output):
+        loc = match.group("loc")
+        if not _safe_nodeid(loc) or not _PYTEST_NODEID.match(loc):
+            continue
+        if loc not in seen:
+            seen.add(loc)
+            found.append(loc)
+        if len(found) >= limit:
+            return found
+
+    for match in _UNITTEST_FAILED.finditer(output):
+        loc = match.group("loc")
+        if not _safe_nodeid(loc) or not _UNITTEST_NODEID.match(loc):
+            continue
+        if loc not in seen:
+            seen.add(loc)
+            found.append(loc)
+        if len(found) >= limit:
+            return found
+
+    return found
+
+
+def compute_failure_signature(
+    *,
+    status: str,
+    kind: str,
+    failed_tests: list[str],
+    issues: list[VerifyIssue],
+) -> str:
+    """稳定的失败指纹：同一测试、同一类错误得到同一个值。
+
+    去掉行号、内存地址、耗时这类每次都会变的东西 —— 否则签名会漂移，
+    停滞检测永远不触发。
+    """
+    if status != "failed":
+        return ""
+    parts = [status, kind, *failed_tests]
+    # 即使已知失败测试 id，也要带上归一化后的错误消息：同一个测试可能换了
+    # 一种失败方式（断言变了/异常类型变了），那不算「原地打转」。
+    for issue in issues[:3]:
+        path = issue.location.split(":", 1)[0]
+        message = re.sub(r":\d+(?::\d+)?", "", issue.message)
+        # 对象地址通常带一个 "at" 前缀；先连它一起删，避免留下孤零零的 at
+        message = re.sub(r"\s+at\s+0x[0-9a-fA-F]+\b", "", message)
+        message = re.sub(r"\b0x[0-9a-fA-F]+\b", "", message)
+        message = re.sub(r"\s+", " ", message).strip()
+        parts.append(f"{path}:{message}")
+    return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _selected_command(resolved: str, only: tuple[str, ...]) -> str:
+    """把失败测试拼成一条 pytest 命令；不安全或不支持时返回空串。"""
+    if not only or "__AGENT_SYNTAX__" in resolved:
+        return ""
+    # 只对「就是 pytest」的命令做追加；`cd x && pytest` / `pytest && ruff`
+    # 这类组合命令追加参数会改变语义，退回全量更安全。
+    if not (resolved.startswith("python3 -m pytest") or resolved.startswith("pytest")):
+        return ""
+    safe = []
+    for nodeid in only:
+        if not _safe_nodeid(nodeid) or not _PYTEST_NODEID.match(nodeid):
+            continue
+        safe.append(nodeid)
+    if not safe:
+        return ""
+    return f"{resolved} {' '.join(shlex.quote(nodeid) for nodeid in safe)}"
 
 
 def extract_summary(output: str) -> str:
@@ -338,6 +442,7 @@ def run_verification(
     *,
     command: str = "",
     allow_manifest: bool = True,
+    only: tuple[str, ...] = (),
 ) -> VerifyResult:
     """执行一次验证并解析结果。
 
@@ -347,6 +452,10 @@ def run_verification(
     `allow_manifest=False` 供**自动 verify** 使用：它不过审批，因此不能执行
     命令文本来自工作区文件的命令（见 `_detect`）。模型主动调 `run_tests`
     走的是默认的 True —— 那条路径有审批兜着。
+
+    `only` 是 repair 的快速通道：只重跑上次失败的 pytest 测试。**子集通过后
+    必须补跑完整命令**，否则修复可能悄悄破坏其它测试；子集失败则直接返回，
+    省掉一次完整套件的等待。
     """
     resolved = detect_test_command(
         sandbox,
@@ -358,20 +467,41 @@ def run_verification(
         return VerifyResult(status="not_configured")
 
     kind = "syntax" if resolved.startswith("python3 - <<'__AGENT_SYNTAX__'") else "tests"
-    result = sandbox.run(resolved, cwd=root)
+    scope: Literal["full", "selected"] = "full"
+    effective = resolved
+    selected = _selected_command(resolved, only)
+    if selected:
+        effective = selected
+        scope = "selected"
+
+    result = sandbox.run(effective, cwd=root)
+
+    # 只跑失败测试通过了，不能据此宣布整步通过：补跑完整套件，抓回归。
+    if scope == "selected" and result.ok:
+        effective = resolved
+        scope = "full"
+        result = sandbox.run(effective, cwd=root)
+
     combined = f"{result.stdout}\n{result.stderr}"
+    status = "ok" if result.ok else "failed"
     issues = [] if result.ok else parse_issues(combined)
+    failed_tests = parse_failed_tests(combined) if not result.ok else []
 
     return VerifyResult(
-        status="ok" if result.ok else "failed",
+        status=status,
         kind=kind,
-        command=resolved,
+        command=effective,
         exit_code=result.exit_code,
         duration_ms=result.duration_ms,
         timed_out=result.timed_out,
         summary="超时" if result.timed_out else extract_summary(combined),
         issues=issues,
         output_tail=combined.strip()[-OUTPUT_TAIL_CHARS:],
+        failed_tests=failed_tests,
+        failure_signature=compute_failure_signature(
+            status=status, kind=kind, failed_tests=failed_tests, issues=issues
+        ),
+        scope=scope,
     )
 
 

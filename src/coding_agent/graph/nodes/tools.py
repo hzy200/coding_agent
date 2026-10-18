@@ -12,15 +12,19 @@ approval_gate 只负责"决定"（放行/询问/拒绝），真正拦住调用�
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from langchain_core.messages import ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 
+from coding_agent.agents.explore import DelegateRunner, render_subagent_result
 from coding_agent.graph.nodes.approve import tool_level
+from coding_agent.graph.plan import EXPLORE, current_step_kind
 from coding_agent.graph.state import AgentState
+from coding_agent.messages import last_human_text
 from coding_agent.sandbox.policy import APPROVED, AUTO, DENIED, DENY, CommandLevel
 from coding_agent.tools.artifacts import (
     CallArtifact,
@@ -29,6 +33,7 @@ from coding_agent.tools.artifacts import (
     pack,
     unpack,
 )
+from coding_agent.tools.delegate import DELEGATE_EXPLORE
 from coding_agent.tools.deps import DEPS_INSTALL
 from coding_agent.tools.files import (
     EDIT_TOOL_NAME,
@@ -132,15 +137,106 @@ def _denied_artifact(name: str, args: dict[str, Any], decision: str) -> dict[str
 
 def make_tools_node(
     tools: list[BaseTool],
-) -> Callable[[AgentState, RunnableConfig], dict[str, Any]]:
+    *,
+    delegate_runner: DelegateRunner | None = None,
+    max_delegate_calls: int = 0,
+    max_concurrent_agents: int = 1,
+) -> Callable[[AgentState, RunnableConfig], Awaitable[dict[str, Any]]]:
     tool_map = {tool.name: tool for tool in tools}
 
-    def run_tools(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+    async def run_tools(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         last = state["messages"][-1]
         calls = getattr(last, "tool_calls", None) or []
         approvals = state.get("approvals") or {}
         # 本步是否改过东西 —— 决定 verify 要不要跑
         dirty = bool(state.get("dirty"))
+        # 整个任务是否改过东西 —— 只在收尾时用来阻止「零改动却声称完成」。
+        # 必须与 dirty 分开：dirty 每步被 advance/planner 重置，存不住。
+        run_dirty = bool(state.get("run_dirty"))
+        # 任务级委派预算：planner 归零，这里递增
+        delegate_calls = int(state.get("delegate_calls", 0))
+        # 成本策略：按仓库规模给出的预算，以及「只有探索步能委派」的约束。
+        delegation_allowed = bool(state.get("delegation_allowed", True))
+        delegation_budget = int(state.get("delegation_budget", max_delegate_calls))
+        effective_max = min(int(max_delegate_calls), delegation_budget)
+        on_explore_step = current_step_kind(state) == EXPLORE
+
+        # ---- 同一条消息里的多个 delegate 并发执行（fan-out）----
+        # 先预扫描并占预算，再一次性 gather。预扫描保证：
+        #   - 被拒/未批准/当前不允许委派的调用不占预算；
+        #   - 超出有效预算的调用按原始顺序被拒绝；
+        #   - 结果按 call_id 回填，与 ToolMessage 的配对语义一致。
+        parent_request = last_human_text(state["messages"])
+        cwd = str(state.get("cwd", ""))
+        remaining = max(effective_max - delegate_calls, 0)
+        jobs: list[tuple[str, dict[str, Any], str]] = []
+        for call in calls:
+            if str(call.get("name", "")) != DELEGATE_EXPLORE:
+                continue
+            call_id = str(call.get("id", ""))
+            decision = approvals.get(call_id)
+            if (
+                decision not in _EXECUTABLE
+                or delegate_runner is None
+                or not delegation_allowed
+                or not on_explore_step
+                or remaining <= 0
+            ):
+                continue
+            jobs.append((call_id, dict(call.get("args") or {}), decision))
+            remaining -= 1
+
+        delegate_messages: dict[str, ToolMessage] = {}
+        if jobs:
+            runner = delegate_runner
+            assert runner is not None
+            semaphore = asyncio.Semaphore(max(1, int(max_concurrent_agents)))
+
+            async def _explore(
+                call_id: str, args: dict[str, Any], decision: str
+            ) -> ToolMessage:
+                async with semaphore:
+                    try:
+                        sub = await runner(
+                            args=args,
+                            call_id=call_id,
+                            parent_request=parent_request,
+                            cwd=cwd,
+                            config=config,
+                        )
+                        sub.decision = decision
+                        return ToolMessage(
+                            content=pack(render_subagent_result(sub), sub),
+                            tool_call_id=call_id,
+                            name=DELEGATE_EXPLORE,
+                            artifact=sub.model_dump(),
+                        )
+                    except Exception as exc:  # noqa: BLE001 - 单个子智能体失败不拖垮其它
+                        return ToolMessage(
+                            content=f"工具执行异常：{type(exc).__name__}: {exc}",
+                            tool_call_id=call_id,
+                            name=DELEGATE_EXPLORE,
+                            artifact=None,
+                        )
+
+            outcomes = await asyncio.gather(
+                *(_explore(*job) for job in jobs), return_exceptions=True
+            )
+            for (call_id, _args, _decision), outcome in zip(
+                jobs, outcomes, strict=True
+            ):
+                if isinstance(outcome, BaseException):
+                    delegate_messages[call_id] = ToolMessage(
+                        content=(
+                            f"工具执行异常：{type(outcome).__name__}: {outcome}"
+                        ),
+                        tool_call_id=call_id,
+                        name=DELEGATE_EXPLORE,
+                        artifact=None,
+                    )
+                else:
+                    delegate_messages[call_id] = outcome
+            delegate_calls += len(jobs)
 
         results: list[ToolMessage] = []
         for call in calls:
@@ -170,6 +266,79 @@ def make_tools_node(
             if name in CWD_INJECTED_TOOLS and args.get("cwd") is None and state.get("cwd"):
                 args["cwd"] = state["cwd"]
 
+            # 子智能体：由宿主执行，不走普通工具的 invoke 路径。
+            # 它同样是 tools 节点的子分支，审批与预算检查已经在上面完成。
+            # 已调度的调用直接取并发批次的结果；剩下的是未启用/超预算/内部异常。
+            if name == DELEGATE_EXPLORE:
+                precomputed = delegate_messages.get(call_id)
+                if precomputed is not None:
+                    results.append(precomputed)
+                    continue
+                if delegate_runner is None:
+                    content = "探索子智能体未启用（AGENT_EXPLORE_ENABLED=false）。"
+                    results.append(
+                        ToolMessage(
+                            content=content,
+                            tool_call_id=call_id,
+                            name=name,
+                            artifact=None,
+                        )
+                    )
+                    continue
+                if not delegation_allowed:
+                    content = (
+                        "当前任务未启用探索委派（仓库规模较小或委派策略关闭）；"
+                        "请直接使用 file_read / search_code / find_files。"
+                    )
+                    results.append(
+                        ToolMessage(
+                            content=content,
+                            tool_call_id=call_id,
+                            name=name,
+                            artifact=None,
+                        )
+                    )
+                    continue
+                if not on_explore_step:
+                    content = (
+                        "只有探索步（kind=explore）可以委派；"
+                        "当前步骤请自己完成，不要调用 delegate_explore。"
+                    )
+                    results.append(
+                        ToolMessage(
+                            content=content,
+                            tool_call_id=call_id,
+                            name=name,
+                            artifact=None,
+                        )
+                    )
+                    continue
+                if delegate_calls >= effective_max:
+                    content = (
+                        f"本任务最多委派 {effective_max} 次探索，"
+                        "已达到上限，请自行使用只读工具或结束这一步。"
+                    )
+                    artifact = _denied_artifact(name, args, "rejected")
+                    results.append(
+                        ToolMessage(
+                            content=pack(content, artifact),
+                            tool_call_id=call_id,
+                            name=name,
+                            artifact=artifact,
+                        )
+                    )
+                    continue
+                # 正常不可达：预扫描只在「可执行 + 有预算」时入队。
+                results.append(
+                    ToolMessage(
+                        content="探索子智能体调用未被调度（内部状态不一致）。",
+                        tool_call_id=call_id,
+                        name=name,
+                        artifact=None,
+                    )
+                )
+                continue
+
             tool = tool_map.get(name)
             if tool is None:
                 content = f"错误：不存在名为 {name} 的工具。可用工具：{sorted(tool_map)}"
@@ -180,7 +349,10 @@ def make_tools_node(
 
             artifact = None
             try:
-                content, artifact = unpack(tool.invoke(args, config))
+                # 现有工具/沙箱是同步的：放进线程池，避免阻塞事件循环。
+                content, artifact = unpack(
+                    await asyncio.to_thread(tool.invoke, args, config)
+                )
             except Exception as exc:  # noqa: BLE001 - 工具失败要回灌给模型而非中断
                 content = f"工具执行异常：{type(exc).__name__}: {exc}"
 
@@ -195,6 +367,7 @@ def make_tools_node(
                     # 它的 ok 正好是"改动是否发生"，所以只有它才看 ok。
                     if name == SHELL_TOOL_NAME or artifact.get("ok"):
                         dirty = True
+                        run_dirty = True
                     if name == SHELL_TOOL_NAME:
                         content += _SHELL_MUTATION_NOTE
                 content = pack(content, artifact)
@@ -206,6 +379,12 @@ def make_tools_node(
             )
 
         # 审批结果是一次性的：用完即清，避免跨轮次误放行
-        return {"messages": results, "approvals": {}, "dirty": dirty}
+        return {
+            "messages": results,
+            "approvals": {},
+            "dirty": dirty,
+            "run_dirty": run_dirty,
+            "delegate_calls": delegate_calls,
+        }
 
     return run_tools

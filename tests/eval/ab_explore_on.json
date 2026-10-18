@@ -1,0 +1,204 @@
+{
+  "passed": 0,
+  "total": 5,
+  "pass_rate": 0.0,
+  "by_category": {
+    "cross_file": {
+      "passed": 0,
+      "total": 4
+    },
+    "spec": {
+      "passed": 0,
+      "total": 1
+    }
+  },
+  "by_tier": {
+    "long": {
+      "passed": 0,
+      "total": 5
+    }
+  },
+  "mechanism": {
+    "runs": 1,
+    "verifications": {},
+    "subagent_statuses": {},
+    "max_delegate_batch": 0,
+    "subagent_input_tokens": null,
+    "subagent_output_tokens": null,
+    "tasks_with_verification": 0,
+    "repairs": 0,
+    "tasks_with_repair": 0,
+    "replans": 0,
+    "tasks_reporting_tokens": 5,
+    "subagents": 0,
+    "tasks_with_subagents": 0,
+    "input_tokens": 1444711,
+    "output_tokens": 24291
+  },
+  "tasks": [
+    {
+      "id": "long/discount_pipeline",
+      "category": "cross_file",
+      "tier": "long",
+      "verdict": "failed",
+      "tool_calls": 16,
+      "steps": 6,
+      "replans": 0,
+      "verifications": {},
+      "repairs": 0,
+      "writes": 0,
+      "subagents": 0,
+      "subagent_statuses": {},
+      "max_delegate_batch": 0,
+      "subagent_input_tokens": 0,
+      "subagent_output_tokens": 0,
+      "budget": {
+        "max_plan_steps": 8,
+        "max_tool_rounds": 16,
+        "max_repair_rounds": 5,
+        "max_replans": 3
+      },
+      "input_tokens": 267161,
+      "output_tokens": 4419,
+      "agent_seconds": 55.6
+    },
+    {
+      "id": "long/discount_spec",
+      "category": "spec",
+      "tier": "long",
+      "verdict": "failed",
+      "tool_calls": 19,
+      "steps": 6,
+      "replans": 0,
+      "verifications": {},
+      "repairs": 0,
+      "writes": 0,
+      "subagents": 0,
+      "subagent_statuses": {},
+      "max_delegate_batch": 0,
+      "subagent_input_tokens": 0,
+      "subagent_output_tokens": 0,
+      "budget": {
+        "max_plan_steps": 8,
+        "max_tool_rounds": 16,
+        "max_repair_rounds": 5,
+        "max_replans": 3
+      },
+      "input_tokens": 293192,
+      "output_tokens": 5010,
+      "agent_seconds": 49.7
+    },
+    {
+      "id": "long/discount_partial",
+      "category": "cross_file",
+      "tier": "long",
+      "verdict": "failed",
+      "tool_calls": 12,
+      "steps": 7,
+      "replans": 0,
+      "verifications": {},
+      "repairs": 0,
+      "writes": 0,
+      "subagents": 0,
+      "subagent_statuses": {},
+      "max_delegate_batch": 0,
+      "subagent_input_tokens": 0,
+      "subagent_output_tokens": 0,
+      "budget": {
+        "max_plan_steps": 8,
+        "max_tool_rounds": 16,
+        "max_repair_rounds": 5,
+        "max_replans": 3
+      },
+      "input_tokens": 239084,
+      "output_tokens": 4337,
+      "agent_seconds": 49.3
+    },
+    {
+      "id": "long/audit_trail",
+      "category": "cross_file",
+      "tier": "long",
+      "verdict": "failed",
+      "tool_calls": 15,
+      "steps": 6,
+      "replans": 0,
+      "verifications": {},
+      "repairs": 0,
+      "writes": 0,
+      "subagents": 0,
+      "subagent_statuses": {},
+      "max_delegate_batch": 0,
+      "subagent_input_tokens": 0,
+      "subagent_output_tokens": 0,
+      "budget": {
+        "max_plan_steps": 8,
+        "max_tool_rounds": 16,
+        "max_repair_rounds": 5,
+        "max_replans": 3
+      },
+      "input_tokens": 256940,
+      "output_tokens": 4373,
+      "agent_seconds": 47.4
+    },
+    {
+      "id": "long/discount_and_audit",
+      "category": "cross_file",
+      "tier": "long",
+      "verdict": "failed",
+      "tool_calls": 23,
+      "steps": 6,
+      "replans": 0,
+      "verifications": {},
+      "repairs": 0,
+      "writes": 0,
+      "subagents": 0,
+      "subagent_statuses": {},
+      "max_delegate_batch": 0,
+      "subagent_input_tokens": 0,
+      "subagent_output_tokens": 0,
+      "budget": {
+        "max_plan_steps": 8,
+        "max_tool_rounds": 16,
+        "max_repair_rounds": 5,
+        "max_replans": 3
+      },
+      "input_tokens": 388334,
+      "output_tokens": 6152,
+      "agent_seconds": 59.0
+    }
+  ],
+  "recorded_at": "2026-10-18T02:43:22+00:00",
+  "model": "deepseek-chat",
+  "git_commit": "d548603",
+  "git_dirty": true,
+  "aggregation": "single_run",
+  "noise": {
+    "repeats": 1,
+    "pass_rate_per_run": [
+      0.0
+    ],
+    "min": 0.0,
+    "max": 0.0,
+    "spread": 0.0,
+    "flipped": [],
+    "one_task_flip": 0.2,
+    "note": "观测到的逐次波动，不是置信区间；重复次数少时无统计效力。能分辨的最小差异由 spread 决定，不是由 one_task_flip 决定 —— 后者只是翻一个任务的算术粒度。"
+  },
+  "sandbox_capabilities": {
+    "python3": true,
+    "pytest": true,
+    "make": false,
+    "node": false,
+    "cargo": false,
+    "go": false
+  },
+  "max_replans": 2,
+  "review_enabled": true,
+  "nudge_empty_steps": true,
+  "explore_enabled": true,
+  "max_concurrent_agents": 4,
+  "suite": "long",
+  "subset_filter": "",
+  "comparable": false,
+  "comparable_reason": "工作区有未提交改动：数字说不清对应哪版代码"
+}

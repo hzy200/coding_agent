@@ -17,12 +17,20 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
+from coding_agent.graph.nodes.act import make_act_node
 from coding_agent.graph.nodes.planner import TaskPlan, make_planner_node
 from coding_agent.graph.nodes.respond import (
     BUDGET_EXHAUSTED_NOTE,
+    NO_CHANGES_NOTE,
     REPAIRS_EXHAUSTED,
     VERIFICATION_FAILED_NOTE,
     make_respond_node,
+)
+from coding_agent.graph.plan import PlanStepModel
+from coding_agent.llm.prompts import (
+    DELEGATION_NOTE,
+    DELEGATION_NOTE_DISABLED,
+    DELEGATION_NOTE_NOT_EXPLORE,
 )
 
 
@@ -100,6 +108,137 @@ def _sync(node):  # noqa: ANN001
     return wrapper
 
 
+# ---------------- act 的委派提示 ----------------
+
+def _delegate_state(**extra) -> dict:
+    return {
+        "messages": [HumanMessage(content="探索一下")],
+        "plan": ["探索", "实现"],
+        "plan_kinds": ["explore", "implement"],
+        "step_idx": 0,
+        "delegation_allowed": True,
+        "delegation_budget": 2,
+        **extra,
+    }
+
+
+def test_act_injects_the_delegation_budget() -> None:
+    llm = _FakeLLM()
+    _sync(make_act_node(llm, max_tool_rounds=5, delegate_enabled=True))(
+        _delegate_state(), None
+    )
+    assert DELEGATION_NOTE.format(max_calls=2) in llm.seen[0].content
+
+
+def test_act_disables_delegation_for_small_repos() -> None:
+    llm = _FakeLLM()
+    _sync(make_act_node(llm, max_tool_rounds=5, delegate_enabled=True))(
+        _delegate_state(delegation_allowed=False), None
+    )
+    assert DELEGATION_NOTE_DISABLED in llm.seen[0].content
+
+
+def test_act_disables_delegation_outside_an_explore_step() -> None:
+    llm = _FakeLLM()
+    _sync(make_act_node(llm, max_tool_rounds=5, delegate_enabled=True))(
+        _delegate_state(plan_kinds=["implement", "verify"]), None
+    )
+    assert DELEGATION_NOTE_NOT_EXPLORE in llm.seen[0].content
+
+
+def test_act_tells_implement_steps_to_read_then_edit() -> None:
+    """上下文被委派隔离后，主 agent 需要先读目标文件才能精确编辑。"""
+    llm = _FakeLLM()
+    _sync(make_act_node(llm, max_tool_rounds=5))(
+        _delegate_state(step_idx=1, plan_kinds=["explore", "implement"]), None
+    )
+    system = llm.seen[0].content
+    assert "先对本步骤涉及的目标文件各做一次 file_read" in system
+    assert "不要再做大范围探索" in system
+    assert "只给结论都不算完成" in system
+
+
+class _CountingLLM(_FakeLLM):
+    def __init__(self, reply: str = "答复", *, raises: bool = False) -> None:
+        super().__init__(reply)
+        self.calls = 0
+        self.raises = raises
+
+    async def ainvoke(self, messages: Any, config: Any = None) -> AIMessage:
+        self.calls += 1
+        if self.raises:
+            raise RuntimeError("forced tool_choice unsupported")
+        return await super().ainvoke(messages, config)
+
+
+def test_nudged_implement_step_forces_one_tool_call() -> None:
+    normal = _CountingLLM()
+    forced = _CountingLLM()
+    node = make_act_node(normal, max_tool_rounds=5, forced_llm=forced)
+    _sync(node)(
+        _delegate_state(
+            step_idx=1,
+            plan_kinds=["explore", "implement"],
+            empty_step_nudged=True,
+            dirty=False,
+            tool_rounds=0,
+        ),
+        None,
+    )
+    assert forced.calls == 1
+    assert normal.calls == 0
+
+
+def test_forced_tool_choice_is_not_repeated_after_the_first_round() -> None:
+    normal = _CountingLLM()
+    forced = _CountingLLM()
+    node = make_act_node(normal, max_tool_rounds=5, forced_llm=forced)
+    _sync(node)(
+        _delegate_state(
+            step_idx=1,
+            plan_kinds=["explore", "implement"],
+            empty_step_nudged=True,
+            dirty=False,
+            tool_rounds=1,
+        ),
+        None,
+    )
+    assert normal.calls == 1
+    assert forced.calls == 0
+
+
+def test_forced_tool_choice_falls_back_when_the_provider_rejects_it() -> None:
+    normal = _CountingLLM()
+    forced = _CountingLLM(raises=True)
+    node = make_act_node(normal, max_tool_rounds=5, forced_llm=forced)
+    _sync(node)(
+        _delegate_state(
+            step_idx=1,
+            plan_kinds=["explore", "implement"],
+            empty_step_nudged=True,
+            dirty=False,
+            tool_rounds=0,
+        ),
+        None,
+    )
+    assert forced.calls == 1
+    assert normal.calls == 1
+
+
+def test_implement_nudge_asks_for_a_read_then_edit() -> None:
+    llm = _FakeLLM()
+    _sync(make_act_node(llm, max_tool_rounds=5))(
+        _delegate_state(
+            step_idx=1,
+            plan_kinds=["explore", "implement"],
+            empty_step_nudged=True,
+            dirty=False,
+        ),
+        None,
+    )
+    assert "先 file_read **本步骤要改的目标文件**" in llm.seen[0].content
+
+
 # ---------------- planner ----------------
 
 def _plan_state(prompt: str = "把计算器加个除法") -> dict:
@@ -115,6 +254,52 @@ def test_planner_uses_model_steps() -> None:
     assert out["step_idx"] == 0
     assert out["retry"] == 0
     assert out["dirty"] is False
+
+
+def test_planner_injects_the_worker_context() -> None:
+    structured = _FakeStructured(TaskPlan(steps=["实现"]))
+    node = _sync(
+        make_planner_node(_FakeStructuredLLM(structured), max_steps=5, allow_write=False)
+    )
+    node(
+        {
+            "messages": [HumanMessage(content="改功能")],
+            "worker_context": "[编排器汇总]\n入口在 main.py",
+        },
+        None,
+    )
+    request = structured.calls[-1][-1].content
+    assert "入口在 main.py" in request
+
+
+def test_act_injects_the_worker_context() -> None:
+    llm = _FakeLLM()
+    _sync(make_act_node(llm, max_tool_rounds=5))(
+        {
+            "messages": [HumanMessage(content="实现")],
+            "worker_context": "[编排器汇总]\n入口在 main.py",
+        },
+        None,
+    )
+    assert "入口在 main.py" in llm.seen[0].content
+
+
+def test_planner_preserves_step_kinds() -> None:
+    structured = _FakeStructured(
+        TaskPlan(
+            steps=[
+                PlanStepModel(text="读代码", kind="explore"),
+                PlanStepModel(text="加函数", kind="implement"),
+                PlanStepModel(text="跑测试", kind="verify"),
+            ]
+        )
+    )
+    out = _sync(
+        make_planner_node(_FakeStructuredLLM(structured), max_steps=5, allow_write=False)
+    )(_plan_state(), None)
+
+    assert out["plan"] == ["读代码", "加函数", "跑测试"]
+    assert out["plan_kinds"] == ["explore", "implement", "verify"]
 
 
 def test_planner_asks_with_pydantic_schema() -> None:
@@ -147,6 +332,8 @@ def test_planner_falls_back_when_model_returns_nothing() -> None:
     node = _sync(make_planner_node(_FakeStructuredLLM(structured), max_steps=5, allow_write=False))
     out = node(_plan_state("把除法加上"), None)
     assert out["plan"] == ["把除法加上"]
+    # 降级计划不知道类型：unknown 保留原有的宽松路由
+    assert out["plan_kinds"] == ["unknown"]
     # 合法 JSON 但 steps 为空，同样是「没规划出来」
     assert out["plan_degraded"] is True
 
@@ -158,6 +345,7 @@ def test_planner_falls_back_when_structured_output_keeps_failing() -> None:
 
     out = node(_plan_state("重构 parser"), None)
     assert out["plan"] == ["重构 parser"]
+    assert out["plan_kinds"] == ["unknown"]
     assert out["plan_degraded"] is True
 
 
@@ -331,6 +519,53 @@ def test_respond_does_not_flag_budget_exhaustion_when_changes_were_made() -> Non
     llm = _FakeLLM()
     _sync(make_respond_node(llm))(_respond_state(budget_exhausted=True, dirty=True), None)
     assert BUDGET_EXHAUSTED_NOTE not in llm.seen[0].content
+
+
+def test_respond_uses_the_run_level_verification_after_a_replan() -> None:
+    """replan 清空 verification 后，收尾仍要看到最近一次真实失败。"""
+    llm = _FakeLLM("任务已完成")
+    out = _sync(make_respond_node(llm))(
+        _respond_state(
+            verification={},
+            last_verification={
+                "status": "failed",
+                "command": "pytest -q",
+                "summary": "3 failed",
+            },
+        ),
+        None,
+    )
+
+    assert "3 failed" in llm.seen[0].content
+    answer = out["messages"][0].content
+    assert "系统提示" in answer
+    assert "不能视为任务已完成" in answer
+
+
+def test_respond_does_not_append_a_warning_when_the_last_verification_passed() -> None:
+    llm = _FakeLLM("完成")
+    out = _sync(make_respond_node(llm))(
+        _respond_state(last_verification={"status": "ok", "summary": "5 passed"}),
+        None,
+    )
+    assert "系统提示" not in out["messages"][0].content
+
+
+def test_respond_warns_when_a_multistep_run_made_no_changes() -> None:
+    """委派探索把读做完了、主 agent 一步没写，收尾不能让它编造完成。"""
+    llm = _FakeLLM()
+    _sync(make_respond_node(llm))(
+        _respond_state(plan=["探索", "实现"], run_dirty=False), None
+    )
+    assert NO_CHANGES_NOTE in llm.seen[0].content
+
+
+def test_respond_does_not_warn_no_changes_when_something_was_written() -> None:
+    llm = _FakeLLM()
+    _sync(make_respond_node(llm))(
+        _respond_state(plan=["探索", "实现"], run_dirty=True), None
+    )
+    assert NO_CHANGES_NOTE not in llm.seen[0].content
 
 
 @pytest.mark.parametrize("retry", [0, 1, 3])

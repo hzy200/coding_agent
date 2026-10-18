@@ -39,6 +39,7 @@ from harness import (  # noqa: E402
     eval_audit_dir,
     format_table,
     mechanism_summary,
+    merge_mechanisms,
     noise_summary,
     summarize,
 )
@@ -310,6 +311,111 @@ def test_mechanism_reports_none_when_nobody_reported() -> None:
     summary = mechanism_summary([_result("a")])
     assert summary["input_tokens"] is None
     assert summary["output_tokens"] is None
+
+
+def test_worker_cost_and_total_tokens_include_orchestrator_workers() -> None:
+    """Phase 4：worker 的 token 不并进 run_end，必须单独累加后再合总。"""
+    summary = mechanism_summary([
+        _result("a", input_tokens=100, output_tokens=10),
+        _result(
+            "b",
+            input_tokens=200,
+            output_tokens=20,
+            worker_input_tokens=1000,
+            worker_output_tokens=50,
+        ),
+    ])
+
+    assert summary["input_tokens"] == 300
+    assert summary["worker_input_tokens"] == 1000
+    assert summary["worker_output_tokens"] == 50
+    assert summary["total_input_tokens"] == 1300
+    assert summary["total_output_tokens"] == 80
+    assert summary["tasks_reporting_worker_tokens"] == 1
+
+
+def test_worker_parallelism_and_merge_quality() -> None:
+    summary = mechanism_summary([
+        _result(
+            "a",
+            agent_seconds=10.0,
+            workers=2,
+            worker_seconds=12.0,
+            worker_roles={"implement": 2},
+            worker_merged=1,
+            worker_merge_attempts=2,
+            worker_conflicts=1,
+        ),
+        _result("b", agent_seconds=10.0),
+    ])
+
+    assert summary["workers"] == 2
+    assert summary["tasks_with_workers"] == 1
+    assert summary["worker_roles"] == {"implement": 2}
+    assert summary["worker_seconds"] == 12.0
+    assert summary["worker_parallelism"] == 0.6
+    assert summary["worker_merge_attempts"] == 2
+    assert summary["worker_conflicts"] == 1
+    assert summary["merge_success_rate"] == 0.5
+    assert summary["conflict_rate"] == 0.5
+
+
+def test_merge_rates_are_none_when_no_merge_was_attempted() -> None:
+    """没有写任务时“冲突率 0%”会误导读者，必须是 None。"""
+    summary = mechanism_summary([_result("a", workers=1)])
+    assert summary["merge_success_rate"] is None
+    assert summary["conflict_rate"] is None
+    assert summary["worker_parallelism"] is None
+
+
+def test_merge_mechanisms_sums_new_worker_fields() -> None:
+    runs = [
+        {
+            "pass_rate": 0.5,
+            "tasks": [],
+            "mechanism": {
+                "worker_input_tokens": 100,
+                "worker_output_tokens": 10,
+                "worker_seconds": 2.0,
+                "agent_seconds": 4.0,
+                "workers": 2,
+                "tasks_with_workers": 1,
+                "worker_merged": 1,
+                "worker_merge_attempts": 2,
+                "worker_conflicts": 1,
+                "worker_roles": {"implement": 1, "explore": 1},
+            },
+        },
+        {
+            "pass_rate": 0.5,
+            "tasks": [],
+            "mechanism": {
+                "worker_input_tokens": 50,
+                "worker_output_tokens": 5,
+                "worker_seconds": 1.0,
+                "agent_seconds": 4.0,
+                "workers": 1,
+                "tasks_with_workers": 1,
+                "worker_merged": 1,
+                "worker_merge_attempts": 1,
+                "worker_conflicts": 0,
+                "worker_roles": {"implement": 1},
+            },
+        },
+    ]
+
+    merged = merge_mechanisms(runs)
+
+    assert merged["worker_input_tokens"] == 150
+    assert merged["total_input_tokens"] == 150
+    assert merged["worker_seconds"] == 3.0
+    assert merged["agent_seconds"] == 8.0
+    assert merged["worker_parallelism"] == 0.375
+    assert merged["worker_merged"] == 2
+    assert merged["worker_merge_attempts"] == 3
+    assert merged["worker_conflicts"] == 1
+    assert merged["merge_success_rate"] == 0.6667
+    assert merged["worker_roles"] == {"explore": 1, "implement": 2}
 
 
 def test_summary_carries_mechanism_and_per_task_detail() -> None:

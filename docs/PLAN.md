@@ -1,5 +1,9 @@
 # 基于 LangGraph 的终端原生编程智能体 — 开发方案
 
+> **历史记录（已归档）**：本文件保留四个月开发过程与冻结后的缺陷收口记录。
+> 文中“计划中/待办”是当时状态，当前实现与数字以 [README](../README.md)、
+> [ACCEPTANCE.md](ACCEPTANCE.md)、[HARNESS.md](HARNESS.md) 为准。
+
 > 开发环境：Windows 10/11 + WSL2（Ubuntu 发行版作为执行沙箱）
 > 模型：DeepSeek V4（OpenAI 兼容协议）
 > 追踪：LangSmith
@@ -953,5 +957,22 @@ pytest -q
 
 **至此「独立复核新增」只剩 Q1 收尾**（CI 里执行沙箱层）与两个已知遗留（B6、工具仍同步）。
 
-**核验**：`pytest -m "not llm"` = **1194 passed / 0 failed**；lint 干净。
+**核验（当时）**：`pytest -m "not llm"` = **1194 passed / 0 failed**；lint 干净。
 两份评测基线（`cd62014`）已重测并提交，含 `per_run` 各轮原始行。
+
+## 10. Harness 化（历史：Phase 3A–4D 已实现，见 HARNESS.md）
+
+> 完整方案见 [HARNESS.md](HARNESS.md)。本节只记录方向，不改变本文件的历史排期。
+
+目标是把系统从「单 agent + 角色化节点」推进到「orchestrator + 动态任务图 +
+并发 worker + fan-in」：
+
+- **3A** ✅ 已实现：动态工作流选择（`direct` / `parallel_readonly`）+
+  最小只读 worker。烟雾：`long/discount_and_audit` 通过，5 个任务 /
+  4 个并发 worker。
+- **3B** ✅ 已实现：任务级重试、partial/blocked、review worker、fan-in 文件重叠报告。
+- **3C** ✅ 已实现：implement worker + git worktree 隔离 + write_scope 校验 +
+  patch 合并/冲突（默认关闭）。
+- **3D**：实时用户干预（pause/resume/cancel/add/replan）。
+
+写并发与实时干预单独排期；首个切片只读，不修改工作区。

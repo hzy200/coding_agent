@@ -66,6 +66,8 @@ Linux 用户空间（非 root）
 | 审计（宿主侧、追加写、失败显式报出） | `audit/` | **接近 T2**（沙箱改不到） |
 | 可选内核级隔离 `AGENT_SHELL_SANDBOX=bwrap` | `sandbox/wsl_exec.py` | **T2 的一层**（opt-in，默认 off） |
 | 前端只消费事件、HTML 用 `textContent` | `tui/` `web/` | 接近 T2（无 XSS、无旁路执行） |
+| 编排写 worker：独立 worktree + `write_scope` + 合并前快照 | `orchestrator/implement.py`、`nodes.py` | T1（仍是 `--write` 预授权下的受控写路径） |
+| worker 提议任务只能只读，host 复核角色/去重/依赖/总量 | `orchestrator/graph.py::validate_proposals` | T1（不允许 worker 自由扩大写范围） |
 
 ## 5. 从 T1 升到 T2 需要的前置条件
 
@@ -110,6 +112,7 @@ Linux 用户空间（非 root）
 ### 5.7 审计完整性
 
 - **现状**：审计在**宿主侧**（好），但快照在**工作区内**（可被 agent 改）。
+  编排合并前的快照同样落在工作区 `.agent/backups/`。
 - **达标**：快照也移出工作区或加校验和；审计考虑远端/只追加存储，防"改完再抹痕"。
 
 ### 5.8 凭据

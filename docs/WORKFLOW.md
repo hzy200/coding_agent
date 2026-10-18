@@ -18,16 +18,17 @@
 ### 2.1 拓扑
 
 ```
-START → planner ─→ act ─┬─(有 tool_calls)→ approval_gate ─→ tools ─┐
-                        │                                          │
-                        │←─────────────────────────────────────────┘
-                        └─(本步做完)→ verify ─┬─(失败，有修复预算)→ repair ─→ act
-                                              ├─(失败，修复用尽)──→ replan ─┬─→ act（换做法）
-                                              │                            └─→ respond → END（没辙）
-                                              ├─(预算耗尽/空转)──→ respond → END
-                                              └─(通过/还有后续步)→ advance ─→ replan ─┬─→ act
-                                                                                      └─→ respond → END
+START → route_entry
+  ├─ direct ─→ planner → act ⇄ approval_gate → tools
+  │                     → verify → review → advance → steering_step → replan → act/respond
+  └─ orchestrated ─→ survey → select_workflow → plan_tasks
+                       → dispatch ⇄ extend_tasks → steering_dispatch → synthesize
+                       → planner → ...
 ```
+
+direct 路径的失败分支：verify/review 没过且还有预算 → repair → act；预算用尽 /
+同一失败签名停滞 → replan（换做法或砍掉剩余步骤）→ act/respond。
+`nudge` 给“一步没有任何改动”的实现步一次重做机会。
 
 它由**三个正交机制**拼成，是设计里最关键的一点：
 
@@ -36,12 +37,16 @@ START → planner ─→ act ─┬─(有 tool_calls)→ approval_gate ─→ t
    `replan` 在每次步进后重新审视**剩余步骤** —— 计划可以在执行中被修正。
 2. **执行内核**（`act` ⇄ `tools`）：出意图 → 审批 → 执行 → 结果回灌，循环到本步做完或轮次用尽。
 3. **验证-修复**（`verify` ⇄ `repair`）：改过东西就自动跑测试，失败带结构化错误重来，硬性上限。
+   多步任务只在 `kind=verify` 或最后一步跑全量 —— 早期实现步只完成了一部分，
+   每步都跑全量会被后面还没做的测试卡死（`AGENT_VERIFY_ONLY_FINAL=false` 可关）。
+   `kind=verify` 步即使 `dirty=False` 也会跑，因为它的职责就是全量确认。
 
 **修复与重规划的分工**：`repair` 修的是**这一步**（验证没过，重做），`replan` 修的是
 **后面**（计划本身不对了）。两者都有硬性次数上限，都不是"发现问题就无限重试"。
 
 三者通过**条件边**（`graph/routing.py`）组合；节点彼此不知道对方存在，加一个机制不用改其它两个。
-节点**只读状态、返回状态增量**，不产事件、不写审计——那是 `runtime` 的职责。
+节点**只读状态、返回状态增量**，不产事件、不写审计——那是 `runtime` 的职责；
+唯一例外是 `dispatch` 用 custom stream 实时推送 worker 开始/结束。
 
 ### 2.2 状态生命周期
 
@@ -50,27 +55,38 @@ START → planner ─→ act ─┬─(有 tool_calls)→ approval_gate ─→ t
 | 字段 | 生命周期 | 重置者 |
 |---|---|---|
 | `messages` | 全程累积（`add_messages`） | 只追加 |
-| `plan` / `step_idx` | 本任务 | planner 初始化，advance 递增，replan 改写剩余部分 |
+| `plan` / `plan_kinds` / `step_idx` | 本任务 | planner 初始化，advance 递增，replan 改写剩余部分（文本与 kind 同步） |
 | `replan_count` | **整个任务**的额度 | planner 清零、replan 递增（advance 不动它） |
 | `tool_rounds` | **本步** | planner / advance / repair 归零 |
 | `dirty` | **本步**是否改过东西 | planner / advance 清零、tools 置位、repair 置位 |
 | `verification` | 本步最近一次验证 | planner / advance 清空 |
 | `retry` | 本步修复次数 | planner / advance 清零、repair 递增 |
+| `same_failure_count` / `last_failure_signature` | 连续同一失败签名的次数与签名 | verify 写入；repair / replan 不清；只有 planner / advance 归零 |
+| `repo_profile` / `delegation_allowed` / `delegation_budget` | 仓库画像与委派预算 | runtime 注入 |
 | `budget_exhausted` | 本步是否撞上工具轮次上限 | planner / advance / repair 复位 |
 | `approvals` | **逐次调用**，用后即清 | approval_gate 写入、tools 清空 |
 
 **为什么重要**：把"每步"与"每轮"两类生命周期分开，是图能收敛的前提；
 `approvals` 的"用后即清"是**安全属性**而非清理——不清空会导致下一轮复用上一轮的批准。
 
+`plan_kinds` 与 `plan` 逐项对齐，取值 `explore / implement / verify / unknown`：
+探索与验证步允许零改动直接步进；实现步没有实际改动时先 nudge 一次，仍不落笔
+就如实收尾，而不是静默进入下一步。这是「委派探索做完读、主 agent 却声称实现完成」
+的直接修复。
+
 ### 2.3 路由决策（全部条件边）
 
 | 边 | 判定 | 依据 |
 |---|---|---|
 | `route_after_act` | 有 `tool_calls` → **approval_gate**；否则 → **verify** | 信任"有 tool_calls 就一定有预算"（act 超预算时不产 tool_calls，见 `nodes/act.py` 不变量） |
-| `route_after_verify` | `failed` 且 `retry < max` → **repair** | 失败驱动修复 |
+| `route_after_verify` | `failed` 且同一签名连续 ≥ `max_same_failures` → **replan** | 原地打转，继续 repair 只会重复同一类修改；replan 后同一签名继续累积（不变量 30） |
+| | `failed` 且 `retry < max` → **repair** | 失败驱动修复 |
 | | `failed` 且到上限 → **respond** | 如实上报"试过了没修好" |
 | | `budget_exhausted` 且 `not dirty` → **respond** | 空转步骤不静默跳过 |
 | | 其余 → **advance**（还有步）/ **respond** | 步进或收尾 |
+| `route_after_review` | `kind in (explore, verify)` → **advance/respond** | 这两类步骤本来就不产生改动 |
+| | `kind=implement` 且 `not dirty` 且未 nudge → **nudge** | 给一次真正落笔的机会 |
+| | `kind=implement` 且 nudge 过仍 `not dirty` → **respond** | 不能把"只读了"当成实现完成（不变量 29） |
 
 路由是**纯函数、无 I/O、无副作用**，因此可单独测（`tests/unit/test_routing.py` 覆盖每个分支）。
 
@@ -87,7 +103,8 @@ START → planner ─→ act ─┬─(有 tool_calls)→ approval_gate ─→ t
 
 `runtime._stream` 消费 LangGraph 的 `updates`，**同一份更新**既翻译成领域事件（给前端）又写成审计：
 
-- 节点不产事件；前端测试不关心图，节点测试不关心事件。
+- 节点不产事件（例外：`dispatch` 的 custom stream）；前端测试不关心图，
+  节点测试不关心事件。
 - 流式只在 `act` / `respond`（`messages` 模式），planner 的结构化调用不流式。
 - **挂起时以 `ApprovalRequested` 收尾，不发 `RunFinished`** → 前端据此判断该 resume 还是收工。
 - 前端三种实现（CLI/TUI/Web）共用同一套 `Event`；前端不得导入 `tools`/`sandbox`（AST 测试守着）。
@@ -100,7 +117,7 @@ START → planner ─→ act ─┬─(有 tool_calls)→ approval_gate ─→ t
 | `max_plan_steps` | 5 | 子任务数 |
 | `max_repair_rounds` | 3/步 | 修复次数硬上限 |
 | `max_replans` | 2/任务 | 重建剩余计划的次数上限（到顶后不再问模型） |
-| `recursion_limit` | `5×(3×156)+10` | 图超步防跑飞（按拓扑推导：每周期 `3×12+2`=38，修复阶段 `4×38+3`=155；重规划会给新做法重置预算，故「阶段+replan」重复 3 遍） |
+| `recursion_limit` | 由 `estimate_recursion_limit()` 推导 | 图超步防跑飞；公式覆盖 repair/replan/nudge/steering/orchestrator/任务扩展，改拓扑必须同步 |
 | 沙箱资源 | CPU 600s / 文件 512MB / 进程 1024 / 墙钟 60s | 单条命令层面 |
 
 ### 2.7 错误处理与降级
@@ -132,6 +149,86 @@ START → planner ─→ act ─┬─(有 tool_calls)→ approval_gate ─→ t
 
 ---
 
+### 2.10 Phase 1：只读 Explore 子智能体
+
+主模型可以在 `act` 阶段调用 `delegate_explore(goal, paths, reason)`，把一次只读探索
+交给独立上下文的子智能体：
+
+```
+act ──delegate_explore──▶ approval_gate（L0，自动放行）──▶ tools（宿主拦截）
+                                                             │
+                          ┌──────────────────────────────────┘
+                          ▼
+                  agents/explore.py
+                  独立 messages（只有系统提示 + 本次任务）
+                  file_read / search_code / find_files 循环
+                  ↓ 独立结构化调用
+                  SubAgentArtifact（summary / findings / files / tokens）
+                          │
+                          ▼
+                  ToolMessage 回灌主模型（只有压缩摘要）
+```
+
+要点：
+
+- **上下文隔离**：子智能体的工具输出不进入主 `messages`；主模型只拿到摘要。
+- **不能写**：只绑定 `EXPLORE_TOOL_NAMES`；构造时与运行时各校验一次。
+- **仍走审批**：delegate 本身是 L0 工具，经过 `approval_gate → tools`；
+  子智能体内部只读工具不再逐条审批，因为白名单保证没有副作用。
+- **并发 fan-out**：同一条 `act` 消息里的多个 `delegate_explore` 由 `tools` 节点
+  用 `asyncio.Semaphore + gather` 并发执行，结果按 `call_id` 回填。并发度由
+  `AGENT_MAX_CONCURRENT_AGENTS`（默认 4）限制；单个子智能体失败只影响自己。
+  fan-in 发生在主模型下一轮：它一次性收到所有子智能体的摘要。
+- **不要混写**：同一条消息里不要同时委派探索和 `file_write/file_edit`；
+  探索读取的是改动前的状态。提示词里已明确要求。
+- **成本感知**：runtime 在 `run()` 时探一次仓库文件数，按规模给委派预算：
+  `<30` 文件不委派；`30–99` 最多 2 次；`100–299` 最多 4 次；`≥300` 用
+  `AGENT_MAX_DELEGATE_CALLS`。只有 `kind=explore` 的步骤允许委派；
+  实现/验证步一律由主 agent 自己完成。
+- **有界**：`AGENT_EXPLORE_MAX_ROUNDS`（8）、`AGENT_EXPLORE_TIMEOUT`（120s）、
+  `AGENT_MAX_DELEGATE_CALLS`（6/任务）、`AGENT_MAX_CONCURRENT_AGENTS`（4）。
+- **默认关闭**：`AGENT_EXPLORE_ENABLED=false`，不改变既有行为与评测基线。
+- **事件**：`SubAgentStarted` / `SubAgentFinished`；多个并发子智能体按
+  `call_id` 配对。审计里每条子工具调用都带 `agent_id` / `parent_call_id`。
+
+### 2.11 编排模式（Phase 3A–4D，已实现，默认关闭）
+
+> 完整方案与阶段拆解见 [HARNESS.md](HARNESS.md)。
+
+运行模式：
+
+```
+START → route_entry
+  ├─ direct ───────────→ planner → act → ...
+  └─ orchestrated ─────→ survey → select_workflow → plan_tasks
+                          → dispatch → extend_tasks → steering_dispatch
+                          → synthesize → planner → ...
+```
+
+- 开关：`AGENT_ORCHESTRATOR_ENABLED`（默认 `false`）；
+- 模板：`direct` / `parallel_readonly` / `orchestrated_implement`；
+- 只读 worker：explore/test/review 并发；任务级失败重试
+  （`AGENT_ORCHESTRATOR_TASK_RETRIES`）；默认 `partial` 不满足依赖，
+  `depends_mode=any` 的 review/test 可消费 partial 产出；
+- **动态任务图（4D）**：explore/review 可提议最多 2 个只读任务；
+  `extend_tasks` 做 host 校验（角色/去重/依赖/总量/无环）后加入 pending；
+- 写 worker（Phase 3C，默认关闭）：需要 `AGENT_ORCHESTRATOR_WRITE_ENABLED=true`、
+  `--write`、git 仓库根 + 干净工作区；每个 implement 在独立 worktree 中修改，
+  write_scope 不得重叠，完成后由宿主顺序合并 patch，合并前留快照；
+- fan-in 只看每个任务的最后一次尝试，并报告多 worker 关注同一文件；
+- 实时干预（Phase 3D，TUI）：`/pause` `/resume` `/cancel` `/add` `/replan`；
+  指令在节点边界消费，pause 走 checkpoint，cancel 协作式停止 worker；
+- worker 的启动/结束通过 custom stream 实时发出（不批量回放）；
+- 关闭时完全走现有单 agent 路径，行为与基线一致。
+
+**已实现的是动态编排**：`survey → select_workflow → plan_tasks →
+dispatch → extend_tasks → steering_dispatch → synthesize → planner`。
+只读 worker 负责探索/测试/审查，并可提议新的只读任务；写 worker（3C，默认关闭）
+在独立 worktree 中并发修改、由宿主校验并合并 patch；编排结束后主 agent 仍负责
+最终验证与答复。烟雾结果见 [HARNESS.md §14](HARNESS.md)。
+
+---
+
 ## 3. 开发工作流
 
 ```
@@ -140,7 +237,8 @@ conda activate agent → make check（ruff + 快反馈）→ make test-all（含
 CI（ubuntu，无 WSL）: pip install -e ".[dev,ui,web]" → ruff → pytest -m "not wsl and not llm"
 ```
 
-- **本地三档**：`not wsl and not llm`（快，~40s）→ `wsl`（真实沙箱）→ `llm`（真调模型，需 Key）。
+- **本地三档**：`not wsl and not llm`（快，约 1 分钟）→ `wsl`（真实沙箱）→
+  `llm`（真调模型，需 Key，仅 3 条）。
 - **CI 与本地互补**：CI 无 WSL，只跑无沙箱用例。因此有两条硬约束——
   ① 标为 unit 的用例**真的不能碰 WSL**；② CI 必须装齐 `ui`/`web` extras（TUI/Web 测试需要）。
   这两条都曾导致过 CI 失败。
@@ -159,6 +257,22 @@ CI（ubuntu，无 WSL）: pip install -e ".[dev,ui,web]" → ruff → pytest -m 
 
 三者的 resume 循环结构相同，都基于"**挂起以 `ApprovalRequested` 收尾**"这条契约。
 
+### 4.1 运行中干预（TUI）
+
+运行中仍可输入斜杠命令；它们进入 `SteeringController`，由图节点在边界消费：
+
+| 命令 | 生效点 | 行为 |
+|---|---|---|
+| `/pause` | `steering_plan` / `steering_dispatch` / `steering_step` / `steering_final` | `interrupt()` 挂起；当前节点结束后不再派发新 worker |
+| `/resume` | 挂起状态 | `Command(resume=...)` 从 checkpoint 继续 |
+| `/cancel` | 同上 | 协作式停止 worker；未合并 patch 丢弃，已合并改动保留 |
+| `/add [角色] <目标>` | orchestrated：任务图；direct：计划 | 只接受 explore/test/review |
+| `/replan` | orchestrated：`plan_tasks`；direct：`replan` | 只重建剩余工作，已完成任务不重跑 |
+
+暂停期间普通 prompt 会被拒绝，必须先 `/resume` 或 `/cancel`。事件侧新增
+`SteeringApplied` 与 `WorkflowRevised`；审计写 `kind=steering`（含来源与动作）。
+CLI 与 Web 目前不提供实时控制入口。
+
 ---
 
 ## 5. 总体评价
@@ -170,13 +284,16 @@ CI（ubuntu，无 WSL）: pip install -e ".[dev,ui,web]" → ruff → pytest -m 
 | 可测性 | **A-**：不变量即测试；"unit 不得触达 WSL"有自动守卫 |
 | 收敛性 | **A**：预算 / 重试 / 超步三重上限 |
 | 鲁棒性 | **A-**：启动失败也事件化；剩余为成本与并发项 |
-| 成本控制 | **B**：按轮次/字符，非 token |
+| 成本控制 | **B**：按轮次/字符，非 token；worker token 已计量但未设硬预算 |
 
 ## 6. 后续改进（按性价比）
 
 | 优先级 | 改进 | 要点 |
 |---|---|---|
-| — | 暂无 | 工作流层面的已知项已全部处理 |
+| P1 | 全局/任务/worker token 预算 | 当前只计量与事后报告，未在运行中硬停 |
+| P1 | Web/CLI 实时控制入口 | 目前只有 TUI 能 pause/cancel/add/replan |
+| P2 | 共享文件的多 worker 合并 | 当前用 write_scope 不重叠规避 3-way rebase |
+| P2 | steering 队列持久化 | checkpoint 存暂停状态，未消费指令不跨进程 |
 
 **已完成**：`recursion_limit` 拓扑推导（W7）、shell 变更"未留底"提示、每 thread 恢复次数上限
 （`AGENT_MAX_RESUMES`）、token 用量累计（`usage_metadata` → `run_end` 审计，未引入 tokenizer）、

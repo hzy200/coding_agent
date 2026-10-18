@@ -432,6 +432,16 @@ class AuditTrailTest(unittest.TestCase):
         )
 '''
 
+# 编排阈值按仓库规模（`AGENT_ORCHESTRATOR_MIN_FILES`，默认 30）打开。
+# 这个任务只关心两个独立文件，所以补一批无依赖的占位模块，让工作区与其它
+# long 任务同量级（几十个文件），而不是为了演示去调低全局阈值。
+_PARALLEL_PADDING = {
+    f"app/support/module_{index:02d}.py": (
+        f'"""占位模块 {index}：与本次任务无关。"""\n\nVALUE = {index}\n'
+    )
+    for index in range(26)
+}
+
 LONG_TASKS = LONG_TASKS + (
     EvalTask(
         id="long/discount_partial",
@@ -507,6 +517,96 @@ LONG_TASKS = LONG_TASKS + (
             "python3 -m unittest -v tests.test_core tests.test_discount "
             "tests.test_audit_trail"
         ),
+        timeout=600,
+        budget=dict(_LONG_BUDGET),
+    ),
+    # Phase 3C 多写 worker 并发演示：两个功能落在两个**独立文件**，
+    # 写范围天然不重叠，planner 可以生成两个 implement 任务。
+    EvalTask(
+        id="long/parallel_modules",
+        category=CROSS_FILE,
+        tier=LONG,
+        prompt=(
+            "项目就在当前工作目录。两件事一起做，互不依赖，请分别完成：\n"
+            "1. 在 `app/alpha.py` 实现 `normalize_name(name)`：去掉首尾空白、"
+            "转小写、把连续空白替换成单个下划线；空字符串返回空字符串。\n"
+            "2. 在 `app/beta.py` 实现 `parse_duration(text)`：解析 `1h30m`、"
+            "`45s`、`2m` 这类时长并返回总秒数；无法解析时抛 `ValueError`。\n"
+            "两个文件互不依赖。项目自带的测试描述了精确要求，请让它们全部通过。"
+            "测试文件不要改（判定前会被还原），改动请落在源码上。"
+        ),
+        sources={
+            "app/__init__.py": "",
+            **_PARALLEL_PADDING,
+            "app/alpha.py": (
+                "def normalize_name(name: str) -> str:\n"
+                "    raise NotImplementedError(\"normalize_name\")\n"
+            ),
+            "app/beta.py": (
+                "def parse_duration(text: str) -> int:\n"
+                "    raise NotImplementedError(\"parse_duration\")\n"
+            ),
+            "pytest.ini": "[pytest]\n",
+        },
+        tests={
+            "tests/__init__.py": _TEST_INIT,
+            "tests/test_alpha.py": '''\
+import unittest
+
+from app.alpha import normalize_name
+
+
+class NormalizeNameTest(unittest.TestCase):
+    def test_strips_and_lowercases(self):
+        self.assertEqual(normalize_name("  Alice  "), "alice")
+
+    def test_collapses_whitespace_to_underscore(self):
+        self.assertEqual(normalize_name("Alice   Smith"), "alice_smith")
+
+    def test_empty(self):
+        self.assertEqual(normalize_name("   "), "")
+''',
+            "tests/test_beta.py": '''\
+import unittest
+
+from app.beta import parse_duration
+
+
+class ParseDurationTest(unittest.TestCase):
+    def test_hours_minutes(self):
+        self.assertEqual(parse_duration("1h30m"), 5400)
+
+    def test_seconds(self):
+        self.assertEqual(parse_duration("45s"), 45)
+
+    def test_minutes(self):
+        self.assertEqual(parse_duration("2m"), 120)
+
+    def test_invalid(self):
+        with self.assertRaises(ValueError):
+            parse_duration("nope")
+''',
+        },
+        reference={
+            "app/alpha.py": '''\
+def normalize_name(name: str) -> str:
+    return "_".join(name.strip().lower().split())
+''',
+            "app/beta.py": '''\
+import re
+
+_DURATION = re.compile(r"^(?:(\\d+)h)?(?:(\\d+)m)?(?:(\\d+)s)?$")
+
+
+def parse_duration(text: str) -> int:
+    match = _DURATION.match(text.strip())
+    if not match or not any(match.groups()):
+        raise ValueError(f"invalid duration: {text!r}")
+    hours, minutes, seconds = (int(part or 0) for part in match.groups())
+    return hours * 3600 + minutes * 60 + seconds
+''',
+        },
+        judge="python3 -m unittest -v tests.test_alpha tests.test_beta",
         timeout=600,
         budget=dict(_LONG_BUDGET),
     ),

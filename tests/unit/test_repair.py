@@ -79,6 +79,17 @@ def test_feedback_includes_command_summary_and_locations() -> None:
     assert "第 1/3 次" in text
 
 
+def test_feedback_includes_failed_tests_and_stagnation_note() -> None:
+    raw = {**FAILED, "failed_tests": ["tests/test_calc.py::test_add"]}
+    text = format_verification_feedback(
+        raw, attempt=2, limit=3, same_failure_count=1
+    )
+    assert "失败测试" in text
+    assert "tests/test_calc.py::test_add" in text
+    assert "失败签名没有变化" in text
+    assert "不要改测试文件" in text
+
+
 def test_feedback_warns_on_last_attempt() -> None:
     text = format_verification_feedback(FAILED, attempt=3, limit=3)
     assert "最后一次修复机会" in text

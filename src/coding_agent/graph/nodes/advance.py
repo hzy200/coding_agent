@@ -22,4 +22,8 @@ def advance(state: AgentState) -> dict[str, Any]:
         "review": {},
         # 修复预算按步计算，逐步重置
         "retry": 0,
+        # 新步骤的失败签名与上一步无关
+        "same_failure_count": 0,
+        "last_failure_signature": "",
+        "last_verification": {},
     }

@@ -25,13 +25,19 @@ route_after_review = make_route_after_review(MAX_REPAIRS)
 route_after_review_no_nudge = make_route_after_review(MAX_REPAIRS, nudge_empty_steps=False)
 
 
-def _state(messages, plan=None, step_idx=0, *, dirty=True):
+def _state(messages, plan=None, step_idx=0, *, dirty=True, plan_kinds=None):
     """默认 `dirty=True`。
 
     这一步的改动是**有意义的**：`dirty=False` 且没被 nudge 过时会走重做那条路
     （见 `nodes/nudge.py`），而本文件大半用例考的是"改动之后往哪去"。
     """
-    return {"messages": messages, "plan": plan or [], "step_idx": step_idx, "dirty": dirty}
+    return {
+        "messages": messages,
+        "plan": plan or [],
+        "plan_kinds": plan_kinds or [],
+        "step_idx": step_idx,
+        "dirty": dirty,
+    }
 
 
 # ---------------- act 之后 ----------------
@@ -207,6 +213,23 @@ def test_budget_exhausted_does_not_override_failed_verification() -> None:
     assert route_after_verify(state) == REPAIR
 
 
+def test_the_same_failure_signature_goes_to_replan() -> None:
+    """连续同一失败说明 repair 在重复同一类修改，继续试没有意义。"""
+    state = _state([AIMessage(content="改完了")], ["实现"], 0, dirty=True)
+    state["verification"] = {"status": "failed"}
+    state["retry"] = 0
+    state["same_failure_count"] = 2
+    assert route_after_verify(state) == REPLAN
+
+
+def test_one_repeat_still_gets_a_repair_chance() -> None:
+    state = _state([AIMessage(content="改完了")], ["实现"], 0, dirty=True)
+    state["verification"] = {"status": "failed"}
+    state["retry"] = 0
+    state["same_failure_count"] = 1
+    assert route_after_verify(state) == REPAIR
+
+
 # ---------------- 空步骤重做（nudge） ----------------
 #
 # `verify` 与 `review` 都只在 `dirty` 时跑。所以「这一步只读了文件」与
@@ -237,4 +260,76 @@ def test_nudged_last_step_still_responds() -> None:
 def test_the_nudge_can_be_turned_off() -> None:
     """关闭时必须回到旧行为 —— 现有基线要有一条可比的路。"""
     state = _state([AIMessage(content="只读")], ["a", "b"], 0, dirty=False)
+    assert route_after_review_no_nudge(state) == ADVANCE
+
+
+# ---------------- 结构化步骤 kind ----------------
+#
+# 委派探索把「读」做完了，不代表实现步做完了。kind=implement 的步骤
+# 没有 dirty 时必须被打回；给过一次机会仍不写则如实收尾，不能步进。
+
+def test_an_explore_step_without_changes_advances_without_nudge() -> None:
+    state = _state(
+        [AIMessage(content="读完了")], ["探索", "实现"], 0, dirty=False,
+        plan_kinds=["explore", "implement"],
+    )
+    assert route_after_review(state) == ADVANCE
+
+
+def test_a_verify_step_without_changes_advances_without_nudge() -> None:
+    state = _state(
+        [AIMessage(content="测试跑完了")], ["验证", "收尾"], 0, dirty=False,
+        plan_kinds=["verify", "verify"],
+    )
+    assert route_after_review(state) == ADVANCE
+
+
+def test_an_implement_step_without_changes_is_nudged() -> None:
+    state = _state(
+        [AIMessage(content="读完了")], ["实现"], 0, dirty=False, plan_kinds=["implement"]
+    )
+    assert route_after_review(state) == NUDGE
+
+
+def test_the_last_implement_step_nudged_without_changes_responds() -> None:
+    """最后一步给过一次机会仍然没写：不能当成完成，如实收尾。"""
+    state = _state(
+        [AIMessage(content="还是只读")], ["实现"], 0, dirty=False,
+        plan_kinds=["implement"],
+    )
+    state["empty_step_nudged"] = True
+    assert route_after_review(state) == RESPOND
+
+
+def test_a_middle_implement_step_nudged_without_changes_advances() -> None:
+    """中间实现步可能是「前面顺带做完了」；直接收尾会让后续步骤没机会执行。"""
+    state = _state(
+        [AIMessage(content="这一步已经做完")], ["实现", "报表", "验证"], 0, dirty=False,
+        plan_kinds=["implement", "implement", "verify"],
+    )
+    state["empty_step_nudged"] = True
+    assert route_after_review(state) == ADVANCE
+
+
+def test_an_implement_step_with_changes_advances() -> None:
+    state = _state(
+        [AIMessage(content="改完了")], ["实现", "后续"], 0, dirty=True,
+        plan_kinds=["implement", "verify"],
+    )
+    assert route_after_review(state) == ADVANCE
+
+
+def test_nudge_off_last_implement_without_changes_responds() -> None:
+    state = _state(
+        [AIMessage(content="只读")], ["实现"], 0, dirty=False,
+        plan_kinds=["implement"],
+    )
+    assert route_after_review_no_nudge(state) == RESPOND
+
+
+def test_nudge_off_middle_implement_without_changes_advances() -> None:
+    state = _state(
+        [AIMessage(content="只读")], ["实现", "后续"], 0, dirty=False,
+        plan_kinds=["implement", "verify"],
+    )
     assert route_after_review_no_nudge(state) == ADVANCE

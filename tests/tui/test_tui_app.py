@@ -31,11 +31,15 @@ from coding_agent.events import (
     RunFailed,
     RunFinished,
     RunStarted,
+    SteeringApplied,
     StepFinished,
     StepStarted,
+    TaskGraphExtended,
     ToolCallFinished,
     ToolCallStarted,
     Verification,
+    WorkerFinished,
+    WorkerStarted,
 )
 from coding_agent.memory.sessions import SessionInfo
 from coding_agent.runtime import HistoryMessage
@@ -85,6 +89,9 @@ class FakeRuntime:
         self.calls: list[tuple[str, str]] = []
         self.resumed: list[tuple[str, dict[str, bool]]] = []
         self.restore_calls: list[tuple[str | None, str | None]] = []
+        self.steer_calls: list[tuple[str, str, dict]] = []
+        self.resume_steering_calls: list[str] = []
+        self._paused = False
 
     def memories(self) -> list[str]:
         return list(self._memories)
@@ -110,6 +117,22 @@ class FakeRuntime:
 
     async def resume(self, thread_id: str, decisions: dict[str, bool]):
         self.resumed.append((thread_id, decisions))
+        for event in self._resume_events:
+            yield event
+
+    def steer(self, thread_id: str, action: str, **payload) -> None:
+        self.steer_calls.append((thread_id, action, payload))
+        if action == "pause":
+            self._paused = True
+        elif action == "cancel":
+            self._paused = False
+
+    def is_paused(self, thread_id: str) -> bool:
+        return self._paused
+
+    async def resume_steering(self, thread_id: str):
+        self.resume_steering_calls.append(thread_id)
+        self._paused = False
         for event in self._resume_events:
             yield event
 
@@ -1084,6 +1107,220 @@ def test_busy_state_rejects_second_prompt() -> None:
             assert len(runtime.calls) == 1
 
             blocking.set()
+            await pilot.pause()
+
+    _run(scenario())
+
+
+# ---------------- Phase 4：worker 事件与成本 ----------------
+
+def test_task_graph_extension_is_rendered() -> None:
+    async def scenario() -> None:
+        events = [
+            TaskGraphExtended(
+                added=[
+                    {
+                        "id": "ext-1",
+                        "role": "review",
+                        "goal": "检查边界",
+                    }
+                ],
+                rejected=["重复任务提议已忽略"],
+            ),
+            RunFinished(thread_id="t"),
+        ]
+        app = AgentTuiApp(runtime_factory=lambda: FakeRuntime(events))
+
+        async with app.run_test() as pilot:
+            app.query_one("#prompt", Input).value = "跑"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+
+            text = _transcript_text(app)
+            assert "动态扩展 1 个只读任务" in text
+            assert "ext-1" in text
+            assert "拒绝 1 个" in text
+
+    _run(scenario())
+
+
+def test_worker_events_and_worker_token_are_rendered() -> None:
+    async def scenario() -> None:
+        events = [
+            WorkerStarted(
+                role="implement", task_id="t1", goal="改实现", attempt=2
+            ),
+            WorkerFinished(
+                role="implement",
+                task_id="t1",
+                status="success",
+                summary="完成",
+                merged=True,
+                input_tokens=100,
+                output_tokens=10,
+            ),
+            RunFinished(
+                thread_id="t",
+                worker_input_tokens=100,
+                worker_output_tokens=10,
+            ),
+        ]
+        app = AgentTuiApp(runtime_factory=lambda: FakeRuntime(events))
+
+        async with app.run_test() as pilot:
+            app.query_one("#prompt", Input).value = "跑"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+
+            text = _transcript_text(app)
+            assert "第 2 次" in text
+            assert "已合并" in text
+            assert "worker token：in 100 / out 10" in text
+
+    _run(scenario())
+
+
+# ---------------- Phase 3D：实时干预 ----------------
+
+class _BlockingRuntime(FakeRuntime):
+    """run() 挂在一个 Event 上，给斜杠命令留出执行窗口。"""
+
+    def __init__(self, events: list) -> None:
+        super().__init__(events)
+        self.release = asyncio.Event()
+
+    async def run(self, prompt: str, *, thread_id: str):
+        self.calls.append((prompt, thread_id))
+        await self.release.wait()
+        for event in self._events:
+            yield event
+
+
+def test_steering_commands_work_while_busy() -> None:
+    async def scenario() -> None:
+        runtime = _BlockingRuntime([RunFinished(thread_id="t")])
+        app = AgentTuiApp(runtime_factory=lambda: runtime)
+
+        async with app.run_test() as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "跑个长任务"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            for command in (
+                "/pause",
+                "/add review 检查错误处理",
+                "/replan",
+            ):
+                prompt.value = command
+                await pilot.press("enter")
+                await pilot.pause()
+
+            actions = [(action, payload) for _, action, payload in runtime.steer_calls]
+            assert actions[0][0] == "pause"
+            assert actions[1][0] == "add"
+            assert actions[1][1] == {
+                "text": "检查错误处理",
+                "role": "review",
+            }
+            assert actions[2][0] == "replan"
+
+            runtime.release.set()
+            await pilot.pause()
+
+    _run(scenario())
+
+
+def test_pause_renders_and_blocks_new_prompts_until_resume() -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime(
+            [SteeringApplied(action="pause", detail="运行已暂停")],
+            resume_events=[
+                SteeringApplied(action="resume"),
+                RunFinished(thread_id="t", answer="继续完成"),
+            ],
+        )
+        app = AgentTuiApp(runtime_factory=lambda: runtime)
+
+        async with app.run_test() as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "长任务"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+
+            assert "已暂停" in _transcript_text(app)
+            assert "已暂停" in app.sub_title
+
+            prompt.value = "再开一个任务"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert "请用 /resume 继续或 /cancel 取消" in _transcript_text(app)
+            assert len(runtime.calls) == 1
+
+            prompt.value = "/resume"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+
+            assert runtime.resume_steering_calls == [app.session_id]
+            assert "已恢复" in _transcript_text(app)
+            assert "已暂停" not in app.sub_title
+
+    _run(scenario())
+
+
+def test_cancel_while_paused_also_resumes_so_the_command_is_consumed() -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime(
+            [SteeringApplied(action="pause", detail="运行已暂停")],
+            resume_events=[
+                SteeringApplied(action="cancel", detail="已取消"),
+                RunFinished(thread_id="t", answer="已取消"),
+            ],
+        )
+        app = AgentTuiApp(runtime_factory=lambda: runtime)
+
+        async with app.run_test() as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "长任务"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+
+            prompt.value = "/cancel"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+
+            assert ("cancel") in [action for _, action, _ in runtime.steer_calls]
+            assert runtime.resume_steering_calls == [app.session_id]
+            assert "已取消" in _transcript_text(app)
+
+    _run(scenario())
+
+
+def test_add_rejects_write_roles_without_calling_runtime() -> None:
+    async def scenario() -> None:
+        runtime = _BlockingRuntime([])
+        app = AgentTuiApp(runtime_factory=lambda: runtime)
+
+        async with app.run_test() as pilot:
+            prompt = app.query_one("#prompt", Input)
+            prompt.value = "跑个长任务"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            prompt.value = "/add implement 改 app/a.py"
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert runtime.steer_calls == []
+            assert "只支持只读任务" in _transcript_text(app)
+
+            runtime.release.set()
             await pilot.pause()
 
     _run(scenario())

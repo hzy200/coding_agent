@@ -22,6 +22,9 @@ class AgentState(TypedDict, total=False):
 
     # 计划与步进
     plan: list[str]
+    # 与 plan 逐项对齐的步骤类型：explore / implement / verify / unknown。
+    # planner 初始化，replan 同步改写剩余部分；advance 不碰。
+    plan_kinds: list[str]
     step_idx: int
     # planner 没解析出计划、退化成「整条请求当一步」时为 True。
     # **每次 planner 都要写**（正常时也写 False）：只写 True 的话，
@@ -42,6 +45,9 @@ class AgentState(TypedDict, total=False):
     budget_exhausted: bool
     # 本步是否改过文件/依赖：没改动就不必跑验证
     dirty: bool
+    # 整个任务是否产生过任何改动。与 `dirty` 的区别：后者每步重置，
+    # 前者只由 planner 归零。用于收尾时防止「一次都没写却声称已完成」。
+    run_dirty: bool
     # 本步是否已经因「一个改动都没产生」被要求重做过一次（上限一次，防死循环）。
     # 由 planner / advance / repair 复位，nudge 置位。
     empty_step_nudged: bool
@@ -60,6 +66,69 @@ class AgentState(TypedDict, total=False):
     review_watermark: str
     # 当前步骤已修复次数
     retry: int
+    # 连续出现**同一失败签名**的次数。verify 写入；repair 与 replan 都刻意不清
+    # （清了就检测不到原地打转）；只有 planner / advance（换了步骤）归零。
+    same_failure_count: int
+    # 上一次失败签名。replan 会清空 `verification`（旧结论针对旧做法），
+    # 但停滞检测需要跨做法比较，所以单独留一份。
+    last_failure_signature: str
+    # 整个运行最后一次真实执行过的验证结果。replan 会清空 `verification`，
+    # 但收尾时必须知道「最近一次验证到底过没过」，否则会声称成功。
+    last_verification: dict[str, Any]
+
+    # 本次运行的仓库画像与委派策略（runtime 在 run() 时注入）。
+    # repo_profile: {"file_count": int, "test_file_count": int}
+    repo_profile: dict[str, int]
+    # 小仓库或非 explore 步直接不允许委派；预算按仓库规模分级。
+    delegation_allowed: bool
+    delegation_budget: int
+
+    # 整个任务已委派给子智能体的次数（上限 max_delegate_calls）。
+    # 由 planner 归零、tools 递增；advance / repair 不动 —— 它是任务级预算，
+    # 不是每步的。与 tool_rounds 相互独立：一次委派只占主 agent 一轮工具预算。
+    delegate_calls: int
+
+    # ---------- Orchestrator（Phase 3A）----------
+    # runtime 注入：direct | orchestrated
+    execution_mode: str
+    # select_workflow 写入：direct | parallel_readonly
+    workflow: str
+    workflow_reason: str
+    # survey 写入：文件数、测试文件数、顶层目录、测试命令
+    repo_summary: dict[str, Any]
+    # plan_tasks 写入：TaskSpec 列表与状态
+    tasks: list[dict[str, Any]]
+    task_status: dict[str, str]
+    # task_id -> 已尝试次数（失败重试用）
+    task_attempts: dict[str, int]
+    # dispatch 追加：每个 worker 的结构化结果（含 attempt）
+    worker_results: list[dict[str, Any]]
+    orchestrator_round: int
+    orchestrator_degraded: bool
+    # synthesize 写入：交给主 agent 的压缩汇总与计数
+    orchestrator_summary: str
+    orchestrator_completed: int
+    orchestrator_failed: int
+    worker_context: str
+    # Phase 4D：worker 提议的只读任务扩展
+    # 已扫描到 worker_results 的哪个位置（避免重复采纳同一批提议）
+    task_extensions_seen: int
+    # extend_tasks 本轮实际追加的任务（runtime 翻译成事件）
+    task_extensions_applied: list[dict[str, Any]]
+    # 被拒绝的提议原因（只记录，不阻断运行）
+    task_extension_errors: list[str]
 
     # call_id -> auto | approved | denied，由 approval_gate 写入、tools 消费后清空
     approvals: dict[str, str]
+
+    # ---------- Steering（Phase 3D）----------
+    # 用户取消：路由直接去收尾，不再开始新的 worker/步骤。
+    steering_cancelled: bool
+    # 用户要求重规划剩余工作（orchestrated 回到 plan_tasks；direct 去 replan）。
+    steering_replan: bool
+    # 用户显式重规划的次数（上限复用 max_replans），防止 /replan 无限续命。
+    steering_replans: int
+    # 本轮已消费的指令（runtime 翻译成 SteeringApplied 事件）
+    steering_applied: list[dict[str, Any]]
+    # plan_tasks 在用户重规划后写入，runtime 翻译成 WorkflowRevised
+    workflow_revised_reason: str

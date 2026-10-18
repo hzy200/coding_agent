@@ -1,0 +1,106 @@
+{
+  "passed": 0,
+  "total": 1,
+  "pass_rate": 0.0,
+  "by_category": {
+    "cross_file": {
+      "passed": 0,
+      "total": 1
+    }
+  },
+  "by_tier": {
+    "long": {
+      "passed": 0,
+      "total": 1
+    }
+  },
+  "mechanism": {
+    "runs": 1,
+    "verifications": {
+      "failed": 12
+    },
+    "subagent_statuses": {
+      "rejected": 1,
+      "success": 2
+    },
+    "max_delegate_batch": 3,
+    "subagent_input_tokens": 61276,
+    "subagent_output_tokens": 6190,
+    "tasks_with_verification": 1,
+    "repairs": 8,
+    "tasks_with_repair": 1,
+    "replans": 4,
+    "tasks_reporting_tokens": 1,
+    "subagents": 3,
+    "tasks_with_subagents": 1,
+    "input_tokens": 513016,
+    "output_tokens": 12799
+  },
+  "tasks": [
+    {
+      "id": "long/discount_pipeline",
+      "category": "cross_file",
+      "tier": "long",
+      "verdict": "failed",
+      "tool_calls": 21,
+      "steps": 3,
+      "replans": 4,
+      "verifications": {
+        "failed": 12
+      },
+      "repairs": 8,
+      "writes": 5,
+      "subagents": 3,
+      "subagent_statuses": {
+        "success": 2,
+        "rejected": 1
+      },
+      "max_delegate_batch": 3,
+      "subagent_input_tokens": 61276,
+      "subagent_output_tokens": 6190,
+      "budget": {
+        "max_plan_steps": 8,
+        "max_tool_rounds": 16,
+        "max_repair_rounds": 5,
+        "max_replans": 3
+      },
+      "input_tokens": 513016,
+      "output_tokens": 12799,
+      "agent_seconds": 95.1
+    }
+  ],
+  "recorded_at": "2026-10-18T04:02:19+00:00",
+  "model": "deepseek-chat",
+  "git_commit": "d548603",
+  "git_dirty": true,
+  "aggregation": "single_run",
+  "noise": {
+    "repeats": 1,
+    "pass_rate_per_run": [
+      0.0
+    ],
+    "min": 0.0,
+    "max": 0.0,
+    "spread": 0.0,
+    "flipped": [],
+    "one_task_flip": 1.0,
+    "note": "观测到的逐次波动，不是置信区间；重复次数少时无统计效力。能分辨的最小差异由 spread 决定，不是由 one_task_flip 决定 —— 后者只是翻一个任务的算术粒度。"
+  },
+  "sandbox_capabilities": {
+    "python3": true,
+    "pytest": true,
+    "make": false,
+    "node": false,
+    "cargo": false,
+    "go": false
+  },
+  "max_replans": 2,
+  "review_enabled": true,
+  "nudge_empty_steps": true,
+  "explore_enabled": true,
+  "max_concurrent_agents": 4,
+  "suite": "long",
+  "subset_filter": "long/discount_pipeline",
+  "comparable": false,
+  "comparable_reason": "只跑了任务子集（--only）：统计口径与全量 baseline 不同；工作区有未提交改动：数字说不清对应哪版代码"
+}

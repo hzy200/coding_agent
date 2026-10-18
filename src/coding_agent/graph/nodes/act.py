@@ -28,9 +28,13 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
+from coding_agent.graph.plan import EXPLORE, IMPLEMENT, current_step_kind
 from coding_agent.graph.state import AgentState
 from coding_agent.llm.context import ContextBudget, trim_messages
 from coding_agent.llm.prompts import (
+    DELEGATION_NOTE,
+    DELEGATION_NOTE_DISABLED,
+    DELEGATION_NOTE_NOT_EXPLORE,
     compose_system_prompt,
     format_review_feedback,
     format_verification_feedback,
@@ -46,6 +50,8 @@ def make_act_node(
     allow_write: bool = False,
     max_repair_rounds: int = 0,
     budget: ContextBudget | None = None,
+    delegate_enabled: bool = False,
+    forced_llm: BaseChatModel | None = None,
 ) -> Callable[[AgentState, RunnableConfig], Awaitable[dict[str, Any]]]:
     # 裁剪只影响发给模型的内容，不改动写回 state 的历史
     trim_budget = budget or ContextBudget()
@@ -76,23 +82,59 @@ def make_act_node(
             )
         elif verification.get("status") == "failed" and attempt > 0:
             feedback = format_verification_feedback(
-                verification, attempt=attempt, limit=max_repair_rounds or attempt
+                verification,
+                attempt=attempt,
+                limit=max_repair_rounds or attempt,
+                same_failure_count=int(state.get("same_failure_count", 0)),
             )
+
+        delegation_note = ""
+        if delegate_enabled:
+            if not state.get("delegation_allowed", True):
+                delegation_note = DELEGATION_NOTE_DISABLED
+            elif current_step_kind(state) != EXPLORE:
+                delegation_note = DELEGATION_NOTE_NOT_EXPLORE
+            else:
+                budget = max(1, int(state.get("delegation_budget", 1)))
+                delegation_note = DELEGATION_NOTE.format(max_calls=budget)
 
         system = compose_system_prompt(
             plan=state.get("plan"),
+            plan_kinds=state.get("plan_kinds"),
             step_idx=state.get("step_idx", 0),
+            step_kind=current_step_kind(state),
             allow_write=allow_write,
             memories=state.get("memories"),
             feedback=feedback,
             # 上一步没产生任何改动、被 nudge 打回来重做 —— 把它明说给模型听，
             # 否则它只会把同样的事再做一遍
             empty_step=bool(state.get("empty_step_nudged")) and not state.get("dirty"),
+            # 只有 delegate 工具真的绑定时才提；否则会教模型调用一个不存在的工具
+            delegation_note=delegation_note,
+            worker_context=str(state.get("worker_context") or ""),
         )
         history, _ = trim_messages(state["messages"], trim_budget)
         messages = [SystemMessage(content=system), *history]
 
-        response = await llm.ainvoke(messages, config)
+        # 实测 deepseek-chat 在 implement 步偶尔会连续返回「无 tool_calls」的
+        # 空动作（读完文件但不动手）。被 nudge 之后的第一次调用强制 required，
+        # 至少让它先读目标文件；后续调用恢复自动选择，留出编辑机会。
+        force_tool = (
+            forced_llm is not None
+            and current_step_kind(state) == IMPLEMENT
+            and bool(state.get("empty_step_nudged"))
+            and not state.get("dirty")
+            and int(state.get("tool_rounds", 0)) == 0
+        )
+        model = forced_llm if force_tool else llm
+        try:
+            response = await model.ainvoke(messages, config)
+        except Exception:
+            if not force_tool:
+                raise
+            # 强制 tool_choice 在个别 provider/模式下可能被拒；退回普通调用，
+            # 不要让一次强制失败把整个运行打断。
+            response = await llm.ainvoke(messages, config)
         return {"messages": [response], "tool_rounds": rounds + 1}
 
     return act

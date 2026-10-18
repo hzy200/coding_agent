@@ -34,6 +34,8 @@ class PlanCreated(Event):
 
     type: Literal["plan_created"] = "plan_created"
     steps: list[str] = Field(default_factory=list)
+    # 与 steps 逐项对齐：explore / implement / verify / unknown
+    kinds: list[str] = Field(default_factory=list)
     degraded: bool = False
 
 
@@ -47,6 +49,7 @@ class PlanRevised(Event):
 
     type: Literal["plan_revised"] = "plan_revised"
     steps: list[str] = Field(default_factory=list)
+    kinds: list[str] = Field(default_factory=list)
     step_idx: int = 0
 
 
@@ -149,6 +152,8 @@ class Verification(Event):
     ok: bool | None = None
     summary: str = ""
     issues: list[str] = Field(default_factory=list)
+    # 解析出的失败测试 id，供前端/评测直接展示与统计
+    failed_tests: list[str] = Field(default_factory=list)
 
 
 class ReviewFinished(Event):
@@ -176,6 +181,138 @@ class RepairStarted(Event):
     limit: int = 0
     summary: str = ""
     issues: list[str] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------
+# 子智能体
+# --------------------------------------------------------------------------
+
+class SubAgentStarted(Event):
+    """主智能体把一次只读探索委派给了子智能体。
+
+    与 `ToolCallStarted` 同时发出：delegate 本身也是一次工具调用。前端按
+    `agent_id` 把后续的 `SubAgentFinished` 配对回来。
+    """
+
+    type: Literal["subagent_started"] = "subagent_started"
+    agent_id: str = ""
+    parent_call_id: str = ""
+    role: str = "explore"
+    goal: str = ""
+
+
+class WorkflowSelected(Event):
+    """编排器选择了一个工作流模板。"""
+
+    type: Literal["workflow_selected"] = "workflow_selected"
+    workflow: str = ""
+    reason: str = ""
+
+
+class TaskGraphCreated(Event):
+    """编排器生成了任务图（可能已降级为单任务）。"""
+
+    type: Literal["task_graph_created"] = "task_graph_created"
+    tasks: list[dict[str, Any]] = Field(default_factory=list)
+    degraded: bool = False
+
+
+class TaskGraphExtended(Event):
+    """运行中由 worker 提议、host 校验后追加的只读任务（Phase 4D）。"""
+
+    type: Literal["task_graph_extended"] = "task_graph_extended"
+    added: list[dict[str, Any]] = Field(default_factory=list)
+    rejected: list[str] = Field(default_factory=list)
+
+
+class WorkerStarted(Event):
+    """一个 worker 开始执行。
+
+    Phase 4：由 dispatch 通过 LangGraph custom stream 实时发出，而不是等整批
+    worker 结束后回放。`attempt` 便于前端区分重试。
+    """
+
+    type: Literal["worker_started"] = "worker_started"
+    worker_id: str = ""
+    task_id: str = ""
+    role: str = ""
+    goal: str = ""
+    attempt: int = 1
+
+
+class WorkerFinished(Event):
+    """一个 worker 结束；status: success / partial / failed / blocked。"""
+
+    type: Literal["worker_finished"] = "worker_finished"
+    worker_id: str = ""
+    task_id: str = ""
+    role: str = ""
+    status: str = ""
+    summary: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    duration_ms: int = 0
+    # 该任务的第几次尝试（1 = 首次；>1 表示重试）
+    attempt: int = 1
+    # Phase 3C：implement worker 的补丁是否已合并 / 合并错误
+    merged: bool = False
+    merge_error: str = ""
+    # worker 内部执行的工具调用数（审计里逐条落账）
+    tool_calls: int = 0
+
+
+class OrchestrationFinished(Event):
+    """编排阶段结束，worker 汇总即将交给主 agent。"""
+
+    type: Literal["orchestration_finished"] = "orchestration_finished"
+    completed: int = 0
+    failed: int = 0
+    summary: str = ""
+
+
+class SubAgentFinished(Event):
+    """子智能体结束。
+
+    `status`: success / partial / failed / rejected。partial 表示跑满了轮次、超时，
+    或报告生成失败但有兜底摘要 —— 主模型仍拿到可用信息，但不应把它当成完整结论。
+    rejected 表示宿主没让它跑（审批拒绝、任务级委派预算耗尽），与「跑了但失败」不同。
+    """
+
+    type: Literal["subagent_finished"] = "subagent_finished"
+    agent_id: str = ""
+    status: str = ""
+    summary: str = ""
+    relevant_files: list[str] = Field(default_factory=list)
+    findings: list[str] = Field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    duration_ms: int = 0
+
+
+class WorkflowRevised(Event):
+    """用户要求重规划后，剩余任务图被重建。
+
+    已完成/已合并的任务不会重跑；`tasks` 是重建后的**完整**任务列表
+    （含保留的已完成任务），前端据此刷新树状进度。
+    """
+
+    type: Literal["workflow_revised"] = "workflow_revised"
+    reason: str = ""
+    tasks: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SteeringApplied(Event):
+    """一条用户干预指令被图节点消费。
+
+    action: pause | resume | cancel | add | replan。
+    pause 在 `interrupt()` 时发出（事件流到此收尾，等待
+    `AgentRuntime.resume_steering`）；其余动作在节点更新时发出。
+    """
+
+    type: Literal["steering_applied"] = "steering_applied"
+    action: str = ""
+    task_id: str = ""
+    detail: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -219,8 +356,13 @@ class RunFinished(Event):
     type: Literal["run_finished"] = "run_finished"
     thread_id: str = ""
     answer: str = ""
+    # 主 agent 的 run_total（含委派子智能体，runtime 会并入）。
     input_tokens: int | None = None
     output_tokens: int | None = None
+    # 编排 worker 的用量。dispatch 不把 worker 并进 run_total，必须单列；
+    # 前端要显示总成本时自行相加。
+    worker_input_tokens: int | None = None
+    worker_output_tokens: int | None = None
 
 
 class RunFailed(Event):
@@ -234,6 +376,8 @@ class RunFailed(Event):
     message: str = ""
     input_tokens: int | None = None
     output_tokens: int | None = None
+    worker_input_tokens: int | None = None
+    worker_output_tokens: int | None = None
 
 
 EventType = (
@@ -248,6 +392,16 @@ EventType = (
     | Verification
     | ReviewFinished
     | RepairStarted
+    | WorkflowSelected
+    | TaskGraphCreated
+    | TaskGraphExtended
+    | WorkerStarted
+    | WorkerFinished
+    | OrchestrationFinished
+    | SubAgentStarted
+    | SubAgentFinished
+    | WorkflowRevised
+    | SteeringApplied
     | ApprovalRequested
     | RunStarted
     | RunFinished

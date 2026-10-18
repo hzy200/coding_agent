@@ -34,17 +34,25 @@ from langgraph.checkpoint.memory import MemorySaver
 from coding_agent.audit import AuditLogger
 from coding_agent.config import Settings
 from coding_agent.events import (
+    AssistantToken,
     PlanRevised,
     RepairStarted,
     RunFailed,
     RunFinished,
     StepStarted,
+    SubAgentFinished,
+    SubAgentStarted,
+    TaskGraphCreated,
     ToolCallStarted,
     Verification,
+    WorkerFinished,
+    WorkerStarted,
+    WorkflowSelected,
 )
 from coding_agent.runtime import AgentRuntime
 from coding_agent.sandbox.fs import SandboxFs
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
+from coding_agent.tools.delegate import DELEGATE_EXPLORE
 from coding_agent.tools.files import (
     EDIT_TOOL_NAME,
     RESTORE_TOOL_NAME,
@@ -184,6 +192,34 @@ class TaskResult:
     # review 都短路）。两种失败在通过率上长得一模一样，但含义天差地别：
     # 前者是"能力不足"，后者是"根本没动手"。没有这个数就分不开。
     writes: int = 0
+    # ---- 子智能体机制指标 ----
+    # 「开了 explore」不等于「真的委派过」。这几个数回答的是：
+    # 子智能体跑了几次、成功/部分/失败各几次、同一条消息里最多并发几个、
+    # 以及它们的 token 占比。没有这些，A/B 的差异无法归因到委派机制。
+    subagents: int = 0
+    subagent_statuses: dict[str, int] = field(default_factory=dict)
+    max_delegate_batch: int = 0
+    subagent_input_tokens: int = 0
+    subagent_output_tokens: int = 0
+    # ---- Phase 3A orchestrator 机制指标 ----
+    workflow: str = ""
+    tasks_planned: int = 0
+    workers: int = 0
+    worker_statuses: dict[str, int] = field(default_factory=dict)
+    max_worker_batch: int = 0
+    worker_retries: int = 0
+    worker_merged: int = 0
+    worker_tool_calls: int = 0
+    # worker 的花费与忙碌时间。主 agent 的 `input_tokens` **不含**编排 worker
+    # （dispatch 不把 worker 用量并入 run_end）；委派子智能体的 token 则已经
+    # 由 runtime 累加进主用量，不能重复计。
+    worker_input_tokens: int = 0
+    worker_output_tokens: int = 0
+    worker_seconds: float = 0.0
+    worker_roles: dict[str, int] = field(default_factory=dict)
+    # implement 合并尝试 / 冲突（merge_error 非空）
+    worker_merge_attempts: int = 0
+    worker_conflicts: int = 0
     # provider 未回报用量时为 None。**不要当 0** —— 那会把缺失算成"没花钱"。
     input_tokens: int | None = None
     output_tokens: int | None = None
@@ -348,6 +384,29 @@ async def run_task(
     replans = 0
     verifications: Counter[str] = Counter()
     repairs = 0
+    subagents = 0
+    subagent_statuses: Counter[str] = Counter()
+    max_delegate_batch = 0
+    delegate_batch = 0
+    subagent_input_tokens = 0
+    subagent_output_tokens = 0
+    workflow = ""
+    tasks_planned = 0
+    workers = 0
+    worker_statuses: Counter[str] = Counter()
+    # 实时事件下 started/finished 会交错；用"活跃 worker 数"算并发度，
+    # 不能再靠连续 started 的段长。
+    active_workers = 0
+    max_worker_batch = 0
+    worker_retries = 0
+    worker_merged = 0
+    worker_tool_calls = 0
+    worker_input_tokens = 0
+    worker_output_tokens = 0
+    worker_seconds = 0.0
+    worker_roles: Counter[str] = Counter()
+    worker_merge_attempts = 0
+    worker_conflicts = 0
     input_tokens: int | None = None
     output_tokens: int | None = None
     answer = ""
@@ -363,8 +422,46 @@ async def run_task(
                     tool_calls += 1
                     if event.name in _WRITE_TOOLS:
                         writes += 1
+                    # delegate 调用后面紧跟 SubAgentStarted；非 delegate 说明
+                    # 这一批并发委派已经结束。
+                    if event.name != DELEGATE_EXPLORE:
+                        delegate_batch = 0
+                elif isinstance(event, SubAgentStarted):
+                    subagents += 1
+                    delegate_batch += 1
+                    max_delegate_batch = max(max_delegate_batch, delegate_batch)
+                elif isinstance(event, SubAgentFinished):
+                    subagent_statuses[event.status] += 1
+                    subagent_input_tokens += event.input_tokens
+                    subagent_output_tokens += event.output_tokens
+                elif isinstance(event, WorkflowSelected):
+                    workflow = event.workflow
+                elif isinstance(event, TaskGraphCreated):
+                    tasks_planned = len(event.tasks)
+                elif isinstance(event, WorkerStarted):
+                    workers += 1
+                    active_workers += 1
+                    max_worker_batch = max(max_worker_batch, active_workers)
+                elif isinstance(event, WorkerFinished):
+                    active_workers = max(0, active_workers - 1)
+                    worker_statuses[event.status] += 1
+                    worker_roles[event.role] += 1
+                    worker_input_tokens += int(event.input_tokens)
+                    worker_output_tokens += int(event.output_tokens)
+                    worker_seconds += max(0, int(event.duration_ms)) / 1000.0
+                    worker_retries += max(0, int(event.attempt) - 1)
+                    worker_merged += int(bool(event.merged))
+                    worker_tool_calls += int(event.tool_calls)
+                    if event.role == "implement":
+                        if event.merged or event.merge_error:
+                            worker_merge_attempts += 1
+                        if event.merge_error:
+                            worker_conflicts += 1
                 elif isinstance(event, StepStarted):
                     steps = max(steps, event.index + 1)
+                    delegate_batch = 0
+                elif isinstance(event, AssistantToken):
+                    delegate_batch = 0
                 elif isinstance(event, PlanRevised):
                     replans += 1
                 elif isinstance(event, Verification):
@@ -402,6 +499,25 @@ async def run_task(
             verifications=dict(verifications),
             repairs=repairs,
             writes=writes,
+            subagents=subagents,
+            subagent_statuses=dict(subagent_statuses),
+            max_delegate_batch=max_delegate_batch,
+            subagent_input_tokens=subagent_input_tokens,
+            subagent_output_tokens=subagent_output_tokens,
+            workflow=workflow,
+            tasks_planned=tasks_planned,
+            workers=workers,
+            worker_statuses=dict(worker_statuses),
+            max_worker_batch=max_worker_batch,
+            worker_retries=worker_retries,
+            worker_merged=worker_merged,
+            worker_tool_calls=worker_tool_calls,
+            worker_input_tokens=worker_input_tokens,
+            worker_output_tokens=worker_output_tokens,
+            worker_seconds=round(worker_seconds, 3),
+            worker_roles=dict(sorted(worker_roles.items())),
+            worker_merge_attempts=worker_merge_attempts,
+            worker_conflicts=worker_conflicts,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             budget=task.budget,
@@ -424,6 +540,19 @@ async def run_task(
         verifications=dict(verifications),
         repairs=repairs,
         writes=writes,
+        subagents=subagents,
+        subagent_statuses=dict(subagent_statuses),
+        max_delegate_batch=max_delegate_batch,
+        subagent_input_tokens=subagent_input_tokens,
+        subagent_output_tokens=subagent_output_tokens,
+        workflow=workflow,
+        tasks_planned=tasks_planned,
+        workers=workers,
+        worker_statuses=dict(worker_statuses),
+        max_worker_batch=max_worker_batch,
+        worker_retries=worker_retries,
+        worker_merged=worker_merged,
+        worker_tool_calls=worker_tool_calls,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         budget=task.budget,
@@ -456,6 +585,11 @@ def _verification_cell(counts: dict[str, int]) -> str:
     )
 
 
+def _ratio(numerator: int, denominator: int) -> float | None:
+    """比率；分母为 0 时返回 None（"不适用" ≠ 0%）。"""
+    return round(numerator / denominator, 4) if denominator else None
+
+
 def mechanism_summary(results: list[TaskResult]) -> dict:
     """机制指标：这条回路真的被走过吗。
 
@@ -463,19 +597,99 @@ def mechanism_summary(results: list[TaskResult]) -> dict:
     `verifications` 从 0 变成了 12，那是完全不同的结论。
     """
     statuses: Counter[str] = Counter()
+    subagent_statuses: Counter[str] = Counter()
+    workflows: Counter[str] = Counter()
+    worker_statuses: Counter[str] = Counter()
+    worker_roles: Counter[str] = Counter()
     for result in results:
         statuses.update(result.verifications)
+        subagent_statuses.update(result.subagent_statuses)
+        if result.workflow:
+            workflows[result.workflow] += 1
+        worker_statuses.update(result.worker_statuses)
+        worker_roles.update(result.worker_roles)
     with_tokens = [r for r in results if r.input_tokens is not None]
+    with_worker_tokens = [
+        r for r in results if r.worker_input_tokens or r.worker_output_tokens
+    ]
+    input_tokens = sum(r.input_tokens for r in with_tokens if r.input_tokens) or None
+    output_tokens = (
+        sum(r.output_tokens for r in with_tokens if r.output_tokens) or None
+    )
+    # 只有编排 worker 的用量没进主 run_end；委派子智能体的 token 已包含在
+    # `input_tokens` 里，不能再加一次。
+    worker_input_tokens = sum(r.worker_input_tokens for r in results) or None
+    worker_output_tokens = sum(r.worker_output_tokens for r in results) or None
+    total_input_tokens = (
+        (input_tokens or 0) + (worker_input_tokens or 0)
+        if input_tokens is not None or worker_input_tokens is not None
+        else None
+    )
+    total_output_tokens = (
+        (output_tokens or 0) + (worker_output_tokens or 0)
+        if output_tokens is not None or worker_output_tokens is not None
+        else None
+    )
+    agent_seconds = sum(r.agent_seconds for r in results)
+    worker_seconds = sum(r.worker_seconds for r in results)
+    merge_attempts = sum(r.worker_merge_attempts for r in results)
+    conflicts = sum(r.worker_conflicts for r in results)
+    merged = sum(r.worker_merged for r in results)
     return {
         "verifications": dict(sorted(statuses.items())),
         "tasks_with_verification": sum(1 for r in results if r.verifications),
         "repairs": sum(r.repairs for r in results),
         "tasks_with_repair": sum(1 for r in results if r.repairs),
         "replans": sum(r.replans for r in results),
+        "subagents": sum(r.subagents for r in results),
+        "tasks_with_subagents": sum(1 for r in results if r.subagents),
+        "subagent_statuses": dict(sorted(subagent_statuses.items())),
+        "max_delegate_batch": max(
+            (r.max_delegate_batch for r in results), default=0
+        ),
+        # 子智能体 token 是总用量的一部分；单列出来才能看出"委派值不值"。
+        "subagent_input_tokens": (
+            sum(r.subagent_input_tokens for r in results) or None
+        ),
+        "subagent_output_tokens": (
+            sum(r.subagent_output_tokens for r in results) or None
+        ),
+        # ---- Phase 3A orchestrator ----
+        "workflows": dict(sorted(workflows.items())),
+        "tasks_planned": sum(r.tasks_planned for r in results),
+        "workers": sum(r.workers for r in results),
+        "tasks_with_workers": sum(1 for r in results if r.workers),
+        "worker_statuses": dict(sorted(worker_statuses.items())),
+        "worker_roles": dict(sorted(worker_roles.items())),
+        "max_worker_batch": max(
+            (r.max_worker_batch for r in results), default=0
+        ),
+        "worker_retries": sum(r.worker_retries for r in results),
+        "worker_merged": merged,
+        "worker_tool_calls": sum(r.worker_tool_calls for r in results),
+        # ---- Phase 4：成本 / 并发 / 合并质量 ----
+        "worker_input_tokens": worker_input_tokens,
+        "worker_output_tokens": worker_output_tokens,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "tasks_reporting_worker_tokens": len(with_worker_tokens),
+        "worker_seconds": round(worker_seconds, 3),
+        "agent_seconds": round(agent_seconds, 3),
+        # 平均并发度 = worker 忙碌秒 / 任务墙钟秒；1.0 表示平均只有一个 worker
+        # 在干活，>1 才说明并行真的发生了。
+        "worker_parallelism": (
+            round(worker_seconds / agent_seconds, 3)
+            if worker_seconds and agent_seconds
+            else None
+        ),
+        "worker_merge_attempts": merge_attempts,
+        "worker_conflicts": conflicts,
+        "merge_success_rate": _ratio(merged, merge_attempts),
+        "conflict_rate": _ratio(conflicts, merge_attempts),
         # 只汇总**有回报**的那些任务，并记下有几个 —— 部分缺失必须看得见，
         # 把 None 当 0 会让均值系统性偏低。
-        "input_tokens": sum(r.input_tokens for r in with_tokens if r.input_tokens) or None,
-        "output_tokens": sum(r.output_tokens for r in with_tokens if r.output_tokens) or None,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
         "tasks_reporting_tokens": len(with_tokens),
     }
 
@@ -489,22 +703,60 @@ def merge_mechanisms(runs: list[dict]) -> dict:
     却长得一样。数不清口径的指标比没有指标更糟。
     """
     statuses: Counter[str] = Counter()
+    subagent_statuses: Counter[str] = Counter()
+    workflows: Counter[str] = Counter()
+    worker_statuses: Counter[str] = Counter()
+    worker_roles: Counter[str] = Counter()
     totals = {
         "tasks_with_verification": 0,
         "repairs": 0,
         "tasks_with_repair": 0,
         "replans": 0,
         "tasks_reporting_tokens": 0,
+        "subagents": 0,
+        "tasks_with_subagents": 0,
+        "tasks_planned": 0,
+        "workers": 0,
+        "tasks_with_workers": 0,
+        "worker_retries": 0,
+        "worker_merged": 0,
+        "worker_tool_calls": 0,
+        "tasks_reporting_worker_tokens": 0,
+        "worker_merge_attempts": 0,
+        "worker_conflicts": 0,
     }
     input_tokens = 0
     output_tokens = 0
+    worker_input_tokens = 0
+    worker_output_tokens = 0
+    subagent_input_tokens = 0
+    subagent_output_tokens = 0
+    max_delegate_batch = 0
+    max_worker_batch = 0
+    worker_seconds = 0.0
+    agent_seconds = 0.0
     saw_tokens = False
+    saw_worker_tokens = False
 
     for run in runs:
         mechanism = run.get("mechanism") or {}
         statuses.update(mechanism.get("verifications") or {})
+        subagent_statuses.update(mechanism.get("subagent_statuses") or {})
+        workflows.update(mechanism.get("workflows") or {})
+        worker_statuses.update(mechanism.get("worker_statuses") or {})
+        worker_roles.update(mechanism.get("worker_roles") or {})
         for key in totals:
             totals[key] += int(mechanism.get(key) or 0)
+        max_delegate_batch = max(
+            max_delegate_batch, int(mechanism.get("max_delegate_batch") or 0)
+        )
+        max_worker_batch = max(
+            max_worker_batch, int(mechanism.get("max_worker_batch") or 0)
+        )
+        worker_seconds += float(mechanism.get("worker_seconds") or 0)
+        agent_seconds += float(mechanism.get("agent_seconds") or 0)
+        subagent_input_tokens += int(mechanism.get("subagent_input_tokens") or 0)
+        subagent_output_tokens += int(mechanism.get("subagent_output_tokens") or 0)
         for key, bucket in (("input_tokens", "in"), ("output_tokens", "out")):
             value = mechanism.get(key)
             if value is None:
@@ -514,11 +766,61 @@ def merge_mechanisms(runs: list[dict]) -> dict:
                 input_tokens += int(value)
             else:
                 output_tokens += int(value)
+        for key, bucket in (
+            ("worker_input_tokens", "in"),
+            ("worker_output_tokens", "out"),
+        ):
+            value = mechanism.get(key)
+            if value is None:
+                continue
+            saw_worker_tokens = True
+            if bucket == "in":
+                worker_input_tokens += int(value)
+            else:
+                worker_output_tokens += int(value)
 
+    merged = totals["worker_merged"]
+    attempts = totals["worker_merge_attempts"]
+    conflicts = totals["worker_conflicts"]
     return {
         "runs": len(runs),
         "verifications": dict(sorted(statuses.items())),
+        "subagent_statuses": dict(sorted(subagent_statuses.items())),
+        "max_delegate_batch": max_delegate_batch,
+        "subagent_input_tokens": subagent_input_tokens or None,
+        "subagent_output_tokens": subagent_output_tokens or None,
+        "workflows": dict(sorted(workflows.items())),
+        "worker_statuses": dict(sorted(worker_statuses.items())),
+        "worker_roles": dict(sorted(worker_roles.items())),
+        "max_worker_batch": max_worker_batch,
         **totals,
+        "worker_input_tokens": (
+            worker_input_tokens if saw_worker_tokens else None
+        ),
+        "worker_output_tokens": (
+            worker_output_tokens if saw_worker_tokens else None
+        ),
+        "total_input_tokens": (
+            (input_tokens if saw_tokens else 0)
+            + (worker_input_tokens if saw_worker_tokens else 0)
+            if saw_tokens or saw_worker_tokens
+            else None
+        ),
+        "total_output_tokens": (
+            (output_tokens if saw_tokens else 0)
+            + (worker_output_tokens if saw_worker_tokens else 0)
+            if saw_tokens or saw_worker_tokens
+            else None
+        ),
+        "worker_seconds": round(worker_seconds, 3),
+        "agent_seconds": round(agent_seconds, 3),
+        "worker_parallelism": (
+            round(worker_seconds / agent_seconds, 3)
+            if worker_seconds and agent_seconds
+            else None
+        ),
+        "merge_success_rate": _ratio(merged, attempts),
+        "conflict_rate": _ratio(conflicts, attempts),
         # 一条都没回报时是 None，不是 0 —— 「没量到」与「量到零」含义不同
         "input_tokens": input_tokens if saw_tokens else None,
         "output_tokens": output_tokens if saw_tokens else None,
@@ -561,6 +863,30 @@ def summarize(results: list[TaskResult]) -> dict:
                 "verifications": r.verifications,
                 "repairs": r.repairs,
                 "writes": r.writes,
+                "subagents": r.subagents,
+                "subagent_statuses": r.subagent_statuses,
+                "max_delegate_batch": r.max_delegate_batch,
+                "subagent_input_tokens": r.subagent_input_tokens,
+                "subagent_output_tokens": r.subagent_output_tokens,
+                "workflow": r.workflow,
+                "tasks_planned": r.tasks_planned,
+                "workers": r.workers,
+                "worker_statuses": r.worker_statuses,
+                "max_worker_batch": r.max_worker_batch,
+                "worker_retries": r.worker_retries,
+                "worker_merged": r.worker_merged,
+                "worker_tool_calls": r.worker_tool_calls,
+                "worker_input_tokens": r.worker_input_tokens,
+                "worker_output_tokens": r.worker_output_tokens,
+                "worker_seconds": round(r.worker_seconds, 3),
+                "worker_roles": r.worker_roles,
+                "worker_merge_attempts": r.worker_merge_attempts,
+                "worker_conflicts": r.worker_conflicts,
+                "worker_parallelism": (
+                    round(r.worker_seconds / r.agent_seconds, 3)
+                    if r.worker_seconds and r.agent_seconds
+                    else None
+                ),
                 "budget": r.budget,
                 "input_tokens": r.input_tokens,
                 "output_tokens": r.output_tokens,
@@ -612,7 +938,28 @@ def noise_summary(runs: list[dict]) -> dict:
 
 
 # 事件计数：跨轮**求和**。
-_SUMMED_TASK_FIELDS = ("tool_calls", "replans", "repairs", "writes")
+_SUMMED_TASK_FIELDS = (
+    "tool_calls",
+    "replans",
+    "repairs",
+    "writes",
+    "subagents",
+    "subagent_input_tokens",
+    "subagent_output_tokens",
+    "tasks_planned",
+    "workers",
+    "worker_retries",
+    "worker_merged",
+    "worker_tool_calls",
+    "worker_input_tokens",
+    "worker_output_tokens",
+    "worker_merge_attempts",
+    "worker_conflicts",
+)
+# 浮点耗时单独求和，不能套 int()。
+_SUMMED_FLOAT_TASK_FIELDS = ("worker_seconds",)
+# 并发度是"曾经达到多高"，跨轮取最大值而不是求和。
+_MAX_TASK_FIELDS = ("max_delegate_batch", "max_worker_batch")
 # 位置类：不是"发生过几次"，而是"走到了多远"。求和无意义（5 步 + 6 步 = 11 步，
 # 比任何一次计划都长），取**均值**。这条踩过一次 —— 当时把所有数值字段一律求和。
 _MEAN_TASK_FIELDS = ("steps",)
@@ -630,13 +977,26 @@ def _merge_task_rows(rows: list[dict], repeats: int) -> dict:
     merged = dict(rows[0])
     for name in _SUMMED_TASK_FIELDS:
         merged[name] = sum(int(row.get(name) or 0) for row in rows)
+    for name in _SUMMED_FLOAT_TASK_FIELDS:
+        merged[name] = round(sum(float(row.get(name) or 0) for row in rows), 3)
     for name in _MEAN_TASK_FIELDS:
         merged[name] = round(sum(int(row.get(name) or 0) for row in rows) / len(rows))
+    for name in _MAX_TASK_FIELDS:
+        merged[name] = max(int(row.get(name) or 0) for row in rows)
 
     statuses: Counter[str] = Counter()
+    subagent_statuses: Counter[str] = Counter()
+    worker_statuses: Counter[str] = Counter()
+    worker_roles: Counter[str] = Counter()
     for row in rows:
         statuses.update(row.get("verifications") or {})
+        subagent_statuses.update(row.get("subagent_statuses") or {})
+        worker_statuses.update(row.get("worker_statuses") or {})
+        worker_roles.update(row.get("worker_roles") or {})
     merged["verifications"] = dict(sorted(statuses.items()))
+    merged["subagent_statuses"] = dict(sorted(subagent_statuses.items()))
+    merged["worker_statuses"] = dict(sorted(worker_statuses.items()))
+    merged["worker_roles"] = dict(sorted(worker_roles.items()))
 
     for name in _TOKEN_FIELDS:
         values = [row.get(name) for row in rows]
@@ -646,8 +1006,28 @@ def _merge_task_rows(rows: list[dict], repeats: int) -> dict:
             if any(v is not None for v in values)
             else None
         )
+    # 总成本 = 主 agent + 编排 worker（委派子智能体已在主用量里）
+    merged["total_input_tokens"] = (
+        int(merged.get("input_tokens") or 0)
+        + int(merged.get("worker_input_tokens") or 0)
+        if merged.get("input_tokens") is not None
+        or merged.get("worker_input_tokens")
+        else None
+    )
+    merged["total_output_tokens"] = (
+        int(merged.get("output_tokens") or 0)
+        + int(merged.get("worker_output_tokens") or 0)
+        if merged.get("output_tokens") is not None
+        or merged.get("worker_output_tokens")
+        else None
+    )
 
     merged["agent_seconds"] = round(sum(float(r.get("agent_seconds") or 0) for r in rows), 1)
+    merged["worker_parallelism"] = (
+        round(merged["worker_seconds"] / merged["agent_seconds"], 3)
+        if merged.get("worker_seconds") and merged.get("agent_seconds")
+        else None
+    )
     merged["verdict"] = _aggregate_verdict([r["verdict"] for r in rows], repeats)
     merged["passes"] = sum(1 for r in rows if r["verdict"] == "passed")
     merged["repeats"] = repeats

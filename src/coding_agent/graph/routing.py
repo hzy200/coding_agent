@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from coding_agent.graph.plan import (
+    EXPLORE,
+    current_step_kind,
+)
+from coding_agent.graph.plan import (
+    VERIFY as VERIFY_KIND,
+)
 from coding_agent.graph.state import AgentState
+from coding_agent.orchestrator.graph import ready_tasks
 
 ACT = "act"
 APPROVE = "approval_gate"
@@ -16,6 +24,16 @@ REPAIR = "repair"
 ADVANCE = "advance"
 REPLAN = "replan"
 RESPOND = "respond"
+
+# Phase 3D：steering 消费点与编排节点名
+STEERING_PLAN = "steering_plan"
+STEERING_DISPATCH = "steering_dispatch"
+STEERING_STEP = "steering_step"
+STEERING_FINAL = "steering_final"
+DISPATCH = "dispatch"
+EXTEND_TASKS = "extend_tasks"
+PLAN_TASKS = "plan_tasks"
+SYNTHESIZE = "synthesize"
 
 
 def has_more_steps(state: AgentState) -> bool:
@@ -39,6 +57,36 @@ def route_after_replan(state: AgentState) -> str:
     return ACT if has_current_step(state) else RESPOND
 
 
+# --------------------------------------------------------------------------
+# Phase 3D：steering 消费之后的路由
+# --------------------------------------------------------------------------
+
+def route_after_steering_plan(state: AgentState) -> str:
+    """任务图刚生成：取消直接去汇总，否则开始派发。"""
+    return SYNTHESIZE if state.get("steering_cancelled") else DISPATCH
+
+
+def route_after_steering_dispatch(state: AgentState) -> str:
+    """一批 worker 之后：取消/无 ready → 汇总；重规划 → 重建任务图。"""
+    if state.get("steering_cancelled"):
+        return SYNTHESIZE
+    if state.get("steering_replan"):
+        return PLAN_TASKS
+    if ready_tasks(state.get("tasks") or [], state.get("task_status") or {}):
+        return DISPATCH
+    return SYNTHESIZE
+
+
+def route_after_steering_step(state: AgentState) -> str:
+    """direct 模式一步之后：取消直接收尾，否则照常重规划。"""
+    return RESPOND if state.get("steering_cancelled") else REPLAN
+
+
+def route_after_synthesize(state: AgentState) -> str:
+    """取消的运行不再交给主 agent 继续实现，直接收尾。"""
+    return STEERING_FINAL if state.get("steering_cancelled") else "planner"
+
+
 def route_after_act(state: AgentState) -> str:
     """act 之后去哪。
 
@@ -55,7 +103,9 @@ def route_after_act(state: AgentState) -> str:
     return VERIFY
 
 
-def make_route_after_verify(max_repair_rounds: int) -> Callable[[AgentState], str]:
+def make_route_after_verify(
+    max_repair_rounds: int, *, max_same_failures: int = 2
+) -> Callable[[AgentState], str]:
     """验证之后去哪。
 
     失败时的分支就是「失败驱动的修复循环」：
@@ -79,6 +129,10 @@ def make_route_after_verify(max_repair_rounds: int) -> Callable[[AgentState], st
 
     def route_after_verify(state: AgentState) -> str:
         if (state.get("verification") or {}).get("status") == "failed":
+            # 连续出现同一失败签名 = 原地打转。继续 repair 只会重复同一类修改，
+            # 直接换做法（replan）；replan 也有硬上限，最终会如实收尾。
+            if state.get("same_failure_count", 0) >= max_same_failures:
+                return REPLAN
             if state.get("retry", 0) < max_repair_rounds:
                 return REPAIR
             # 修不动了，但还没到放弃的时候：先让 replan 看看能不能换个做法。
@@ -109,11 +163,23 @@ def make_route_after_review(
             if state.get("retry", 0) < max_repair_rounds:
                 return REPAIR
             return REPLAN
-        # 这一步**一个改动都没产生** —— 而 verify 与 review 都只在 `dirty` 时才跑，
-        # 所以两者都短路通过，「只读了文件」和「做完了」在图上长得一样。
-        # 给它一次重做的机会（见 nodes/nudge.py），上限一次。
+
+        kind = current_step_kind(state)
+        # 探索/验证步本来就不产生改动：`dirty=False` 是预期，不是"没做完"。
+        # 这类步骤直接步进，不要浪费一次 nudge 预算。
+        if kind in (EXPLORE, VERIFY_KIND):
+            return ADVANCE if has_more_steps(state) else RESPOND
+
+        # 实现步（或旧计划里的 unknown）**一个改动都没产生** —— 而 verify 与
+        # review 都只在 `dirty` 时才跑，所以两者都短路通过，「只读了文件」和
+        # 「做完了」在图上长得一样。给它一次重做的机会（见 nodes/nudge.py）。
         if nudge_empty_steps and not state.get("dirty") and not state.get("empty_step_nudged"):
             return NUDGE
+
+        # 实现步给过机会仍然没写：只有**最后一步**才收尾；中间步可能是
+        # 「前面的工作已经顺带做完了」，直接收尾会让后面的步骤永远没机会执行
+        # （实测：卡在实现 1，报表/审批步骤从未运行）。最终验证步会把
+        # 「其实没做完」抓出来。
         return ADVANCE if has_more_steps(state) else RESPOND
 
     return route_after_review

@@ -172,6 +172,19 @@ def test_relative_paths_stay_auto_allowed(command: str) -> None:
     assert classify(command).auto_allowed, classify(command)
 
 
+@pytest.mark.parametrize(
+    ("command", "level"),
+    [
+        ("sed -n '1,5p' file.txt", CommandLevel.READ),
+        ("sed 's/a/b/' file.txt", CommandLevel.READ),
+        ("sed -i 's/a/b/' f.py", CommandLevel.MUTATE),
+        ("sed --in-place='s/a/b/' f.py", CommandLevel.MUTATE),
+    ],
+)
+def test_sed_is_read_only_unless_in_place(command: str, level: CommandLevel) -> None:
+    assert classify(command).level == level
+
+
 # ---------------- 引号感知：搜字符串不该被判危险 ----------------
 
 @pytest.mark.parametrize(

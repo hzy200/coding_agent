@@ -31,13 +31,19 @@ python tests/eval/runner.py
 
 # 量化噪声：整批跑 3 次，报告逐次波动与翻转过的任务
 python tests/eval/runner.py --repeat 3
+
+# 对比两份 baseline：差值落在两臂 spread 内就明确拒绝下结论
+python tests/eval/compare.py tests/eval/baseline.json tests/eval/phase4_baseline.json
+
+# 干预延迟基准（不调用模型、不需要 WSL）
+python tests/eval/steering_bench.py --repeat 3 --delay-ms 50
 ```
 
 全量会真实调用模型、耗时以十分钟计，并把 `baseline.json` 覆盖掉。
 
 评测工作区建在 `<沙箱工作区>/.agent/eval/<task_id>/`。放 `.agent/` 下是有意的：
 那里已经被系统提示、`git_add` 过滤与检索排除保护着，日常会话不会在 `ls` 里
-看到 20 个评测目录；而跑某个任务时，智能体的沙箱根就是那个任务目录，看不到别的任务。
+看到几十个评测目录；而跑某个任务时，智能体的沙箱根就是那个任务目录，看不到别的任务。
 
 ### 可比性守卫：不可比的数字不许冒充基线
 
@@ -89,7 +95,7 @@ python tests/eval/runner.py --repeat 3
 > **聚合稳、成员不稳。** `spread` 小不代表单任务可比 —— 必须同时看 `flipped`。
 > 上面那组 52%/83% 是这条的反面教材：波动大到能把整个改善空间吃掉。
 
-`long` 套件（5 个任务）波动更大：三个 `--repeat 2` 样本对的逐轮通过率分别是
+`long` 套件（**当时 5 个任务**，现已扩到 6 个）波动更大：三个 `--repeat 2` 样本对的逐轮通过率分别是
 [60,40]、[60,40]、[40,20]，合起来 **20%~60%（40pp）**。任务少、每个都长，
 方差自然大 —— 目前这一档只能分辨很大的差异。
 
@@ -111,7 +117,7 @@ python tests/eval/runner.py --repeat 3
 | 套件 | 任务 | 基线 | 跑法 |
 |---|---|---|---|
 | `default` | 29 个（20 basic + 9 deep） | `baseline.json` | `python tests/eval/runner.py` |
-| `long` | 5 个（38 文件 / 近千行的仓库） | `baseline_long.json` | `python tests/eval/runner.py --suite long` |
+| `long` | 6 个（5 个 38 文件长程任务 + 1 个多写 worker 演示） | `baseline_long.json` | `python tests/eval/runner.py --suite long` |
 
 分套件不是分类癖：长程档的单任务成本是前两档的若干倍，混进全量会让整轮变得
 不可承受；它的波动量级也不同（任务更少、每个更长），混着报会掩盖差异。
@@ -127,13 +133,12 @@ python tests/eval/runner.py --repeat 3
 | `basic` | 20 | 单点缺陷，规模 1–3 个文件，失败测试通常直接指出位置 |
 | `deep` | 9 | 为**区分度**设计：症状与根因相隔多个模块、需求未被可见测试覆盖、长程多文件贯通、计划需要中途修正 |
 
-分档不是装饰。首轮 baseline（`deepseek-v4-flash`）上两档都是 **100%**：每个任务
-平均只用掉 17% 的工具预算，`search_code` 全场合计只用了 8 次。一把人人满分的
-尺子量不出差别 —— 所以报告通过率时**必须分档报**（见 `by_tier`）。
+分档不是装饰。首轮 baseline 两档都是 **100%**（当时沙箱没有 pytest，自动验证
+与修复循环整场未生效），平均只用了 17% 的工具预算。一把人人满分的尺子量不出
+差别 —— 所以报告通过率时**必须分档报**（见 `by_tier`）。
 
-> 那一轮 100% 之后情况变了：`tasks_replan.py` 补了 3 个专测「计划需要修正」的
-> 进阶任务，沙箱里也装上了 pytest（见下文），自动验证与修复循环开始真正生效。
-> 当前基线是 **18/29 = 62%**，见「实测结论」。
+> 后来沙箱装上 pytest，历史基线为 12/29 = 41.4%；当前 default 已饱和为
+> 29/29 ×2（见 Phase 4），后续调优需要更难的任务。
 
 类别：
 
@@ -210,58 +215,104 @@ python tests/eval/runner.py --repeat 3
 测试），一次在判定前恢复。这不是冗余，是判定可信性的来源：智能体改测试
 文件没有任何收益，必须真的改源码。
 
-## 实测结论
+## 历史基线（已归档）
 
-### 首轮：两档都是 100%（现在看，那是「没有修复循环」的智能体）
+早期数字保留在 `baseline.json` / `ab_*.json` 中，只用于说明口径，**不再作为
+当前基线**：
 
-`deepseek-v4-flash`，2026-10-05 上午：
+- 2026-10-05 首轮 100% 是“沙箱无 pytest、验证/修复循环未生效”的假象；
+- 2026-10-06 `--repeat 2`：default 12/29 = 41.4%（spread 6.9pp，12 个任务翻转），
+  long 2/5 = 30%（spread 20pp）；
+- 同一份代码曾跑出 52% 与 83%（spread 31pp）——单次运行不能当结论。
 
-| 档位 | 结果 | 平均工具调用 |
-|---|---|---|
-| basic（20） | **20/20 = 100%** | ~9 |
-| deep（6） | **6/6 = 100%** | ~10 |
+机制指标、可比性守卫与 `flipped`/`spread` 的方法论仍然有效；当前数字见下。
 
-预算是 5 步 × 12 轮 = 60 次工具调用，**两档都只用了约 17%**。押的三个假设全没成立：
-模型能跨模块追根因（`config_precedence`）、能修跨模块循环依赖（`import_chain`）、
-**也能照着需求做对而不是只盯着绿化测试**（3 个 spec 任务全过）。
+## Phase 4：成本、并发与噪声感知对比
 
-> **那 100% 的含义要打折扣**：当时 `sandbox_capabilities.pytest` 是 false，
-> 自动验证与修复循环**整场没有生效**。它测的是一个没有第二道质量关的智能体。
-> 这正是可比性守卫要把 `pytest=false` 拦在基线之外的原因。
+### 成本与并发指标
 
-### 当前基线：`--repeat 2`（2026-10-06，`deepseek-chat`，`cd62014`，干净工作区）
+| 指标 | 口径 |
+|---|---|
+| `input_tokens` / `output_tokens` | **主 agent** 的 run_total；委派子智能体的 token 已由 runtime 累加进来 |
+| `worker_input_tokens` / `worker_output_tokens` | **编排 worker** 的用量（dispatch 不并入 run_end，必须单独累加） |
+| `total_input_tokens` / `total_output_tokens` | 主 agent + 编排 worker |
+| `worker_seconds` | Σ `WorkerFinished.duration_ms` |
+| `max_worker_batch` | **同一时刻活跃 worker 数**的峰值（按 `WorkerStarted`/`WorkerFinished` 配对；实时事件会交错，不能再用连续 started 的段长） |
+| `worker_parallelism` | `worker_seconds / Σ agent_seconds`；>1 才说明并行真的发生 |
+| `worker_roles` | explore/test/review/implement 次数 |
+| `worker_merge_attempts` / `worker_conflicts` | implement 合并尝试 / `merge_error` 非空 |
+| `merge_success_rate` / `conflict_rate` | 无合并尝试时为 `None`，不是 0% |
+| `tasks_reporting_worker_tokens` | 有多少任务真的回报了 worker 用量 |
 
-#### default 套件（29 个任务）
+`--repeat k` 时这些字段按轮求和；`worker_parallelism` 由合并后的秒数重算，
+不是把每轮的比率再平均。
+
+`RunFinished` / `RunFailed` 也直接携带 `worker_input_tokens` /
+`worker_output_tokens`（主 agent token 仍单独记），TUI 会显示这一行。
+
+### 噪声感知对比（`compare.py`）
+
+```bash
+python tests/eval/compare.py a.json b.json [--json]
+```
+
+- 通过率 Δ 与两臂 `spread` 取大者比较；**差值在带内时输出“不能下结论”**；
+- 重复次数 < 2 或任务集合/套件不同 → `insufficient_repeats` / `incomparable`；
+- 两臂间翻转的任务若在任一臂内部也翻过（`noise.flipped`），标为
+  `noise_suspect`，不能归因于改动；
+- 同时对比墙钟、主/worker/total token、并行度、合并/冲突率。
+
+### 干预延迟（`steering_bench.py`）
+
+```bash
+python tests/eval/steering_bench.py --repeat 3 --delay-ms 50
+```
+
+合成图 `work(sleep) → steering_step → respond`，由真实 `AgentRuntime` 驱动，
+不调用模型、不依赖 WSL。实测（delay=50ms，repeat=3）：
+
+| 场景 | wait（提交→边界） | apply（边界→事件） | total |
+|---|---|---|---|
+| pause | 55.9ms | **9.4ms** | 64.4ms |
+| resume | — | — | **20.2ms** |
+| cancel | 59.9ms | **8.6ms** | 73.7ms |
+
+`wait` 由当前节点决定（真实运行里就是模型/工具耗时）；`apply` 才是 steering
+的处理开销。不要把 `total` 当成“干预有多快”——它主要反映你等当前这步等了多久。
+
+#### default `--repeat 2` 实测（2026-10-18）
+
+`tests/eval/phase4_baseline.json`，工作区有未提交改动（`comparable=false`）：
 
 | 项 | 值 |
 |---|---|
-| 两轮通过率 | 44.8% / 37.9%，均值 **12/29 = 41.4%** |
-| `spread` / 翻转 | **6.9pp** / **12 个任务**（方向相抵，所以聚合看起来比成员稳） |
-| 分档 | basic 8/20、deep 3/9 |
-| 机制（两轮合计） | 验证 124 次（**失败 96 / 通过 28**）、修复 72 次、重规划 26 次 |
-| token（两轮合计） | 输入 **4,928,541**、输出 **124,168**（单任务单轮约 8.5 万 in） |
+| 两轮通过率 | **29/29、29/29 = 100%** |
+| `spread` / 翻转 | **0.0pp** / 无 |
+| token（两轮合计） | 主 agent in **4,333,650** / out **97,419**；worker 0（本次为 direct 模式） |
+| 墙钟（两轮合计） | **1,528s** |
+| 验证 / 修复 / 重规划 | 72 次（failed 9 / ok 63）、6 次、12 次 |
 
-#### long 套件（5 个任务）
+**结论：default 套件已饱和。** 两轮都 100%、零翻转，说明这把尺子对当前模型
+没有区分度，继续用它做 A/B 只会得到 0pp。与旧 `baseline.json`（12/29）对比
+会报 Δ=+58.6pp、超出 6.9pp 噪声带，但那是**跨版本/跨时间**的差异，并且右侧
+`comparable=false`，不能读成“优化带来的提升”。下一步应扩展更难的 default
+任务或改用 `long` 套件。
 
-| 项 | 值 |
+## 编排与写 Worker 验证记录（已归档）
+
+以下为 Phase 3A–3C 的机制验证，**单轮、不可比**，只证明链路走通：
+
+| 场景 | 关键结果 |
 |---|---|
-| 两轮通过率 | 40% / 20%，均值 **2/5 = 30%** |
-| `spread` / 翻转 | **20pp** / 3 个任务（且跨样本对可达 40pp，见上文「实测」） |
-| 机制（两轮合计） | 验证 55 次（失败 48 / 通过 7）、修复 40 次、重规划 12 次 |
-| token（两轮合计） | 输入 **4,818,777**、输出 **57,803**（单任务单轮约 **48 万 in，是 default 的 5.7 倍**） |
+| Explore A/B | 机制发生（17 次子智能体、最大同批 5）；通过率 1/5 vs 1/5，成本 input +42.6% / output +190%；单轮不能下结论 |
+| Phase 3A 只读编排 | `parallel_readonly`，5 任务 / 4 worker，最大同批 4，通过 1/1 |
+| Phase 3B 重试与阻塞 | test worker 失败后重试 1 次，依赖 partial 的任务 blocked，通过 1/1 |
+| Phase 3C 单写 worker | `orchestrated_implement`，1 worker，33 次工具调用，1 patch 合并，通过 |
+| Phase 3C 多写并发 | `long/parallel_modules`：2 个 implement 同批（最大同批 2），2 patch 合并，通过 |
 
-**三件要读出来的事**
-
-1. **验证与修复循环确实在干活**：default 两轮 124 次验证里 96 次失败 → 触发 72 次
-   修复、26 次重规划。这与首轮那个"沙箱无 pytest、修复循环从未生效"的 100%
-   是两回事 —— 机制指标就是为区分这两者加的。
-2. **`review` 与 `nudge` 是一道守卫**：实测里 `review` 从未因语法阻断过（这也让
-   P1-5 的落盘前预校验对评测无影响），而 `nudge` 对**它覆盖的那类失败**有效 ——
-   `discount_partial` 在修前两轮都是"零写调用"，修后能真的动手并做成。
-3. **通过率低于更早的 62%，但两者不可比**：agent 行为变了（`nudge` 会给空步骤
-   一次重做机会；工作区多了 git，`git_*` 工具从全废变可用）。旧基线只能当历史坐标。
-
-> 更早那份单次基线（18/29 = 62%）应当视为**噪声带里的一个样本**，不是基准。
+多写并发这轮还修掉一个真实缺陷：worktree 与 patch 都落在主工作区 `.agent/` 下，
+第二个 worker 的脏检查会误判为用户改动。`_git_ready` 现在排除 `.agent/` 与
+`__pycache__/`，由 `test_concurrent_implement_workers_ignore_agent_state` 锁住。
 
 ## long 套件：几十个文件的仓库
 
@@ -271,12 +322,13 @@ python tests/eval/runner.py --repeat 3
 
 | 项 | 值 |
 |---|---|
-| 仓库规模 | **38 个文件 / 约 970 行**（分层：模型 / 仓储 / 校验 / 服务 / 报表 / 12 个 handler / 9 个 util / 3 个 adapter） |
-| 任务数 | 5 个，**同一个仓库、五种不同形态**（补样本时刻意不复制任务） |
+| 仓库规模 | **38 个文件 / 约 970 行**（分层：模型 / 仓储 / 校验 / 服务 / 报表 / 12 个 handler / 9 个 util / 3 个 adapter）；`parallel_modules` 是 32 个文件的独立 fixture，同样跨过编排的 30 文件阈值 |
+| 任务数 | 6 个，**同一个仓库、五种形态 + 一个多写并发演示**（补样本时刻意不复制任务） |
 | 改动跨度 | 3–8 个文件 |
 
 | 任务 | 种子形态 | 改动 | 考的是什么 |
 |---|---|---|---|
+| `long/parallel_modules` | 两个独立模块都是 stub | 2 文件（互不依赖） | Phase 3C 多写 worker 并发：写范围不重叠、worktree 隔离、patch 顺序合并 |
 | `long/discount_pipeline` | 功能全缺 | 6 文件 | 从零贯通：模型 → 配置 → 服务 → 报表 → 两个 handler |
 | `long/discount_partial` | 折扣**只做了模型层** | 4 文件 | **诊断既有代码**：找出还缺哪几层，而不是照需求重建 |
 | `long/audit_trail` | `EventLog` 是**死代码** | 3 文件 | 发现既有但没人用的设施，并把它接对 |
@@ -338,20 +390,16 @@ python tests/eval/runner.py --suite long --repeat 2       # 拿到噪声后再�
 "有没有做完"的答案），只是把原因写进 detail —— 否则一个挂死的长程任务会把串行的
 整轮评测钉住。
 
-### 还缺什么
+### 当前缺口
 
-**「没有区分度」这个诊断要分两半说**：
-
-- 上一版说「两档都 100%」是因为沙箱没 pytest、修复循环根本没跑 —— 那一半
-  已经解决（现在 52%~83%，机制指标可见）。
-- 但**动态范围的上端仍然缺**：29 个任务里最大的只有 9 个文件、68 行，
-  `tool_calls` 中位数约 7（预算 60）。而这套任务现在的噪声已经有 31 个百分点 ——
-  比任何一次代码改动带来的提升都大。要能测「自主性提升了多少」，需要规模上的
-  量级变化（几十文件的仓库、几十步长程、模糊需求、跨会话），
-  见 [IMPROVEMENT_PLAN.md](../../docs/IMPROVEMENT_PLAN.md) §3.2 W2。
-
-换句话说：**先把波动压下去、或者把差异做大到远超波动**，否则再精细的机制指标
-也测不出提升。
+- **default 已饱和**：两轮 29/29、spread 0，无法再区分改动优劣。任务规模仍偏小
+  （最大 9 个文件），需要更难的 default 任务才能恢复区分度。
+- **long 仍不够稳**：6 个任务、单任务成本高，历史基线 2/5 = 30%、spread 20pp；
+  继续调优至少 `--repeat 2`，且结论必须超出 spread。
+- **编排/并发收益尚未量化**：需要让两臂只差 `AGENT_ORCHESTRATOR_ENABLED`，
+  用 `compare.py` 检查 Δ 是否超过噪声带。
+- 具体后续项见 [HARNESS.md §14](../../docs/HARNESS.md) 与
+  [ACCEPTANCE.md 已知限制](../../docs/ACCEPTANCE.md)。
 
 ### 重规划族的 A/B：一次被指标拦下的误读
 

@@ -17,7 +17,7 @@ class MissingApiKeyError(RuntimeError):
     """未配置 DeepSeek API Key。"""
 
 
-def with_json_output(llm: ChatOpenAI, schema: type) -> Any:
+def with_json_output(llm: ChatOpenAI, schema: type, **kwargs: Any) -> Any:
     """结构化输出，走 JSON 模式而不是默认的 json_schema。
 
     **不要改回默认方式。** `with_structured_output(schema)` 走 OpenAI 的
@@ -32,10 +32,13 @@ def with_json_output(llm: ChatOpenAI, schema: type) -> Any:
     `method="function_calling"` 也不行：v4-flash 的 thinking 模式不支持强制
     `tool_choice`。
 
+    额外的 `kwargs` 原样透传（例如子智能体报告需要 `include_raw=True` 才能拿到
+    这次结构化调用的 token 用量）。
+
     真实 provider 上的可用性由 `tests/integration/test_llm_structured_output.py`
     守着（标 `llm`，需要 API Key）。
     """
-    return llm.with_structured_output(schema, method="json_mode")
+    return llm.with_structured_output(schema, method="json_mode", **kwargs)
 
 
 def build_llm(settings: Settings, *, streaming: bool = True) -> ChatOpenAI:

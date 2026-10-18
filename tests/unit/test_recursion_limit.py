@@ -26,10 +26,13 @@ def test_matches_worst_case_topology() -> None:
     per_step = (replans + 1) * (phase + 1)
     # 一步没产生任何改动时会经 nudge 重做一轮：nudge 节点 + 一个完整周期
     per_step += per_cycle + 1
-    # 失败修订若让本步通过，仍会走 advance → replan（步进微调，独立额度），
-    # 相邻步骤之间最多各多两个超步
+    # Phase 3D：advance 之后多一个 steering_step
+    per_step += 1
+    # 失败修订若让本步通过，仍会走 advance → steering_step → replan
+    # （步进微调，独立额度），相邻步骤之间最多各多两个超步；
+    # 收尾多一个 steering_final。
     assert estimate_recursion_limit(steps, rounds, repairs, replans) == (
-        steps * (per_step + 2) + MARGIN
+        steps * (per_step + 2) + 1 + MARGIN
     )
 
 
@@ -47,8 +50,8 @@ def test_covers_a_maxed_out_default_plan() -> None:
     # 所以阶段结构不变，只是每周期多一个超步。
     per_cycle = (s.max_tool_rounds + 1) + 2 * s.max_tool_rounds + 2
     phase = (s.max_repair_rounds + 1) * per_cycle + s.max_repair_rounds
-    # 每步还可能在步进之后多一次「步进微调」（advance + replan）
-    worst = s.max_plan_steps * ((s.max_replans + 1) * (phase + 1) + 2)
+    # 每步还可能在步进之后多一次「步进微调」（advance + steering_step + replan）
+    worst = s.max_plan_steps * ((s.max_replans + 1) * (phase + 1) + 3)
     assert (
         estimate_recursion_limit(
             s.max_plan_steps, s.max_tool_rounds, s.max_repair_rounds, s.max_replans

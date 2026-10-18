@@ -35,6 +35,8 @@ SILENT_NODES = {
     # 审批决定本身不是给用户看的结果：需要确认时走 __interrupt__ → ApprovalRequested，
     # 放行/拒绝则由 tools 节点执行后产出 ToolCallFinished。它只往 state 写 approvals。
     "approval_gate",
+    # survey 只把仓库画像写进 state；用户可见的选择结果由 select_workflow 发出。
+    "survey",
 }
 
 _META_NODES = {"__start__", "__end__"}
@@ -54,27 +56,48 @@ def _graph_nodes(graph) -> set[str]:
     return set(graph.get_graph().nodes) - _META_NODES
 
 
-def _translated_nodes() -> set[str]:
-    """`_stream` 里与 `node` 比较过的字符串字面量。"""
+def _translated_nodes() -> tuple[set[str], set[str]]:
+    """`_stream` 里与 `node` 比较过的字面量，以及 `node.startswith(...)` 前缀。
+
+    Phase 3D 有四个 steering 节点共用一套翻译，用前缀分支避免复制四遍
+    if/elif；测试必须能识别这种写法，否则会误报它们"没有翻译"。
+    """
     source = textwrap.dedent(inspect.getsource(AgentRuntime._stream))
     names: set[str] = set()
+    prefixes: set[str] = set()
     for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Compare):
-            continue
-        if not (isinstance(node.left, ast.Name) and node.left.id == "node"):
-            continue
-        for op, comparator in zip(node.ops, node.comparators, strict=True):
-            if (
-                isinstance(op, ast.Eq)
-                and isinstance(comparator, ast.Constant)
-                and isinstance(comparator.value, str)
-            ):
-                names.add(comparator.value)
-    return names
+        if isinstance(node, ast.Compare):
+            if not (isinstance(node.left, ast.Name) and node.left.id == "node"):
+                continue
+            for op, comparator in zip(node.ops, node.comparators, strict=True):
+                if (
+                    isinstance(op, ast.Eq)
+                    and isinstance(comparator, ast.Constant)
+                    and isinstance(comparator.value, str)
+                ):
+                    names.add(comparator.value)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "startswith"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "node"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+        ):
+            prefixes.add(node.args[0].value)
+    return names, prefixes
+
+
+def _is_translated(node: str, names: set[str], prefixes: set[str]) -> bool:
+    return node in names or any(node.startswith(prefix) for prefix in prefixes)
 
 
 def test_every_graph_node_is_translated_or_declared_silent(real_graph) -> None:
-    untranslated = _graph_nodes(real_graph) - _translated_nodes()
+    nodes = _graph_nodes(real_graph)
+    names, prefixes = _translated_nodes()
+    untranslated = {node for node in nodes if not _is_translated(node, names, prefixes)}
     assert untranslated == SILENT_NODES, (
         f"这些图节点没有对应的事件翻译：{sorted(untranslated - SILENT_NODES)}。"
         f"要么在 runtime._stream 里补上分支，要么在 SILENT_NODES 里登记并写明"
@@ -84,14 +107,22 @@ def test_every_graph_node_is_translated_or_declared_silent(real_graph) -> None:
 
 def test_no_translation_branch_for_a_missing_node(real_graph) -> None:
     """反向约束：翻译分支必须对应真实节点，防止节点改名后留下死分支。"""
-    dead = _translated_nodes() - _graph_nodes(real_graph)
+    nodes = _graph_nodes(real_graph)
+    names, prefixes = _translated_nodes()
+    dead = {name for name in names if name not in nodes}
     assert not dead, f"这些翻译分支对应的节点已不存在：{sorted(dead)}"
+    for prefix in prefixes:
+        assert any(node.startswith(prefix) for node in nodes), (
+            f"前缀翻译分支 {prefix!r} 没有匹配任何真实节点"
+        )
 
 
 def test_the_constraint_is_not_vacuous(real_graph) -> None:
     """防止约束退化成空转：两边都必须非空且规模合理。"""
     assert len(_graph_nodes(real_graph)) >= 8, "图节点太少，约束失去意义"
-    assert len(_translated_nodes()) >= 7, "没有抽到任何翻译分支，AST 提取可能失效"
+    names, prefixes = _translated_nodes()
+    assert len(names) >= 7, "没有抽到任何翻译分支，AST 提取可能失效"
+    assert prefixes, "没有抽到 startswith 分支"
 
 
 def _edges(real_graph) -> set[tuple[str, str]]:

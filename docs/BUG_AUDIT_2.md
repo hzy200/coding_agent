@@ -1,5 +1,8 @@
 # 第二轮缺陷审计：功能 / 性能
 
+> **历史记录（已归档）**：第二轮审计（C1–C8 已修）；当前状态见
+> [ACCEPTANCE.md](ACCEPTANCE.md)。
+
 > 审计方式：在**第一轮修复之后**的代码上重新逐文件精读（含本轮新改的
 > `wsl_exec.py` / `testrun.py` / `files.py` / `snapshots.py`），并交叉验证调用链。
 > 基线：`pytest -m "not wsl and not llm and not wsl_env"` → **791 passed, 0 failed**。

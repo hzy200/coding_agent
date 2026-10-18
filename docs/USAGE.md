@@ -141,8 +141,10 @@ agent audit --thread-id abc123
 
 按天一个 JSONL 文件，默认在 `<当前目录>/.agent/audit/`。
 
-记录类型：`run_start` / `plan` / `tool_call` / `file_change` / `verify` / `repair` /
-`rollback` / `run_end` / `run_error`。每条复用工具的结构化产物，不解析工具文本输出；
+记录类型：`run_start` / `plan` / `replan` / `tool_call` / `file_change` /
+`verify` / `review` / `repair` / `nudge` / `subagent` / `workflow` /
+`task_graph` / `worker` / `orchestration` / `steering` / `rollback` /
+`run_end` / `run_error`。每条复用工具的结构化产物，不解析工具文本输出；
 `args` 落库前统一截断，不会把整个文件内容抄进日志。
 
 **审计由 runtime 写，不由前端写** —— 所以任何界面都绕不过。
@@ -168,6 +170,21 @@ tags:     ["coding-agent", "mode:ask"]
 metadata: {"thread_id": "…", "workspace": "/mnt/d/proj", "model": "deepseek-chat",
            "allow_write": false, "approval_mode": "ask"}
 ```
+
+### 编排模式与实时干预
+
+默认 `direct`。要启用动态工作流与并发 worker：
+
+```bash
+AGENT_ORCHESTRATOR_ENABLED=true agent tui
+# 写 worker 还需要（工作区必须是干净 git 仓库根）：
+AGENT_ORCHESTRATOR_ENABLED=true AGENT_ORCHESTRATOR_WRITE_ENABLED=true \
+  agent tui --write
+```
+
+TUI 运行中可输入 `/pause` `/resume` `/cancel` `/add [角色] <目标>` `/replan`；
+CLI 与 Web 只透传事件，不提供控制入口。任务图、worker 成本/并发/冲突与
+干预延迟的评测方法见 [tests/eval/README.md](../tests/eval/README.md)。
 
 ## 配置来源
 
@@ -234,16 +251,16 @@ WARN  环境变量被 .env 覆盖 — LANGSMITH_API_KEY 在环境变量里也有
 
 `deepseek-v4-flash` 的思考模式偶发。langchain-openai 不提取该字段，传不回去。
 **改用 `DEEPSEEK_MODEL=deepseek-chat`**（也是配置默认值）。
-详见 [PLAN.md](PLAN.md#6-风险与应对)。
+当前状态见 [ACCEPTANCE.md 已知限制](ACCEPTANCE.md#4-已知限制)。
 
 ### 测试太慢
 
 ```bash
-pytest -m "not wsl"   # 跳过真实沙箱，约 45 秒
+pytest -m "not wsl and not llm"   # 跳过真实沙箱与真实模型，约 1 分钟
 ```
 
-集成测试的开销几乎全在 `wsl.exe` 进程启动上。完整说明见
-[PLAN.md](PLAN.md#测试执行速度)。
+集成测试的开销几乎全在 `wsl.exe` 进程启动上。分层与守卫见
+[WORKFLOW.md §3](WORKFLOW.md#3-开发工作流)。
 
 ## 沙箱
 
