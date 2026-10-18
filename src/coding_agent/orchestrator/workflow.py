@@ -7,17 +7,29 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel, Field
 
 from coding_agent.config import Settings
 from coding_agent.graph.state import AgentState
 from coding_agent.llm.deepseek import with_json_output
-from coding_agent.messages import last_human_text
-from coding_agent.orchestrator.contracts import WorkflowDecision
+from coding_agent.orchestrator.contracts import TaskSpec, WorkflowDecision
+from coding_agent.orchestrator.state import request_of
+
+
+class WorkflowPlan(BaseModel):
+    """工作流选择 + 任务图一次返回，避免模糊请求付两次 LLM 往返。"""
+
+    workflow: Literal[
+        "direct", "parallel_readonly", "orchestrated_implement"
+    ] = "direct"
+    reason: str = ""
+    tasks: list[TaskSpec] = Field(default_factory=list)
+    degraded: bool = False
 
 # 明确的「多交付物/多区域」信号：命中时不必再问模型。
 _MULTI_HINTS = (
@@ -87,14 +99,14 @@ def rule_workflow(
 def make_select_workflow_node(
     llm: BaseChatModel, settings: Settings, *, allow_write: bool = False
 ) -> Callable[[AgentState, RunnableConfig], Awaitable[dict[str, Any]]]:
-    structured = with_json_output(llm, WorkflowDecision).with_retry(
+    structured = with_json_output(llm, WorkflowPlan).with_retry(
         stop_after_attempt=2
     )
 
     async def select_workflow(
         state: AgentState, config: RunnableConfig
     ) -> dict[str, Any]:
-        request = last_human_text(state["messages"])
+        request = request_of(state)
         summary = state.get("repo_summary") or {}
         write_available = bool(
             settings.orchestrator_write_enabled
@@ -106,23 +118,62 @@ def make_select_workflow_node(
         decision = rule_workflow(
             request, summary, settings, write_available=write_available
         )
+        prefetched: list[dict[str, Any]] = []
+        prefetched_degraded = False
 
         if decision is None:
+            # 规则不确定时一次调用同时拿到 workflow 和任务图，省掉
+            # select → plan 的第二次 LLM 往返。
+            from coding_agent.orchestrator.nodes import (
+                _IMPLEMENT_ROLE_NOTES,
+                _IMPLEMENT_RULES,
+                _READ_ONLY_ROLE_NOTES,
+                _READ_ONLY_RULES,
+                PLAN_TASKS_PROMPT,
+            )
+
+            task_prompt = PLAN_TASKS_PROMPT.format(
+                max_tasks=settings.orchestrator_max_tasks,
+                role_notes=(
+                    _IMPLEMENT_ROLE_NOTES
+                    if write_available
+                    else _READ_ONLY_ROLE_NOTES
+                ),
+                write_rules=(
+                    _IMPLEMENT_RULES
+                    if write_available
+                    else _READ_ONLY_RULES
+                ),
+            )
             body = (
                 f"用户请求：{request}\n\n"
                 f"仓库画像：{summary}\n\n"
-                "请选择工作流。"
+                "请先选择 workflow，再给出任务图。"
+                "输出 JSON："
+                '{"workflow": "direct|parallel_readonly|orchestrated_implement",'
+                ' "reason": "一句话", "tasks": [...]}'
             )
             try:
-                decision = await structured.ainvoke(
+                plan = await structured.ainvoke(
                     [
-                        SystemMessage(content=WORKFLOW_PROMPT),
+                        SystemMessage(
+                            content=WORKFLOW_PROMPT + "\n\n" + task_prompt
+                        ),
                         HumanMessage(content=body),
                     ],
                     config,
                 )
             except Exception:  # noqa: BLE001 - 选择失败不能拖垮图
-                decision = None
+                plan = None
+
+            if isinstance(plan, WorkflowPlan):
+                decision = WorkflowDecision(
+                    workflow=plan.workflow, reason=plan.reason
+                )
+                prefetched = [task.model_dump() for task in plan.tasks]
+                prefetched_degraded = bool(plan.degraded)
+            elif isinstance(plan, WorkflowDecision):
+                decision = plan
 
         if decision is None:
             decision = WorkflowDecision(
@@ -135,10 +186,13 @@ def make_select_workflow_node(
                 workflow="parallel_readonly",
                 reason="写编排不可用，回退为只读并行",
             )
+            prefetched = []
 
         return {
             "workflow": decision.workflow,
             "workflow_reason": decision.reason,
+            "prefetched_tasks": prefetched,
+            "prefetched_degraded": prefetched_degraded,
         }
 
     return select_workflow

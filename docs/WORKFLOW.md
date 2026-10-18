@@ -21,8 +21,9 @@
 START → route_entry
   ├─ direct ─→ planner → act ⇄ approval_gate → tools
   │                     → verify → review → advance → steering_step → replan → act/respond
-  └─ orchestrated ─→ survey → select_workflow → plan_tasks
-                       → dispatch ⇄ extend_tasks → steering_dispatch → synthesize
+  └─ orchestrated ─→ orchestrator 子图：
+                       survey → select_and_plan
+                       → scheduler ⇄ steering_dispatch → fan_in
                        → planner → ...
 ```
 
@@ -46,7 +47,7 @@ direct 路径的失败分支：verify/review 没过且还有预算 → repair �
 
 三者通过**条件边**（`graph/routing.py`）组合；节点彼此不知道对方存在，加一个机制不用改其它两个。
 节点**只读状态、返回状态增量**，不产事件、不写审计——那是 `runtime` 的职责；
-唯一例外是 `dispatch` 用 custom stream 实时推送 worker 开始/结束。
+唯一例外是 `scheduler`/`dispatch` 用 custom stream 实时推送 worker 开始/结束。
 
 ### 2.2 状态生命周期
 
@@ -191,41 +192,42 @@ act ──delegate_explore──▶ approval_gate（L0，自动放行）──�
 - **事件**：`SubAgentStarted` / `SubAgentFinished`；多个并发子智能体按
   `call_id` 配对。审计里每条子工具调用都带 `agent_id` / `parent_call_id`。
 
-### 2.11 编排模式（Phase 3A–4D，已实现，默认关闭）
+### 2.11 编排模式（独立子图 + 事件驱动 DAG，默认启用）
 
-> 完整方案与阶段拆解见 [HARNESS.md](HARNESS.md)。
+> 完整方案见 [HARNESS.md](HARNESS.md)。
 
 运行模式：
 
 ```
 START → route_entry
-  ├─ direct ───────────→ planner → act → ...
-  └─ orchestrated ─────→ survey → select_workflow → plan_tasks
-                          → dispatch → extend_tasks → steering_dispatch
-                          → synthesize → planner → ...
+  ├─ direct ───────────→ planner → act → ...          （小任务快速路径）
+  └─ orchestrated ─────→ orchestrator 子图
+                          survey → select_and_plan
+                          → scheduler ⇄ steering_dispatch
+                          → fan_in → planner → ...
 ```
 
-- 开关：`AGENT_ORCHESTRATOR_ENABLED`（默认 `false`）；
+- 开关：`AGENT_ORCHESTRATOR_ENABLED`（默认 `true`）；
 - 模板：`direct` / `parallel_readonly` / `orchestrated_implement`；
-- 只读 worker：explore/test/review 并发；任务级失败重试
-  （`AGENT_ORCHESTRATOR_TASK_RETRIES`）；默认 `partial` 不满足依赖，
-  `depends_mode=any` 的 review/test 可消费 partial 产出；
-- **动态任务图（4D）**：explore/review 可提议最多 2 个只读任务；
-  `extend_tasks` 做 host 校验（角色/去重/依赖/总量/无环）后加入 pending；
-- 写 worker（Phase 3C，默认关闭）：需要 `AGENT_ORCHESTRATOR_WRITE_ENABLED=true`、
-  `--write`、git 仓库根 + 干净工作区；每个 implement 在独立 worktree 中修改，
-  write_scope 不得重叠，完成后由宿主顺序合并 patch，合并前留快照；
-- fan-in 只看每个任务的最后一次尝试，并报告多 worker 关注同一文件；
-- 实时干预（Phase 3D，TUI）：`/pause` `/resume` `/cancel` `/add` `/replan`；
-  指令在节点边界消费，pause 走 checkpoint，cancel 协作式停止 worker；
-- worker 的启动/结束通过 custom stream 实时发出（不批量回放）；
+- **事件驱动调度**：scheduler 用 ready 堆 + `asyncio.wait(FIRST_COMPLETED)`，
+  任务完成立即解锁依赖；失败立即短路，不等整批；
+- 只读 worker：explore/test/review 并发；任务级失败重试带上次失败上下文
+  （`AGENT_ORCHESTRATOR_TASK_RETRIES`）；`depends_mode=any` 的 review/test
+  可消费 partial 产出；
+- **动态任务图**：explore/review 可提议最多 2 个只读任务，scheduler 在完成点
+  做 host 校验（角色/去重/依赖/总量/无环）后立即入队；
+- 写 worker：需要 `AGENT_ORCHESTRATOR_WRITE_ENABLED=true`、`--write`、
+  git 仓库根 + 干净工作区；每个 implement 在独立 worktree 中修改，
+  `write_scope` 在 I/O 前强制校验，完成后由宿主串行合并 patch 并留快照；
+- fan-in：按失败/阻塞优先、任务级预算输出 `worker_brief`，完整结果落
+  `.agent/artifacts/`；
+- 实时干预（TUI）：`/pause` `/resume` `/cancel` `/add` `/replan`；
+  scheduler 在 `checkpoint_every` 边界 drain 后消费，pause 走 checkpoint；
+- worker 的启动/结束通过 custom stream 实时发出；
 - 关闭时完全走现有单 agent 路径，行为与基线一致。
 
-**已实现的是动态编排**：`survey → select_workflow → plan_tasks →
-dispatch → extend_tasks → steering_dispatch → synthesize → planner`。
-只读 worker 负责探索/测试/审查，并可提议新的只读任务；写 worker（3C，默认关闭）
-在独立 worktree 中并发修改、由宿主校验并合并 patch；编排结束后主 agent 仍负责
-最终验证与答复。烟雾结果见 [HARNESS.md §14](HARNESS.md)。
+编排结束后主 agent 仍负责最终验证与答复；写路径的审批、快照与审计仍是唯一
+安全边界。烟雾结果见 [HARNESS.md §14](HARNESS.md)。
 
 ---
 

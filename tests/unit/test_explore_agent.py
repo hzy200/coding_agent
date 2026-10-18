@@ -314,3 +314,23 @@ def test_cancelled_explore_skips_the_report_call() -> None:
     assert "取消" in artifact.summary
     assert llm.seen == []
     assert llm.structured.calls == 0
+
+
+def test_json_final_message_skips_the_second_report_call() -> None:
+    payload = (
+        '{"summary":"入口在 main.py","relevant_files":["main.py"],'
+        '"findings":["main 负责启动"],"open_questions":[],'
+        '"recommended_next_steps":[],"proposed_tasks":[]}'
+    )
+    llm = _ScriptedLLM([AIMessage(content=payload)])
+    runner = _runner(llm, [])
+
+    artifact = _run(
+        runner,
+        args={"goal": "定位入口", "paths": []},
+        parent_request="父请求",
+    )
+
+    assert artifact.summary == "入口在 main.py"
+    assert artifact.relevant_files == ["main.py"]
+    assert llm.structured.calls == 0

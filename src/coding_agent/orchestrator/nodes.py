@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import posixpath
 import shlex
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -16,7 +17,7 @@ from langgraph.config import get_stream_writer
 from coding_agent.config import Settings
 from coding_agent.graph.state import AgentState
 from coding_agent.llm.deepseek import with_json_output
-from coding_agent.messages import last_human_text
+from coding_agent.orchestrator.artifacts import ArtifactStore, make_run_id
 from coding_agent.orchestrator.contracts import TaskGraph, WorkerResult
 from coding_agent.orchestrator.graph import (
     mark_blocked,
@@ -25,6 +26,7 @@ from coding_agent.orchestrator.graph import (
     validate_tasks,
 )
 from coding_agent.orchestrator.implement import stage_args
+from coding_agent.orchestrator.state import request_of
 from coding_agent.orchestrator.workers import WorkerRunner
 from coding_agent.sandbox.fs import SandboxFs, SandboxFsError, SandboxPathError
 from coding_agent.sandbox.snapshots import MAX_OPERATIONAL_BYTES, SnapshotStore
@@ -116,27 +118,47 @@ def make_survey_node(
     def survey(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         summary = dict(state.get("repo_profile") or {})
         top_entries: dict[str, list[str]] = {"dirs": [], "files": []}
+        is_git = False
+        git_root = False
+        git_clean = False
+        # 一次 wsl.exe 拿完顶层目录/文件与 git 状态；原先这里是 6 次进程启动，
+        # 4 个 worker 并发时这部分开销会被放大。
+        script = f"""\
+echo "AGENT_DIRS"
+find . -maxdepth 1 -mindepth 1 -type d -not -name '.*' | sort | head -20
+echo "AGENT_FILES"
+find . -maxdepth 1 -mindepth 1 -type f -not -name '.*' | sort | head -20
+echo "AGENT_GIT"
+if git rev-parse --is-inside-work-tree 2>/dev/null | grep -q true; then
+  echo "INSIDE=1"
+  top=$(git rev-parse --show-toplevel 2>/dev/null)
+  physical=$(pwd -P)
+  if [ "$top" = "$physical" ]; then echo "ROOT=1"; else echo "ROOT=0"; fi
+  dirty=$(git status --porcelain -- . {stage_args()} 2>/dev/null)
+  if [ -z "$dirty" ]; then echo "CLEAN=1"; else echo "CLEAN=0"; fi
+else
+  echo "INSIDE=0"; echo "ROOT=0"; echo "CLEAN=0"
+fi
+"""
         try:
-            dirs_result = sandbox.run(
-                "find . -maxdepth 1 -mindepth 1 -type d -not -name '.*' | sort",
-                cwd=root,
-            )
-            if dirs_result.ok:
-                top_entries["dirs"] = [
-                    line.strip()
-                    for line in dirs_result.stdout.splitlines()
-                    if line.strip()
-                ][:20]
-            files_result = sandbox.run(
-                "find . -maxdepth 1 -mindepth 1 -type f -not -name '.*' | sort",
-                cwd=root,
-            )
-            if files_result.ok:
-                top_entries["files"] = [
-                    line.strip()
-                    for line in files_result.stdout.splitlines()
-                    if line.strip()
-                ][:20]
+            result = sandbox.run(script, cwd=root)
+            section = ""
+            flags: dict[str, str] = {}
+            for line in result.stdout.splitlines():
+                text = line.strip()
+                if text in {"AGENT_DIRS", "AGENT_FILES", "AGENT_GIT"}:
+                    section = text
+                    continue
+                if section == "AGENT_DIRS" and text:
+                    top_entries["dirs"].append(text)
+                elif section == "AGENT_FILES" and text:
+                    top_entries["files"].append(text)
+                elif section == "AGENT_GIT" and "=" in text:
+                    key, _, value = text.partition("=")
+                    flags[key] = value
+            is_git = flags.get("INSIDE") == "1"
+            git_root = flags.get("ROOT") == "1"
+            git_clean = flags.get("CLEAN") == "1"
         except Exception:  # noqa: BLE001 - survey 失败不能拖垮 run
             pass
 
@@ -144,32 +166,6 @@ def make_survey_node(
             test_command = detect_test_command(sandbox, root, allow_manifest=False)
         except Exception:  # noqa: BLE001
             test_command = ""
-
-        # Phase 3C 的写隔离要求：git 仓库根、工作区干净（不含 .agent/ 等
-        # agent 自己的产物）。工作区是仓库子目录时 patch 路径会错位，直接禁用。
-        is_git = False
-        git_root = False
-        git_clean = False
-        try:
-            inside = sandbox.run(
-                "git rev-parse --is-inside-work-tree", cwd=root
-            )
-            is_git = inside.ok and inside.stdout.strip().endswith("true")
-            if is_git:
-                toplevel = sandbox.run("git rev-parse --show-toplevel", cwd=root)
-                physical = sandbox.run("pwd -P", cwd=root)
-                git_root = bool(
-                    toplevel.ok
-                    and physical.ok
-                    and toplevel.stdout.strip().rstrip("/")
-                    == physical.stdout.strip().rstrip("/")
-                )
-                status = sandbox.run(
-                    f"git status --porcelain -- . {stage_args()}", cwd=root
-                )
-                git_clean = status.ok and not status.stdout.strip()
-        except Exception:  # noqa: BLE001
-            is_git = False
 
         summary["top_dirs"] = top_entries["dirs"]
         summary["top_files"] = top_entries["files"]
@@ -217,7 +213,7 @@ def make_plan_tasks_node(
     async def plan_tasks(
         state: AgentState, config: RunnableConfig
     ) -> dict[str, Any]:
-        request = last_human_text(state["messages"])
+        request = request_of(state)
         summary = state.get("repo_summary") or {}
         replan_mode = bool(state.get("steering_replan"))
         existing_tasks = [dict(task) for task in (state.get("tasks") or [])]
@@ -257,42 +253,55 @@ def make_plan_tasks_node(
         tasks: list[dict[str, Any]] = []
         degraded = False
         errors: list[str] = []
-        try:
-            graph = await structured.ainvoke(
-                [
-                    SystemMessage(
-                        content=PLAN_TASKS_PROMPT.format(
-                            max_tasks=settings.orchestrator_max_tasks,
-                            role_notes=(
-                                _IMPLEMENT_ROLE_NOTES
-                                if write_mode
-                                else _READ_ONLY_ROLE_NOTES
-                            ),
-                            write_rules=(
-                                _IMPLEMENT_RULES
-                                if write_mode
-                                else _READ_ONLY_RULES
-                            ),
-                        )
-                    ),
-                    HumanMessage(content=body),
-                ],
-                config,
-            )
+        prefetched = [
+            dict(task) for task in (state.get("prefetched_tasks") or [])
+        ]
+        if prefetched and not replan_mode:
+            # select_workflow 已经把任务图一并返回；不要再付一次 LLM 往返。
             tasks, degraded, errors = validate_tasks(
-                graph.tasks,
+                prefetched,
                 request=request,
                 max_tasks=settings.orchestrator_max_tasks,
                 allow_write=write_mode,
             )
-            degraded = degraded or bool(graph.degraded)
-        except Exception:  # noqa: BLE001 - 规划失败降级
-            tasks, degraded, errors = validate_tasks(
-                [],
-                request=request,
-                max_tasks=settings.orchestrator_max_tasks,
-                allow_write=write_mode,
-            )
+            degraded = degraded or bool(state.get("prefetched_degraded"))
+        else:
+            try:
+                graph = await structured.ainvoke(
+                    [
+                        SystemMessage(
+                            content=PLAN_TASKS_PROMPT.format(
+                                max_tasks=settings.orchestrator_max_tasks,
+                                role_notes=(
+                                    _IMPLEMENT_ROLE_NOTES
+                                    if write_mode
+                                    else _READ_ONLY_ROLE_NOTES
+                                ),
+                                write_rules=(
+                                    _IMPLEMENT_RULES
+                                    if write_mode
+                                    else _READ_ONLY_RULES
+                                ),
+                            )
+                        ),
+                        HumanMessage(content=body),
+                    ],
+                    config,
+                )
+                tasks, degraded, errors = validate_tasks(
+                    graph.tasks,
+                    request=request,
+                    max_tasks=settings.orchestrator_max_tasks,
+                    allow_write=write_mode,
+                )
+                degraded = degraded or bool(graph.degraded)
+            except Exception:  # noqa: BLE001 - 规划失败降级
+                tasks, degraded, errors = validate_tasks(
+                    [],
+                    request=request,
+                    max_tasks=settings.orchestrator_max_tasks,
+                    allow_write=write_mode,
+                )
 
         if degraded and write_mode:
             fallback = _default_write_task(request, summary)
@@ -316,7 +325,12 @@ def make_plan_tasks_node(
         # 只读模式下，模型只给一个任务时补一个独立的「测试/期望」探索任务：
         # 编排路径要能真正演示并发，而不是一个 worker 的串行包装。
         # 写模式不补：第二个 implement 没有明确 write_scope 时不安全。
-        if not degraded and not write_mode and len(tasks) == 1:
+        if (
+            settings.orchestrator_add_explore_tests
+            and not degraded
+            and not write_mode
+            and len(tasks) == 1
+        ):
             used = {task["id"] for task in tasks}
             extra_id = "explore-tests"
             while extra_id in used:
@@ -374,6 +388,8 @@ def make_plan_tasks_node(
             "orchestrator_summary": "；".join(errors),
             "steering_replan": False,
             "workflow_revised_reason": revised_reason,
+            "prefetched_tasks": [],
+            "prefetched_degraded": False,
         }
 
     return plan_tasks
@@ -522,7 +538,7 @@ def make_dispatch_node(
                 "orchestrator_round": round_no,
             }
 
-        parent_request = last_human_text(state["messages"])
+        parent_request = request_of(state)
         cwd = str(state.get("cwd", ""))
         semaphore = asyncio.Semaphore(
             max(1, int(settings.orchestrator_max_concurrent_workers))
@@ -763,8 +779,32 @@ def make_extend_tasks_node(
     return extend_tasks
 
 
+_FANIN_STATUS_ORDER = {
+    "failed": 0,
+    "blocked": 0,
+    "cancelled": 1,
+    "partial": 2,
+    "success": 3,
+}
+
+
+def _fanin_rank(result: dict[str, Any]) -> tuple[int, int, int, str]:
+    """失败/阻塞优先，其次 partial，最后 success；同级按优先级/深度。"""
+    status = _FANIN_STATUS_ORDER.get(str(result.get("status", "")), 4)
+    return (
+        status,
+        -int(result.get("priority") or 0),
+        -int(result.get("depth") or 0),
+        str(result.get("task_id", "")),
+    )
+
+
 def make_synthesize_node(
     settings: Settings,
+    *,
+    sandbox: WslSandbox | None = None,
+    root: str = "",
+    artifacts: bool = False,
 ) -> Callable[[AgentState, RunnableConfig], dict[str, Any]]:
     def synthesize(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         tasks = state.get("tasks") or []
@@ -787,17 +827,29 @@ def make_synthesize_node(
             for result in latest.values()
             if result.get("role") == "implement" and result.get("merged")
         )
-        lines = [
-            "[编排器汇总]"
-            + (
-                "\n注意：以下实现任务已由 worker 完成并合并到主工作区；"
-                "优先验证与最小修复，不要重做已完成部分。"
-                if merged_count
-                else ""
-            )
-        ]
         file_tasks: dict[str, list[str]] = {}
         for result in latest.values():
+            for path in result.get("files") or []:
+                file_tasks.setdefault(str(path), []).append(
+                    str(result.get("task_id", "?"))
+                )
+        overlaps = {
+            path: task_ids
+            for path, task_ids in file_tasks.items()
+            if len(set(task_ids)) > 1
+        }
+        unfinished = [
+            task["id"]
+            for task in tasks
+            if status.get(task["id"], "pending")
+            in {"pending", "blocked", "cancelled"}
+        ]
+
+        limit = max(int(settings.orchestrator_context_chars), 500)
+        ordered = sorted(latest.values(), key=_fanin_rank)
+        per_task = max(200, limit // max(len(ordered), 1))
+        blocks: list[str] = []
+        for result in ordered:
             task_id = result.get("task_id", "?")
             role = result.get("role", "")
             state_text = result.get("status", "")
@@ -812,42 +864,67 @@ def make_synthesize_node(
                     merge_note = f"，合并失败：{result['merge_error'][:200]}"
                 elif result.get("patch_path"):
                     merge_note = "，补丁未合并"
-            lines.append(
+            block_lines = [
                 f"- {task_id} ({role}/{state_text}){retry_note}"
                 f"{merge_note}: {summary}"
-            )
+            ]
             files = result.get("files") or []
             if files:
-                lines.append("  相关文件：" + "、".join(str(f) for f in files[:8]))
-                for path in files:
-                    file_tasks.setdefault(str(path), []).append(str(task_id))
+                block_lines.append(
+                    "  相关文件：" + "、".join(str(f) for f in files[:8])
+                )
             findings = result.get("findings") or []
             if findings:
-                lines.append("  发现：" + "；".join(str(f) for f in findings[:5]))
+                block_lines.append(
+                    "  发现：" + "；".join(str(f) for f in findings[:5])
+                )
+            block = "\n".join(block_lines)
+            if len(block) > per_task:
+                block = block[:per_task] + "…（任务摘要已截断）"
+            blocks.append(block)
 
-        overlaps = {
-            path: task_ids
-            for path, task_ids in file_tasks.items()
-            if len(set(task_ids)) > 1
-        }
-        if overlaps:
-            lines.append("多 worker 关注同一文件：")
-            for path, task_ids in list(overlaps.items())[:10]:
-                lines.append(f"- {path}（{', '.join(sorted(set(task_ids)))}）")
-
-        unfinished = [
-            task["id"]
-            for task in tasks
-            if status.get(task["id"], "pending")
-            in {"pending", "blocked", "cancelled"}
+        head = [
+            "[编排器汇总]"
+            + (
+                "\n注意：以下实现任务已由 worker 完成并合并到主工作区；"
+                "优先验证与最小修复，不要重做已完成部分。"
+                if merged_count
+                else ""
+            )
         ]
+        if overlaps:
+            head.append("多 worker 关注同一文件：")
+            for path, task_ids in list(overlaps.items())[:10]:
+                head.append(
+                    f"- {path}（{', '.join(sorted(set(task_ids)))}）"
+                )
         if unfinished:
-            lines.append("未执行/阻塞的任务：" + "、".join(unfinished))
+            head.append("未执行/阻塞的任务：" + "、".join(unfinished))
 
-        context = "\n".join(lines)
-        limit = max(int(settings.orchestrator_context_chars), 500)
+        context = "\n".join([*head, *blocks])
         if len(context) > limit:
             context = context[:limit] + "\n…（汇总已截断）"
+
+        artifact_items: list[dict[str, Any]] = []
+        if artifacts and sandbox is not None and root:
+            thread_id = str(
+                (((config or {}).get("configurable")) or {}).get(
+                    "thread_id", ""
+                )
+            )
+            run_id = make_run_id(thread_id, time.strftime("%Y%m%dT%H%M%S"))
+            store = ArtifactStore(sandbox, root, run_id)
+            for result in ordered:
+                rel = store.save_result(result)
+                if rel:
+                    artifact_items.append(
+                        {
+                            "task_id": str(result.get("task_id", "")),
+                            "attempt": int(result.get("attempt", 1)),
+                            "status": str(result.get("status", "")),
+                            "artifact_id": rel,
+                        }
+                    )
 
         completed = sum(1 for value in status.values() if value == "success")
         partial = sum(1 for value in status.values() if value == "partial")
@@ -861,6 +938,10 @@ def make_synthesize_node(
         return {
             "task_status": status,
             "worker_context": context,
+            # 给 planner/act 的紧凑版本；当前与 worker_context 同源，
+            # 后续可按主 agent 的上下文预算单独裁剪。
+            "worker_brief": context,
+            "orchestration_artifacts": artifact_items,
             "orchestrator_summary": (
                 f"成功 {completed}，部分 {partial}，失败/阻塞 {failed}"
                 f"（其中取消 {cancelled_count}），"

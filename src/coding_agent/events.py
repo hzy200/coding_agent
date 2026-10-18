@@ -238,6 +238,8 @@ class WorkerStarted(Event):
     role: str = ""
     goal: str = ""
     attempt: int = 1
+    # 进入 ready 队列后等待并发槽位的时间。
+    queue_wait_ms: int = 0
 
 
 class WorkerFinished(Event):
@@ -259,6 +261,15 @@ class WorkerFinished(Event):
     merge_error: str = ""
     # worker 内部执行的工具调用数（审计里逐条落账）
     tool_calls: int = 0
+    # ---- Phase 5：成本与审计指标 ----
+    queue_wait_ms: int = 0
+    llm_ms: int = 0
+    tool_ms: int = 0
+    timed_out: bool = False
+    artifact_id: str = ""
+    depth: int = 0
+    priority: int = 0
+    scope_violations: list[str] = Field(default_factory=list)
 
 
 class OrchestrationFinished(Event):

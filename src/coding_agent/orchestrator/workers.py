@@ -17,6 +17,7 @@ from langchain_core.runnables import RunnableConfig
 from coding_agent.agents.explore import DelegateRunner
 from coding_agent.orchestrator.contracts import WorkerResult
 from coding_agent.orchestrator.implement import ImplementRunner
+from coding_agent.orchestrator.retry import format_retry_context
 from coding_agent.sandbox.wsl_exec import WslSandbox
 from coding_agent.tools.testrun import run_verification
 
@@ -42,6 +43,7 @@ def make_worker_runner(
         task_id = str(task.get("id", ""))
         role = str(task.get("role", "explore"))
         goal = str(task.get("goal", ""))
+        retry_note = format_retry_context(task)
         worker_id = f"{role}:{task_id}"
 
         if role in {"explore", "review"}:
@@ -57,7 +59,7 @@ def make_worker_runner(
                 )
             artifact = await runner(
                 args={
-                    "goal": goal,
+                    "goal": f"{goal}\n{retry_note}" if retry_note else goal,
                     "paths": list(task.get("inputs") or []),
                     "reason": f"编排器派发的只读 {role} 任务",
                 },

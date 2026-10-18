@@ -29,7 +29,7 @@ class FakeGraph:
     def __init__(self, script: list[tuple[str, Any]]) -> None:
         self.script = script
 
-    async def astream(self, payload, config=None, stream_mode=None):  # noqa: ANN001
+    async def astream(self, payload, config=None, stream_mode=None, subgraphs=None):  # noqa: ANN001
         for mode, data in self.script:
             yield mode, data
 

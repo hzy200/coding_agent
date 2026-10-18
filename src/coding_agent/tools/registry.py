@@ -29,6 +29,8 @@ def build_tools(
     *,
     allow_write: bool = False,
     sandbox: WslSandbox | None = None,
+    write_scope: list[str] | None = None,
+    read_cache: dict[str, bytes] | None = None,
 ) -> list[BaseTool]:
     """构造本次会话的全部工具。
 
@@ -43,7 +45,13 @@ def build_tools(
 
     tools: list[BaseTool] = [build_shell_tool(settings, sandbox)]
     # 其余工具与 shell 共用同一个 sandbox 实例，工作区边界一致
-    tools += build_file_tools(settings, sandbox, allow_write=allow_write)
+    tools += build_file_tools(
+        settings,
+        sandbox,
+        allow_write=allow_write,
+        write_scope=write_scope,
+        read_cache=read_cache,
+    )
     tools += build_git_tools(settings, sandbox)
     tools += build_deps_tools(settings, sandbox)
     tools += build_search_tools(settings, sandbox)

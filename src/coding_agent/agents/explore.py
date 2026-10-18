@@ -23,6 +23,7 @@ checkpoint、interrupt 恢复与并行分支语义，而这些在 Phase 2 才真
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal
@@ -148,6 +149,19 @@ def _transcript(messages: list[Any], max_chars: int) -> str:
     return "…（前文已截断）\n" + transcript[-max_chars:]
 
 
+def _parse_report_text(text: str) -> ExploreReport | None:
+    """从收尾消息里解析结构化报告；失败返回 None，走第二次报告调用。"""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        payload = json.loads(text[start : end + 1])
+        return ExploreReport.model_validate(payload)
+    except (ValueError, TypeError):
+        return None
+
+
 def _fallback_summary(messages: list[Any]) -> str:
     """报告调用失败时，用最后一条助手/工具文本兜底。"""
     for message in reversed(messages):
@@ -264,10 +278,11 @@ def make_readonly_runner(
         truncated = False
         responded = False
         cancelled = False
+        final_text = ""
 
         async def _loop() -> None:
             nonlocal input_tokens, output_tokens, rounds, truncated, responded
-            nonlocal cancelled
+            nonlocal cancelled, final_text
             for round_index in range(1, max_rounds + 1):
                 if cancel is not None and cancel():
                     cancelled = True
@@ -282,6 +297,9 @@ def make_readonly_runner(
 
                 calls = getattr(response, "tool_calls", None) or []
                 if not calls:
+                    # 收尾消息若已经是约定 JSON，宿主直接采用，省掉第二次
+                    # 报告 LLM 调用；解析失败才回退。
+                    final_text = text_of(response).strip()
                     return
 
                 for index, call in enumerate(calls):
@@ -343,6 +361,8 @@ def make_readonly_runner(
 
         report: ExploreReport | None = None
         if responded and not cancelled:
+            report = _parse_report_text(final_text)
+        if report is None and responded and not cancelled:
             transcript = _transcript(messages, _MAX_TRANSCRIPT_CHARS)
             # 报告调用也受同一个墙钟预算约束：循环若已用满，只给它剩余时间。
             remaining = max(timeout - (time.monotonic() - started), 1.0)

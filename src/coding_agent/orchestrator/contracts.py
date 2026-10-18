@@ -38,6 +38,13 @@ class TaskSpec(BaseModel):
     write_scope: list[str] = Field(default_factory=list)
     # 该任务在 worktree 中允许的修复轮次（宿主默认值兜底）。
     max_repairs: int | None = None
+    # 任务级预算。None 表示使用全局配置兜底。
+    max_rounds: int | None = None
+    timeout: int | None = None
+    # 0/None 表示不限制；scheduler 按 provider 回报的 usage 累计判断。
+    max_tokens: int | None = None
+    # 宿主可覆盖的调度优先级（越大越先启动）；模型给出的值会被 clamp。
+    priority: int | None = None
 
 
 class TaskGraph(BaseModel):
@@ -80,3 +87,21 @@ class WorkerResult(BaseModel):
     error: str = ""
     # worker 内部执行的工具调用（供审计层逐条落账）
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    # ---- Phase 5：调度 / 成本 / 审计指标 ----
+    # 从进入 ready 队列到真正拿到并发槽位的等待时间。
+    queue_wait_ms: int = 0
+    # LLM 与工具分别占用的时间；用于定位成本/延迟来源。
+    llm_ms: int = 0
+    tool_ms: int = 0
+    # 是否因为 deadline/任务 timeout 被取消。
+    timed_out: bool = False
+    # 写 worker 在运行中试图越界但被写时守卫拦下的路径。
+    scope_violations: list[str] = Field(default_factory=list)
+    # fan-in 的结构化结果落盘位置。
+    artifact_id: str = ""
+    # 任务在依赖图中的深度，fan-in 排序用。
+    depth: int = 0
+    # 调度优先级（越大越先启动）。
+    priority: int = 0
+    # 本任务实际消耗的预算摘要（tokens / rounds / seconds）。
+    budget_used: dict[str, int] = Field(default_factory=dict)

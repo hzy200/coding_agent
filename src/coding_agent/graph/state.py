@@ -15,6 +15,9 @@ from langgraph.graph.message import add_messages
 class AgentState(TypedDict, total=False):
     # 对话与工具调用轨迹，add_messages 负责追加与去重
     messages: Annotated[list[AnyMessage], add_messages]
+    # 本轮用户请求的纯文本副本。独立子图不复制整段 messages，只读这一项；
+    # direct 路径仍以 messages 为准（此字段不参与规划）。
+    request: str
     # 沙箱内的工作目录
     cwd: str
     # 跨会话的项目事实，每次 run 从记忆文件刷新后注入系统提示
@@ -96,6 +99,9 @@ class AgentState(TypedDict, total=False):
     workflow_reason: str
     # survey 写入：文件数、测试文件数、顶层目录、测试命令
     repo_summary: dict[str, Any]
+    # select_workflow 在规则不确定时一次返回的预取任务；plan_tasks 直接消费。
+    prefetched_tasks: list[dict[str, Any]]
+    prefetched_degraded: bool
     # plan_tasks 写入：TaskSpec 列表与状态
     tasks: list[dict[str, Any]]
     task_status: dict[str, str]
@@ -110,6 +116,9 @@ class AgentState(TypedDict, total=False):
     orchestrator_completed: int
     orchestrator_failed: int
     worker_context: str
+    # fan-in 的结构化产物索引；完整结果在 .agent/artifacts/ 下。
+    worker_brief: str
+    orchestration_artifacts: list[dict[str, Any]]
     # Phase 4D：worker 提议的只读任务扩展
     # 已扫描到 worker_results 的哪个位置（避免重复采纳同一批提议）
     task_extensions_seen: int

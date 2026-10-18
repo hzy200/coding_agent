@@ -445,6 +445,8 @@ class AgentRuntime:
 
         inputs = {
             "messages": [HumanMessage(content=prompt)],
+            # 独立 orchestrator 子图只读这一项，避免把整段消息历史复制进子图。
+            "request": prompt,
             "cwd": self.workspace,
             "tool_rounds": 0,
             "budget_exhausted": False,
@@ -599,6 +601,7 @@ class AgentRuntime:
                 settings.max_replans,
                 orchestrator_enabled=settings.orchestrator_enabled,
                 orchestrator_max_rounds=settings.orchestrator_max_rounds,
+                orchestrator_subgraph=settings.orchestrator_subgraph_enabled,
             ),
             # 这些会随 trace 一起上报，LangSmith 里可按会话/工作区/权限筛选
             "run_name": f"agent:{thread_id}",
@@ -671,9 +674,20 @@ class AgentRuntime:
                 yield RunStarted(thread_id=thread_id)
 
             graph = await self._ensure_graph()
-            async for mode, data in graph.astream(
-                payload, config, stream_mode=["messages", "updates", "custom"]
+            # 只在一个 stream 调用内去重：子图中断会同时在带 namespace 的
+            # 更新和父图更新里出现一次，但跨 resume 的重复暂停不能被吞掉。
+            seen_interrupts: set[str] = set()
+            async for chunk in graph.astream(
+                payload,
+                config,
+                stream_mode=["messages", "updates", "custom"],
+                # 独立子图的内层节点更新/自定义事件只有打开它才可见。
+                subgraphs=True,
             ):
+                if len(chunk) == 3:
+                    _namespace, mode, data = chunk
+                else:
+                    mode, data = chunk
                 if mode == "custom":
                     # Phase 4：dispatch 通过 get_stream_writer 实时推送 worker
                     # 开始/结束；updates 分支只补齐没被流式发过的事件。
@@ -722,6 +736,11 @@ class AgentRuntime:
                 if suspension:
                     interrupted = True
                     for item in suspension:
+                        key = str(getattr(item, "id", "") or "")
+                        if key:
+                            if key in seen_interrupts:
+                                continue
+                            seen_interrupts.add(key)
                         payload = getattr(item, "value", None) or {}
                         if payload.get("steering") == "pause":
                             yield SteeringApplied(
@@ -861,7 +880,7 @@ class AgentRuntime:
                                 added=added, rejected=rejected
                             )
 
-                    elif node == "dispatch":
+                    elif node in {"dispatch", "scheduler"}:
                         results = update.get("worker_results") or []
                         emitted = int(progress.get("workers_emitted", 0))
                         fresh = results[emitted:]
@@ -884,6 +903,7 @@ class AgentRuntime:
                                 role=str(result.get("role", "")),
                                 goal=str(result.get("goal", "")),
                                 attempt=int(result.get("attempt", 1)),
+                                queue_wait_ms=int(result.get("queue_wait_ms", 0)),
                             )
                         for result in fresh:
                             key = _worker_key(result)
@@ -895,6 +915,35 @@ class AgentRuntime:
                             ):
                                 yield event
                         progress["workers_emitted"] = len(results)
+                        # 事件驱动 scheduler 在同一个节点里完成动态扩展，
+                        # 没有独立的 extend_tasks 更新可翻译。
+                        added = update.get("task_extensions_applied") or []
+                        rejected = update.get("task_extension_errors") or []
+                        if added or rejected:
+                            if added:
+                                self._audit(
+                                    AuditRecord(
+                                        ts=now_iso(),
+                                        kind=audit_models.TASK_GRAPH,
+                                        thread_id=thread_id,
+                                        workflow=progress.get("workflow"),
+                                        steps=[
+                                            str(task.get("goal", ""))
+                                            for task in added
+                                        ],
+                                        detail=(
+                                            f"运行中扩展 {len(added)} 个只读任务"
+                                            + (
+                                                f"；拒绝 {len(rejected)} 个"
+                                                if rejected
+                                                else ""
+                                            )
+                                        ),
+                                    )
+                                )
+                            yield TaskGraphExtended(
+                                added=added, rejected=rejected
+                            )
 
                     elif node == "synthesize":
                         completed = int(update.get("orchestrator_completed", 0))
@@ -1457,6 +1506,16 @@ class AgentRuntime:
             merged=bool(result.get("merged")),
             merge_error=str(result.get("merge_error", "")),
             tool_calls=len(result.get("tool_calls") or []),
+            queue_wait_ms=int(result.get("queue_wait_ms") or 0),
+            llm_ms=int(result.get("llm_ms") or 0),
+            tool_ms=int(result.get("tool_ms") or 0),
+            timed_out=bool(result.get("timed_out")),
+            artifact_id=str(result.get("artifact_id", "")),
+            depth=int(result.get("depth") or 0),
+            priority=int(result.get("priority") or 0),
+            scope_violations=[
+                str(item) for item in (result.get("scope_violations") or [])
+            ],
         )
         self._audit(
             AuditRecord(

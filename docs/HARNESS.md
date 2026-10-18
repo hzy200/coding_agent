@@ -1,9 +1,11 @@
 # Harness 化改进方案：动态工作流 + 并发子智能体
 
-> **状态**：**Phase 3A–4D 已实现**：动态工作流、只读/写并发 worker、worktree
-> 隔离与合并、fan-in、运行中干预、worker 提议只读任务、成本/并发指标、
-> 噪声感知对比与干预延迟基准。**仍计划中**：成本预算与模型分层、Web/CLI
-> 实时控制入口、共享文件多 worker 合并、steering 队列持久化。
+> **状态**：harness 新架构已落地：**独立 orchestrator 子图 + 事件驱动动态
+> DAG + 并发 worker + 结构化 fan-in**。已实现动态只读任务扩展、写 worker
+> worktree 隔离与串行合并、写时 `write_scope` 校验、运行中干预、artifact
+> store、成本/并发指标、噪声感知对比与干预延迟基准。direct 仍保留为小任务
+> 快速路径。**仍计划中**：按改动文件的测试影响分析、共享文件多 worker 的
+> 3-way 合并、steering 队列持久化、Web/CLI 全量实时控制入口。
 > 当前实现见 [ARCHITECTURE.md](ARCHITECTURE.md)，运行工作流见 [WORKFLOW.md](WORKFLOW.md)。
 
 目标是把系统演进成 Claude Code / Codex / Workbuddy / DeepSeek Harness 那类
@@ -213,12 +215,15 @@ class TaskSpec(TypedDict):
 
 ### 6.3 调度
 
-- `ready = pending 且所有依赖 success`；
-- 依赖 failed/blocked → 该任务标 `blocked`；
-- `asyncio.Semaphore(orchestrator_max_concurrent_workers)` + `gather` 并发；
-- 单 worker 失败不影响同批其它任务；
-- 轮次上限 `orchestrator_max_rounds`，超过后剩余任务标 blocked 并汇总；
-- 每个 worker 有独立 `timeout` 与工具轮次预算。
+- 事件驱动：ready 最小堆 + `asyncio.wait(FIRST_COMPLETED)`；任务完成立即解锁
+  依赖方，不再等整批；
+- `asyncio.Semaphore(orchestrator_max_concurrent_workers)` 控制真正并发；
+- 依赖 failed/blocked → 该任务标 `blocked`；同类失败立即短路；
+- 失败任务在额度内带上次失败上下文重试（`retry_context`），额度用尽才阻塞下游；
+- 动态只读提议在 worker 完成点校验并立即入队；
+- `orchestrator_checkpoint_every` 到达时 drain 在飞任务并返回父图，形成
+  checkpoint/steering 边界；pause 只在边界 `interrupt()`；
+- 全局 `orchestrator_run_deadline_s` 与每个 worker 的独立 timeout 共同兜底。
 
 ### 6.4 状态
 

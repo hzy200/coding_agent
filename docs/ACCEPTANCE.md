@@ -72,7 +72,7 @@ review 的「改动前」**直接复用快照**（不变量 8：所有写操作�
 ruff check .
 
 # 2. 全量测试（含真实 WSL 沙箱）
-pytest -m "not llm"          # 期望 1403 passed
+pytest -m "not llm"          # 期望 1420 passed
 # 另有 3 条 llm 标记用例需要 DEEPSEEK_API_KEY；不要用裸 pytest 代替 ——
 # 不加 -m 时它们会真的调用模型（本机配了 key 就产生费用）。
 
@@ -92,10 +92,10 @@ python scripts/demo.py --only 1
 
 | 项 | 结果 |
 |---|---|
-| 测试 | **1403 passed**（`pytest -m "not llm"`，含真实 WSL），其中 `wsl` 标记 **207**，无失败；另 3 条 `llm` 用例需 API Key |
-| 覆盖率 | **89.9%**（`pytest -m "not llm" --cov`，含真实 WSL）；**CI 子集 81.3%**，门槛 `fail_under=76` |
+| 测试 | **1420 passed**（`pytest -m "not llm"`，含真实 WSL），其中 `wsl` 标记 **207**，无失败；另 3 条 `llm` 用例需 API Key |
+| 覆盖率 | **89.1%**（`pytest -m "not llm" --cov`，含真实 WSL）；**CI 子集 81.5%**，门槛 `fail_under=76` |
 | lint | 干净（`ruff check src tests`） |
-| 快反馈 | `pytest -m "not wsl and not llm"` = **1196 passed**（deselect 210 = 207 个 `wsl` + 3 个 `llm`，两组无交集）；需装齐 `.[dev,ui,web]`，缺 `textual` 时 TUI 整目录 skip（TUI 49 条） |
+| 快反馈 | `pytest -m "not wsl and not llm"` = **1213 passed**（deselect 210 = 207 个 `wsl` + 3 个 `llm`，两组无交集）；需装齐 `.[dev,ui,web]`，缺 `textual` 时 TUI 整目录 skip（TUI 49 条） |
 | 能力评测 | **两个套件，各记各的基线**：`default` 29 个短任务最新两轮 **29/29、29/29（100%，spread 0，无翻转）** —— 该套件已**饱和**，测不出进一步改进；旧基线 12/29 = 41.4% 只能当历史坐标。`long` 原有 5 个长程任务（38 文件 / 近千行仓库，改动跨度 3–8 文件，通过率 **2/5 = 30%**，`spread` 20pp；新增 `parallel_modules` 后共 6 个，旧 5 任务基线只能当历史坐标）。报告带机制指标、worker 成本/并发/冲突与噪声块；对比与干预延迟见 [tests/eval/README](../tests/eval/README.md) |
 | CI | `.github/workflows/ci.yml`：`pip install -e ".[dev,ui,web]"` → ruff → `pytest -m "not wsl and not llm"` |
 
@@ -327,6 +327,6 @@ workflow `orchestrated_implement`；planner 生成 2 个 implement + 1 test + 1 
 
 代码冻结后不再改动功能，只接受缺陷修复。任何改动都应：
 
-1. 跑 `pytest -m "not llm"`（1403 个用例全过；见第 3 节口径提醒）
+1. 跑 `pytest -m "not llm"`（1420 个用例全过；见第 3 节口径提醒）
 2. 跑 `ruff check .`
 3. 如果是安全相关的改动，对照本文件第 2 节确认对应测试仍在

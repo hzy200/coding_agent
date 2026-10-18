@@ -32,7 +32,7 @@ class FakeGraph:
         self.script = script
         self.payloads: list[Any] = []
 
-    async def astream(self, payload, config=None, stream_mode=None):  # noqa: ANN001
+    async def astream(self, payload, config=None, stream_mode=None, subgraphs=None):  # noqa: ANN001
         self.payloads.append(payload)
         for mode, data in self.script:
             yield mode, data

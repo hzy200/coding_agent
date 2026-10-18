@@ -213,12 +213,12 @@ checkpoint 保存，队列只活在当前进程。
 | 26 | **语法错在落盘前就拒** | 原先「先写下去 → review 事后查 → 不合格再 repair」，白烧一轮工具预算与一次模型往返。语法错是这里最便宜就能确定的错误（纯解析、零 I/O），没理由等到事后。**判据是「有没有变坏」而不是「是不是好的」** —— 原本就坏的文件允许继续改，否则会堵死模型自己的分步修复 | `test_write_rejects_broken_python`、`test_edit_rejects_a_change_that_breaks_syntax`、`test_an_already_broken_file_can_still_be_edited` |
 | 25 | **「没验证」不等于「通过」** | 识别不出测试命令时原先是 `not_configured` → 路由判为非 failed → **审计记成 `ok=True`**，于是"没做"与"做对了"在账上分不开（P0-2）。现在：① 有源码就做**语法解析级降级验证**（`kind=syntax`），② 事件与审计的 `ok` 都是**三态**（True/False/**None=没验证**） | `test_a_python_project_without_tests_falls_back_to_a_syntax_check`、`test_the_audit_records_not_configured_as_unverified_not_passed`、`test_verification_ok_is_three_state` |
 | 24 | **空步骤的重做有界，且必须给退路** | 只读步骤是合法的（计划第一步常常就是探索）。无限要求"必须有改动"会逼出无意义的改动，所以只给一次机会，且提示里明确写了"这一步确实只需只读就说明理由停下" | `test_the_nudge_happens_only_once_per_step`、`test_nudge_tells_the_model_why_it_is_back` |
-| 27 | **`delegate_explore` 子智能体只能绑定只读白名单工具** | 子智能体输入包含仓库内容，不能让它获得写/执行能力。构造时校验工具集合，运行时再按名字二次校验；委托调用本身仍走 `approval_gate → tools` 唯一咽喉。编排 implement worker 是另一条受控路径（见 32） | `test_runner_refuses_non_readonly_tools_at_construction`、`test_non_whitelisted_tool_call_is_refused` |
-| 28 | **主 agent 的并发只发生在只读子智能体之间** | 多个 delegate 同批并发；主 agent 的普通工具（含写）仍串行。写操作与探索混在同一条消息时，提示词要求模型拆开，避免读到改动前的状态 | `test_multiple_delegate_calls_run_concurrently`、`test_concurrent_batch_respects_the_task_budget` |
+| 27 | **`delegate_explore` 子智能体只能绑定只读白名单工具；implement worker 只能绑定文件/检索白名单** | 子智能体输入包含仓库内容，不能让它获得写/执行能力。构造时校验工具集合，运行时再按名字二次校验；委托调用本身仍走 `approval_gate → tools` 唯一咽喉。编排 implement worker 是另一条受控路径，构造时断言不含 shell/git/deps/test（见 32） | `test_runner_refuses_non_readonly_tools_at_construction`、`test_non_whitelisted_tool_call_is_refused` |
+| 28 | **主 agent 的并发只发生在只读子智能体之间；编排并发由 scheduler 统一管理** | 多个 delegate 同批并发；主 agent 的普通工具（含写）仍串行。编排路径由 scheduler 的 ready 堆与信号量控制并发，任务完成即解锁依赖，失败立即短路。写操作与探索混在同一条消息时，提示词要求模型拆开，避免读到改动前的状态 | `test_multiple_delegate_calls_run_concurrently`、`test_concurrent_batch_respects_the_task_budget`、`test_dependent_starts_as_soon_as_its_predecessor_finishes` |
 | 29 | **`implement` 步骤必须有实际改动才能推进** | 委派探索可以把「读」做完，但不能因此把实现步当成完成。`plan_kinds` 与 `plan` 逐项对齐：explore/verify 允许零改动直接步进；implement 先 nudge 一次，仍无 `dirty` 就收尾，不再静默 advance | `test_an_implement_step_nudged_without_changes_responds`、`test_an_explore_step_without_changes_advances_without_nudge` |
 | 30 | **同一失败签名连续出现就改走 replan，且跨 replan 继续累积** | 24 次相同失败验证说明 repair 只是重复同一类修改。失败签名由失败测试 id + 归一化错误消息组成；连续达到 `max_same_failures` 后不再 repair。replan 会清空 `verification`，所以签名另存 `last_failure_signature`：新做法若仍撞同一个失败，计数继续增长，不会「清零→再修两轮→再 replan」循环。repair 时只重跑上次失败的 pytest 测试，子集通过后自动补跑全量。 | `test_the_same_failure_signature_goes_to_replan`、`test_stagnation_survives_a_replan_that_clears_the_verification`、`test_selected_pass_is_confirmed_by_a_full_run` |
 | 31 | **委派只在 explore 步、且受仓库规模预算约束** | 38 文件的任务实测会拆 3–5 个子智能体，成本 +43%。默认：<30 文件不委派；30–99 最多 2 次；100–299 最多 4 次；≥300 用配置上限。实现/验证步一律拒绝委派 | `test_small_repo_disables_delegation`、`test_delegate_is_rejected_outside_an_explore_step`、`test_delegate_budget_comes_from_the_cost_policy` |
-| 32 | **编排写 worker 只能在隔离 worktree 中并发，且写范围不重叠** | 多个 implement 同时改主工作区会互相覆盖。每个 worker 一个 worktree；dispatch 顺序 `git apply --check` → 留快照 → `git apply`；越界修改由 worker 事后 diff 校验拒绝 | `test_concurrent_implement_workers_ignore_agent_state`、`test_merged_patch_takes_snapshots_so_undo_can_restore`、`test_dispatch_marks_a_conflicting_patch_failed` |
+| 32 | **编排写 worker 只能在隔离 worktree 中并发，且写范围在 I/O 前就被校验** | 多个 implement 同时改主工作区会互相覆盖。每个 worker 一个 worktree；scheduler/dispatch 串行执行 `git apply --check` → 留快照 → `git apply`；文件工具在写入前拒绝 `write_scope` 外路径，事后 diff 校验保留为第二道防线 | `test_concurrent_implement_workers_ignore_agent_state`、`test_merged_patch_takes_snapshots_so_undo_can_restore`、`test_dispatch_marks_a_conflicting_patch_failed`、`test_write_outside_scope_is_rejected_before_io` |
 
 ## 7. 关键取舍
 
@@ -294,39 +294,50 @@ Git、依赖、检索都有专用工具。换来三件事：参数无法逃逸�
 往进程环境注入值，用户既看不到来源也删不掉，导致改 `.env` 完全不生效。
 项目目录里的 `.env` 是显式写下、看得见、可编辑的意图。详见 [USAGE.md](USAGE.md#配置来源)。
 
-## 8. Orchestrator（Phase 3A–4D 已实现，默认关闭）
+## 8. Orchestrator（独立子图 + 事件驱动 DAG）
 
 > 完整方案与阶段拆解见 [HARNESS.md](HARNESS.md)。
 
-编排层位于 runtime 与 graph 之间，**复用现有能力**：
+编排层是父图中的一个**独立子图**，默认启用；小任务仍由 runtime 选择
+`direct` 快速路径：
 
-- `orchestrator/`：survey、工作流选择、TaskSpec 校验、dispatch、synthesize；
-- `graph/`：`START` 条件入口按 `execution_mode` 分流；`direct` 路径保持现状；
-- `agents/`：explore worker 复用现有只读 runner；test worker 复用测试 runner；
-- `events.py` / `audit/`：workflow/task/worker 事件与字段；
-- 审批、沙箱、快照、审计仍是唯一执行与安全路径。
+```
+START ─ route_entry ─┬─ direct → planner → act ...
+                     └─ orchestrated
+                          └─ orchestrator 子图
+                               survey → select_and_plan → scheduler ⇄ steering_dispatch
+                                                              ↓
+                                                            fan_in → planner
+```
 
-**已实现**（默认 `AGENT_ORCHESTRATOR_ENABLED=false`）：
+- `orchestrator/state.py`：`OrchestratorState` 窄契约，只传 request/cwd/
+  repo_profile 与编排结果，不复制父子图的 messages；
+- `orchestrator/subgraph.py`：独立子图组装；父图用 `subgraphs=True` 消费内层
+  更新与 worker custom 事件；
+- `orchestrator/scheduler.py`：事件驱动 DAG（ready 堆 +
+  `asyncio.wait(FIRST_COMPLETED)`），完成即解锁依赖、失败立即短路；
+  `checkpoint_every` 到达边界时 drain 在飞任务再返回，交给
+  `steering_dispatch` 消费 pause/add/replan/cancel；
+- `orchestrator/merge.py`：implement 补丁串行合并（check → 解析路径 → 留快照 →
+  apply），旧 dispatch 与新 scheduler 共用同一套判定；
+- `orchestrator/artifacts.py`：fan-in 完整结果落 `.agent/artifacts/`；
+  `worker_brief` 给 planner/act，完整结果可追溯；
+- `orchestrator/workflow.py`：规则优先；规则不确定时一次结构化调用同时返回
+  workflow + 任务图，避免第二次规划往返。
 
-- `direct` / `parallel_readonly` 模板；
-- 只读 explore/test/review worker 的并发 dispatch、依赖阻塞、fan-in；
-- 任务级失败重试；默认 `partial` 不满足依赖，但 `depends_mode=any` 的
-  review/test 可以消费 partial 产出；fan-in 只看最后尝试并报告文件重叠；
-- **动态任务图**：explore/review 可提议最多 2 个只读任务；`extend_tasks`
-  做 host 校验（角色/去重/依赖/总量/无环）后加入 pending；
-- `worker_context` 注入 planner/act；
-- 事件/审计/eval 机制指标。
+**写路径**：`implement` worker 仍在独立 git worktree 中修改，导出 patch 后由
+宿主串行合并。`write_scope` 现在有**写时校验**：文件工具在 I/O 前拒绝越界路径；
+事后 diff 校验保留为第二道防线。写编排要求 `--write`、git 仓库根、干净工作区；
+`.agent/` 与 `__pycache__/` 不算用户脏改动。
 
-**Phase 3C 已实现（默认关闭）**：`implement` worker 在独立 git worktree 中修改，
-导出 patch 后由 dispatch 顺序 `git apply`；写范围必须不重叠，合并前 `--check`。
-合并前还会为主工作区目标文件留快照（`worker_results.snapshot_ids`），使
-`agent undo` 覆盖编排写。写编排要求工作区是 git 仓库根；`.agent/` 与
-`__pycache__/` 不算用户脏改动。
+**Steering**：`runtime.steer()` → `SteeringController`（按 thread 隔离）。
+`cancel` 在 worker 轮次/工具边界协作式轮询；`pause/add/replan` 只在 scheduler
+drain 后的边界消费。pause 用 `interrupt()` + checkpoint，恢复时已完成任务
+不会重跑。
 
-**Phase 3D 已实现**：`runtime.steer()` → `SteeringController`（按 thread 隔离），
-四个图节点在边界消费 `/pause` `/cancel` `/add` `/replan`；pause 用
-`interrupt()` + checkpoint，worker 在轮次/工具边界协作式响应 cancel；
-事件 `SteeringApplied` / `WorkflowRevised`，审计 `kind=steering`。
+**权限与稳定性**：worker 仍只能通过 `WslSandbox` 执行；implement worker 只绑定
+文件/检索白名单，不绑定 shell/git/deps/test。`WslSandbox` 增加并发命令信号量与
+探测缓存锁；所有 worker 工具调用、合并、超时、scope 违规、取消均写审计。
 
 ## 9. 扩展点
 

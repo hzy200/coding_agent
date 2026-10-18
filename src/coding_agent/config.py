@@ -98,6 +98,11 @@ class Settings(BaseSettings):
     shell_max_processes: int = Field(default=1024, alias="AGENT_SHELL_MAX_PROCESSES")
     max_output_chars: int = Field(default=20_000, alias="AGENT_MAX_OUTPUT_CHARS")
     max_file_read_bytes: int = Field(default=2_000_000, alias="AGENT_MAX_FILE_READ_BYTES")
+    # 同时启动的 wsl.exe 进程上限。并发 worker 会各自调用沙箱，没有这层
+    # 背压时 4 个 worker 的一次工具轮次就能同时拉起十几个 WSL 进程。
+    sandbox_max_concurrent_commands: int = Field(
+        default=8, alias="AGENT_SANDBOX_MAX_CONCURRENT_COMMANDS"
+    )
 
     # ---------- 上下文裁剪 ----------
     # 0 表示不裁剪；这些值作用于发给模型的历史，不改写会话状态
@@ -158,8 +163,10 @@ class Settings(BaseSettings):
     delegate_large_calls: int = Field(default=4, alias="AGENT_DELEGATE_LARGE_CALLS")
 
     # ---------- Orchestrator（Phase 3A）----------
-    # 默认关闭：打开后 START 会根据仓库规模进入编排路径；关闭时完全走旧图。
-    orchestrator_enabled: bool = Field(default=False, alias="AGENT_ORCHESTRATOR_ENABLED")
+    # 新架构默认启用：满足规模阈值的仓库走 harness；小仓库仍走 direct 快速路径。
+    orchestrator_enabled: bool = Field(
+        default=True, alias="AGENT_ORCHESTRATOR_ENABLED"
+    )
     # 小于该文件数不做编排，直接单 agent。
     orchestrator_min_files: int = Field(default=30, alias="AGENT_ORCHESTRATOR_MIN_FILES")
     orchestrator_max_tasks: int = Field(default=6, alias="AGENT_ORCHESTRATOR_MAX_TASKS")
@@ -191,6 +198,53 @@ class Settings(BaseSettings):
     # 交给主 agent 的 worker 汇总上限（字符）。
     orchestrator_context_chars: int = Field(
         default=8_000, alias="AGENT_ORCHESTRATOR_CONTEXT_CHARS"
+    )
+
+    # ---- Phase 5：统一 harness（迁移期开关）----
+    # 独立 orchestrator 子图。迁移期默认关闭，等价迁移验收后置为 true。
+    orchestrator_subgraph_enabled: bool = Field(
+        default=True, alias="AGENT_ORCHESTRATOR_SUBGRAPH_ENABLED"
+    )
+    # 事件驱动 DAG 调度。关闭时保留按批 dispatch 的旧实现。
+    orchestrator_event_driven: bool = Field(
+        default=True, alias="AGENT_ORCHESTRATOR_EVENT_DRIVEN"
+    )
+    # 写 worker 的 write_scope 在 I/O 前强制校验（三重防线之一）。
+    orchestrator_write_scope_enforce: bool = Field(
+        default=True, alias="AGENT_ORCHESTRATOR_WRITE_SCOPE_ENFORCE"
+    )
+    # fan-in 是否落 artifact store 并输出结构化结果。
+    orchestrator_fanout_artifacts: bool = Field(
+        default=True, alias="AGENT_ORCHESTRATOR_FANOUT_ARTIFACTS"
+    )
+    # 整个编排阶段（含所有 worker）的墙钟上限，0 表示不限制。
+    orchestrator_run_deadline_s: int = Field(
+        default=900, alias="AGENT_ORCHESTRATOR_RUN_DEADLINE_S"
+    )
+    # 单任务 token 上限，0 表示不限制（由 provider 回报的 usage 累计判断）。
+    orchestrator_task_tokens: int = Field(
+        default=0, alias="AGENT_ORCHESTRATOR_TASK_TOKENS"
+    )
+    # scheduler 每完成多少个任务返回一次父图，形成 checkpoint/干预边界。
+    orchestrator_checkpoint_every: int = Field(
+        default=4, alias="AGENT_ORCHESTRATOR_CHECKPOINT_EVERY"
+    )
+    # worker 专用模型；空串表示继承 DEEPSEEK_MODEL。用于 explore/review 降本。
+    orchestrator_worker_model: str = Field(
+        default="", alias="AGENT_ORCHESTRATOR_WORKER_MODEL"
+    )
+    # fan-in 超预算/有冲突时才调用一次 reducer LLM；失败回退确定性汇总。
+    orchestrator_fanin_reducer: bool = Field(
+        default=False, alias="AGENT_ORCHESTRATOR_FANIN_REDUCER"
+    )
+    # 只读模式下模型只给一个任务时，是否强行补一个「找测试」explore 任务。
+    # 默认关闭：这会增加一次 worker 成本，只有演示并发/确实需要测试画像时才值得。
+    orchestrator_add_explore_tests: bool = Field(
+        default=False, alias="AGENT_ORCHESTRATOR_ADD_EXPLORE_TESTS"
+    )
+    # 派发 implement 前一次性展示 write_scope 并等待确认（并发区不弹审批）。
+    orchestrator_write_plan_approval: bool = Field(
+        default=False, alias="AGENT_ORCHESTRATOR_WRITE_PLAN_APPROVAL"
     )
 
     # ---------- 持久化与审计 ----------

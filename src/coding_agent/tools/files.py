@@ -126,10 +126,20 @@ def build_file_tools(
     sandbox: WslSandbox,
     *,
     allow_write: bool,
+    write_scope: list[str] | None = None,
+    read_cache: dict[str, bytes] | None = None,
 ) -> list[BaseTool]:
     root = resolve_workspace(settings, sandbox)
-    fs = SandboxFs(sandbox, root)
+    fs = SandboxFs(sandbox, root, cache=read_cache)
     snapshots = SnapshotStore(sandbox, fs, root)
+    # 并发写 worker 的写时边界。None/空表示不限制（主 agent 的常规文件工具）。
+    # 归一化与 orchestrator.graph 的 scope 口径保持一致：POSIX 相对路径、
+    # 不带前导斜杠、目录不以 "/" 结尾。
+    write_scope_norm = [
+        str(item).strip().replace("\\", "/").strip("/")
+        for item in (write_scope or [])
+        if str(item).strip()
+    ]
     # 喂进模型上下文的读上限
     max_bytes = settings.max_file_read_bytes
     # 「读出来改完再写回」的上限。这类读取的内容**不进上下文**（模型只看到 diff），
@@ -166,6 +176,18 @@ def build_file_tools(
     def _error(path: str, action: str, message: str) -> str:
         artifact = FileArtifact(path=path, action=action, ok=False)
         return pack(message, artifact)
+
+    def _scope_allows_rel(relpath: str) -> bool:
+        if not write_scope_norm:
+            return True
+        rel = relpath.replace("\\", "/").lstrip("/")
+        return any(
+            rel == item or rel.startswith(item + "/")
+            for item in write_scope_norm
+        )
+
+    def _scope_allows(target: str) -> bool:
+        return _scope_allows_rel(_relpath(target, root))
 
     # ------------------------------------------------------------------
     # read
@@ -233,6 +255,14 @@ def build_file_tools(
             return _reject(path, "overwrite", f"路径被拒绝：{exc}")
         except SandboxFsError as exc:
             return _error(path, "overwrite", f"无法读取文件状态：{exc}")
+
+        if not _scope_allows(target):
+            return _reject(
+                path,
+                "overwrite",
+                f"路径不在 write_scope 内：{_relpath(target, root)}。"
+                f"允许写入：{', '.join(write_scope_norm)}",
+            )
 
         original: str | None = None
         if info.exists:
@@ -316,6 +346,14 @@ def build_file_tools(
             target = fs.lexical(path)
         except SandboxPathError as exc:
             return _reject(path, "edit", f"路径被拒绝：{exc}")
+
+        if not _scope_allows(target):
+            return _reject(
+                path,
+                "edit",
+                f"路径不在 write_scope 内：{_relpath(target, root)}。"
+                f"允许写入：{', '.join(write_scope_norm)}",
+            )
 
         try:
             original = fs.read_text(target, max_bytes=internal_max_bytes)
@@ -440,6 +478,14 @@ def build_file_tools(
             if not entries:
                 return _error("", "restore", "工作区里还没有任何快照，无法回滚。")
             entry = entries[0]
+
+        if not _scope_allows_rel(entry.path):
+            return _reject(
+                entry.path,
+                "restore",
+                f"快照路径不在 write_scope 内：{entry.path}。"
+                f"允许写入：{', '.join(write_scope_norm)}",
+            )
 
         result = snapshots.restore(entry)
         if not result.ok:

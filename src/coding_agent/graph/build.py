@@ -88,6 +88,7 @@ from coding_agent.orchestrator import (
     route_entry,
 )
 from coding_agent.orchestrator.implement import make_implement_runner
+from coding_agent.orchestrator.subgraph import build_orchestrator_subgraph
 from coding_agent.sandbox.policy import SessionPolicy
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
 from coding_agent.steering import SteeringController
@@ -106,6 +107,7 @@ def estimate_recursion_limit(
     *,
     orchestrator_enabled: bool = False,
     orchestrator_max_rounds: int = 0,
+    orchestrator_subgraph: bool = False,
 ) -> int:
     """按图拓扑估算 `recursion_limit`，避免把限额算小导致正常任务误报。
 
@@ -155,6 +157,9 @@ def estimate_recursion_limit(
     orchestrator_extra = (max_replans + 1) * (
         4 + max(int(orchestrator_max_rounds), 0) * 3
     )
+    if orchestrator_subgraph:
+        # 父图里的 orchestrator 节点本身 + 子图入口/出口各一个超步。
+        orchestrator_extra += 2
     return base + orchestrator_extra
 
 
@@ -179,10 +184,30 @@ def build_graph(
     # 工作区只解析一次，再往下传：verify 的沙箱是共享的，它那份 settings 未必带
     # `--workspace` 覆盖，让它自己推会退回 $HOME。
     root = resolve_workspace(settings, sandbox)
-    tools = build_tools(settings, allow_write=allow_write, sandbox=sandbox)
+    # 同一次运行内只读 worker 共享内容缓存；写路径会主动失效。
+    read_cache: dict[str, bytes] = {}
+    tools = build_tools(
+        settings,
+        allow_write=allow_write,
+        sandbox=sandbox,
+        read_cache=read_cache,
+    )
 
     # 不绑定工具的实例留给 planner / respond，避免它们在规划或收尾阶段发起动作
     llm = build_llm(settings, streaming=True)
+    # 模型分层：explore/review/implement worker 可独立使用更便宜的模型；
+    # 空串表示沿用主模型。
+    worker_llm = llm
+    if (
+        settings.orchestrator_worker_model
+        and settings.orchestrator_worker_model != settings.deepseek_model
+    ):
+        worker_llm = build_llm(
+            settings.model_copy(
+                update={"deepseek_model": settings.orchestrator_worker_model}
+            ),
+            streaming=True,
+        )
 
     # 子智能体/编排 worker 共用同一份只读 Explore runner。
     # delegate 工具只在 explore_enabled 时绑定；orchestrator 只使用 runner。
@@ -192,16 +217,16 @@ def build_graph(
     if settings.explore_enabled or settings.orchestrator_enabled:
         explore_tools = [tool for tool in tools if tool.name in EXPLORE_TOOL_NAMES]
         explore_runner = make_explore_runner(
-            llm=llm, tools=explore_tools, settings=settings
+            llm=worker_llm, tools=explore_tools, settings=settings
         )
     if settings.orchestrator_enabled:
         review_runner = make_review_runner(
-            llm=llm, tools=explore_tools, settings=settings
+            llm=worker_llm, tools=explore_tools, settings=settings
         )
     implement_runner = None
     if settings.orchestrator_enabled and settings.orchestrator_write_enabled and allow_write:
         implement_runner = make_implement_runner(
-            llm=llm, sandbox=sandbox, root=root, settings=settings
+            llm=worker_llm, sandbox=sandbox, root=root, settings=settings
         )
     if settings.explore_enabled:
         delegate_runner = explore_runner
@@ -273,69 +298,109 @@ def build_graph(
         sandbox=sandbox,
         root=root,
     )
-    graph.add_node("survey", make_survey_node(sandbox, root))
-    graph.add_node(
-        "select_workflow",
-        make_select_workflow_node(llm, settings, allow_write=allow_write),
-    )
-    graph.add_node(
-        "plan_tasks", make_plan_tasks_node(llm, settings, allow_write=allow_write)
-    )
-    graph.add_node(
-        DISPATCH,
-        make_dispatch_node(
-            worker_runner=worker_runner,
-            settings=settings,
-            sandbox=sandbox,
-            root=root,
-            steering=steering,
-        ),
-    )
-    # worker 提议的只读任务在这里进入任务图（host 校验/去重/总量上限）
-    graph.add_node(EXTEND_TASKS, make_extend_tasks_node(settings))
-    graph.add_node("synthesize", make_synthesize_node(settings))
-    # Phase 3D：四个 steering 消费点（见 nodes/steering.py 顶部说明）
-    graph.add_node(STEERING_PLAN, make_steering_plan_node(steering, settings))
-    graph.add_node(
-        STEERING_DISPATCH, make_steering_dispatch_node(steering, settings)
-    )
+    use_orchestrator_subgraph = bool(settings.orchestrator_subgraph_enabled)
+
+    if use_orchestrator_subgraph:
+        # 独立子图：父图只看到 orchestrator 一个节点；内层节点通过
+        # `subgraphs=True` 的 stream 上报事件。
+        graph.add_node(
+            "orchestrator",
+            build_orchestrator_subgraph(
+                llm=llm,
+                settings=settings,
+                sandbox=sandbox,
+                root=root,
+                worker_runner=worker_runner,
+                steering=steering,
+                allow_write=allow_write,
+            ),
+        )
+    else:
+        graph.add_node("survey", make_survey_node(sandbox, root))
+        graph.add_node(
+            "select_workflow",
+            make_select_workflow_node(llm, settings, allow_write=allow_write),
+        )
+        graph.add_node(
+            "plan_tasks",
+            make_plan_tasks_node(llm, settings, allow_write=allow_write),
+        )
+        graph.add_node(
+            DISPATCH,
+            make_dispatch_node(
+                worker_runner=worker_runner,
+                settings=settings,
+                sandbox=sandbox,
+                root=root,
+                steering=steering,
+            ),
+        )
+        # worker 提议的只读任务在这里进入任务图（host 校验/去重/总量上限）
+        graph.add_node(EXTEND_TASKS, make_extend_tasks_node(settings))
+        graph.add_node(
+            "synthesize",
+            make_synthesize_node(
+                settings,
+                sandbox=sandbox,
+                root=root,
+                artifacts=settings.orchestrator_fanout_artifacts,
+            ),
+        )
+        # Phase 3D：四个 steering 消费点（见 nodes/steering.py 顶部说明）
+        graph.add_node(
+            STEERING_PLAN, make_steering_plan_node(steering, settings)
+        )
+        graph.add_node(
+            STEERING_DISPATCH, make_steering_dispatch_node(steering, settings)
+        )
+
     graph.add_node(STEERING_STEP, make_steering_step_node(steering, settings))
     graph.add_node(STEERING_FINAL, make_steering_final_node(steering, settings))
 
-    # direct 走旧路径；orchestrated 先 survey/选择/调度，最后仍回到 planner。
+    # direct 走旧路径；orchestrated 进独立子图或旧编排节点，最后仍回到 planner。
     graph.add_conditional_edges(
         START,
         route_entry,
-        {"planner": "planner", "survey": "survey"},
-    )
-    graph.add_edge("survey", "select_workflow")
-    graph.add_conditional_edges(
-        "select_workflow",
-        route_after_select,
-        {PLAN_TASKS: PLAN_TASKS, "planner": "planner"},
-    )
-    graph.add_edge(PLAN_TASKS, STEERING_PLAN)
-    graph.add_conditional_edges(
-        STEERING_PLAN,
-        route_after_steering_plan,
-        {DISPATCH: DISPATCH, SYNTHESIZE: SYNTHESIZE},
-    )
-    graph.add_edge(DISPATCH, EXTEND_TASKS)
-    graph.add_edge(EXTEND_TASKS, STEERING_DISPATCH)
-    graph.add_conditional_edges(
-        STEERING_DISPATCH,
-        route_after_steering_dispatch,
         {
-            DISPATCH: DISPATCH,
-            PLAN_TASKS: PLAN_TASKS,
-            SYNTHESIZE: SYNTHESIZE,
+            "planner": "planner",
+            "survey": "orchestrator" if use_orchestrator_subgraph else "survey",
         },
     )
-    graph.add_conditional_edges(
-        SYNTHESIZE,
-        route_after_synthesize,
-        {STEERING_FINAL: STEERING_FINAL, "planner": "planner"},
-    )
+    if use_orchestrator_subgraph:
+        graph.add_conditional_edges(
+            "orchestrator",
+            route_after_synthesize,
+            {STEERING_FINAL: STEERING_FINAL, "planner": "planner"},
+        )
+    else:
+        graph.add_edge("survey", "select_workflow")
+        graph.add_conditional_edges(
+            "select_workflow",
+            route_after_select,
+            {PLAN_TASKS: PLAN_TASKS, "planner": "planner"},
+        )
+        graph.add_edge(PLAN_TASKS, STEERING_PLAN)
+        graph.add_conditional_edges(
+            STEERING_PLAN,
+            route_after_steering_plan,
+            {DISPATCH: DISPATCH, SYNTHESIZE: SYNTHESIZE},
+        )
+        graph.add_edge(DISPATCH, EXTEND_TASKS)
+        graph.add_edge(EXTEND_TASKS, STEERING_DISPATCH)
+        graph.add_conditional_edges(
+            STEERING_DISPATCH,
+            route_after_steering_dispatch,
+            {
+                DISPATCH: DISPATCH,
+                PLAN_TASKS: PLAN_TASKS,
+                SYNTHESIZE: SYNTHESIZE,
+            },
+        )
+        graph.add_conditional_edges(
+            SYNTHESIZE,
+            route_after_synthesize,
+            {STEERING_FINAL: STEERING_FINAL, "planner": "planner"},
+        )
     graph.add_edge("planner", "act")
     graph.add_conditional_edges(
         "act",

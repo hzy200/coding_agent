@@ -34,6 +34,7 @@ from coding_agent.llm.prompts import (
 )
 from coding_agent.messages import text_of
 from coding_agent.orchestrator.contracts import WorkerResult
+from coding_agent.orchestrator.retry import format_retry_context
 from coding_agent.sandbox.fs import SandboxFs
 from coding_agent.sandbox.wsl_exec import WslSandbox
 from coding_agent.tools.artifacts import unpack
@@ -107,26 +108,41 @@ def stage_args() -> str:
 
 
 def _git_ready(sandbox: WslSandbox, root: str) -> tuple[bool, str]:
-    inside = sandbox.run("git rev-parse --is-inside-work-tree", cwd=root)
-    if not (inside.ok and inside.stdout.strip().endswith("true")):
+    """一次 wsl.exe 完成 worktree 前置检查。
+
+    原先拆成 5 条命令，4 个 implement worker 并发时就是 20 次进程启动；
+    检查项本身不变，只是合并成一次脚本。
+    """
+    script = f"""\
+inside=$(git rev-parse --is-inside-work-tree 2>/dev/null)
+if [ "$inside" != "true" ]; then echo "INSIDE=0"; exit 0; fi
+echo "INSIDE=1"
+top=$(git rev-parse --show-toplevel 2>/dev/null)
+physical=$(pwd -P)
+if [ "$top" = "$physical" ]; then echo "ROOT=1"; else echo "ROOT=0"; fi
+if git rev-parse HEAD >/dev/null 2>&1; then echo "HEAD=1"; else echo "HEAD=0"; fi
+dirty=$(git status --porcelain -- . {stage_args()} 2>/dev/null)
+if [ -z "$dirty" ]; then echo "CLEAN=1"; else echo "CLEAN=0"; fi
+"""
+    result = sandbox.run(script, cwd=root)
+    if not result.ok:
+        return False, "无法确认 git 仓库状态"
+    flags: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep:
+            flags[key] = value
+    if flags.get("INSIDE") != "1":
         return False, "工作区不是 git 仓库"
     # worktree 基于整个仓库的 HEAD，patch 路径也是仓库相对的。工作区若只是
     # 仓库的子目录，合并会落到错误的根上 —— 必须要求它就是仓库根。
-    toplevel = sandbox.run("git rev-parse --show-toplevel", cwd=root)
-    physical = sandbox.run("pwd -P", cwd=root)
-    if not toplevel.ok or not physical.ok:
-        return False, "无法确认 git 仓库根目录"
-    if toplevel.stdout.strip().rstrip("/") != physical.stdout.strip().rstrip("/"):
+    if flags.get("ROOT") != "1":
         return False, "工作区不是 git 仓库根目录（写编排需要以仓库根作为工作区）"
-    head = sandbox.run("git rev-parse HEAD", cwd=root)
-    if not head.ok:
+    if flags.get("HEAD") != "1":
         return False, "git 仓库还没有 HEAD（需要至少一次提交）"
     # `.agent/` 里是 worktree、patch、快照等 agent 自己的产物；并发 worker
     # 互相看到对方刚创建的 worktree 是正常现象，不能据此判定"用户工作区脏"。
-    status = sandbox.run(
-        f"git status --porcelain -- . {stage_args()}", cwd=root
-    )
-    if not status.ok or status.stdout.strip():
+    if flags.get("CLEAN") != "1":
         return False, "工作区有未提交改动，写 worker 已禁用"
     return True, ""
 
@@ -208,6 +224,7 @@ def make_implement_runner(
         task_id = str(task.get("id", ""))
         safe = _safe_id(task_id)
         goal = str(task.get("goal", "")).strip()
+        retry_note = format_retry_context(task)
         scopes = [
             str(scope).strip().replace("\\", "/").rstrip("/")
             for scope in (task.get("write_scope") or [])
@@ -255,11 +272,24 @@ def make_implement_runner(
             )
 
         scoped = settings.model_copy(update={"wsl_workspace": worktree})
+        # 写时边界：文件工具在 I/O 之前就会拒绝 write_scope 外的路径。
+        # 事后 `_within_scope` 的 diff 校验仍保留，作为第二道防线。
         tools = [
             tool
-            for tool in build_tools(scoped, allow_write=True, sandbox=sandbox)
+            for tool in build_tools(
+                scoped,
+                allow_write=True,
+                sandbox=sandbox,
+                write_scope=(
+                    scopes if settings.orchestrator_write_scope_enforce else None
+                ),
+                # worktree 内独立缓存；写路径会失效，不能与主工作区共享。
+                read_cache={},
+            )
             if tool.name in IMPLEMENT_TOOL_NAMES
         ]
+        # 静态白名单断言：implement worker 永远不应拿到 shell/git/deps/test。
+        assert set(tool.name for tool in tools) <= IMPLEMENT_TOOL_NAMES
         tool_map: dict[str, BaseTool] = {tool.name: tool for tool in tools}
         child_llm = llm.bind_tools(tools)
 
@@ -276,6 +306,7 @@ def make_implement_runner(
                     f"用户请求：{parent_request or '（未提供）'}\n\n"
                     f"实现任务：{goal}\n\n"
                     f"write_scope：{', '.join(scopes)}"
+                    f"{retry_note}"
                 )
             ),
         ]
@@ -456,6 +487,7 @@ def make_implement_runner(
             error=error,
             patch_path=patch_path,
             tool_calls=records,
+            scope_violations=out_of_scope,
         )
 
     return run

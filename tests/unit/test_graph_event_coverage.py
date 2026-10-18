@@ -48,7 +48,14 @@ def real_graph(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         WslSandbox, "_exec", lambda self, script, *, wall, command="": _FAKE_PROBE
     )
-    settings = Settings(_env_file=None, deepseek_api_key="x", wsl_workspace="/tmp/agent-eval")
+    settings = Settings(
+        _env_file=None,
+        deepseek_api_key="x",
+        wsl_workspace="/tmp/agent-eval",
+        # 这个约束检查的是父图节点翻译；独立子图的内层事件由子图测试覆盖。
+        orchestrator_subgraph_enabled=False,
+        orchestrator_event_driven=False,
+    )
     return build_graph(settings, checkpointer=MemorySaver())
 
 
@@ -76,6 +83,15 @@ def _translated_nodes() -> tuple[set[str], set[str]]:
                     and isinstance(comparator.value, str)
                 ):
                     names.add(comparator.value)
+                elif isinstance(op, ast.In) and isinstance(
+                    comparator, (ast.Set, ast.Tuple, ast.List)
+                ):
+                    for element in comparator.elts:
+                        if (
+                            isinstance(element, ast.Constant)
+                            and isinstance(element.value, str)
+                        ):
+                            names.add(element.value)
         elif (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -109,7 +125,12 @@ def test_no_translation_branch_for_a_missing_node(real_graph) -> None:
     """反向约束：翻译分支必须对应真实节点，防止节点改名后留下死分支。"""
     nodes = _graph_nodes(real_graph)
     names, prefixes = _translated_nodes()
-    dead = {name for name in names if name not in nodes}
+    # dispatch 与 scheduler 是同一职责的两套实现，由
+    # AGENT_ORCHESTRATOR_EVENT_DRIVEN 选择；默认图只有前者。
+    conditional = {"dispatch", "scheduler"}
+    dead = {
+        name for name in names if name not in nodes and name not in conditional
+    }
     assert not dead, f"这些翻译分支对应的节点已不存在：{sorted(dead)}"
     for prefix in prefixes:
         assert any(node.startswith(prefix) for node in nodes), (

@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+from langgraph.types import Interrupt
 
 from coding_agent.audit import AuditLogger, read_records
 from coding_agent.config import Settings
@@ -33,6 +34,7 @@ from coding_agent.events import (
     ToolCallFinished,
     ToolCallStarted,
     Verification,
+    WorkflowSelected,
 )
 from coding_agent.runtime import AgentRuntime
 from coding_agent.tools.artifacts import CallArtifact, FileArtifact, ShellArtifact
@@ -65,13 +67,14 @@ class FakeGraph:
         self.payloads: list[Any] = []
         self.configs: list[dict] = []
 
-    async def astream(self, payload, config=None, stream_mode=None):  # noqa: ANN001
+    async def astream(self, payload, config=None, stream_mode=None, subgraphs=None):  # noqa: ANN001
         self.payloads.append(payload)
         self.configs.append(config or {})
-        for mode, data in self.script:
+        for chunk in self.script:
+            data = chunk[-1]
             if self.error is not None and data is self.error:
                 raise self.error
-            yield mode, data
+            yield chunk
 
 
 def _token(text: str, node: str) -> tuple[str, tuple]:
@@ -927,3 +930,53 @@ def test_not_running_verification_is_not_a_failure(tmp_path) -> None:
     assert record.ok is None
     event = next(e for e in events if isinstance(e, Verification))
     assert event.ok is None
+
+
+def test_namespaced_subgraph_updates_are_translated(tmp_path) -> None:
+    """subgraphs=True 时内层节点更新带 namespace；翻译逻辑不能因此丢失。"""
+    runtime, _ = _runtime(
+        tmp_path,
+        [
+            (
+                ("orchestrator:abc",),
+                "updates",
+                {
+                    "select_workflow": {
+                        "workflow": "parallel_readonly",
+                        "workflow_reason": "多交付物",
+                    }
+                },
+            ),
+            ((), "updates", {"respond": {"messages": [AIMessage(content="完成")]}}),
+        ],
+    )
+    events = _run(_collect(runtime))
+
+    selected = next(e for e in events if isinstance(e, WorkflowSelected))
+    assert selected.workflow == "parallel_readonly"
+    assert isinstance(events[-1], RunFinished)
+
+
+def test_subgraph_interrupt_is_not_emitted_twice(tmp_path) -> None:
+    """子图中断会同时出现在带 namespace 和父图更新里，必须按 id 去重。"""
+    request = {
+        "call_id": "c1",
+        "tool": "shell_exec",
+        "command": "pip install x",
+        "level": "L2 变更性",
+        "reason": "装依赖",
+    }
+    item = Interrupt(value={"requests": [request]}, id="interrupt-1")
+    runtime, _ = _runtime(
+        tmp_path,
+        [
+            (("orchestrator:abc",), "updates", {"__interrupt__": (item,)}),
+            ((), "updates", {"__interrupt__": (item,)}),
+        ],
+    )
+    events = _run(_collect(runtime))
+
+    approvals = [e for e in events if isinstance(e, ApprovalRequested)]
+    assert len(approvals) == 1
+    assert approvals[0].request_id == "c1"
+    assert not any(isinstance(e, RunFinished) for e in events)

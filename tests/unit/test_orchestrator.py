@@ -570,6 +570,19 @@ class _SurveySandbox:
 
     def run(self, command: str, *, cwd: str | None = None, timeout: int | None = None):
         self.commands.append(command)
+        if "AGENT_DIRS" in command:
+            root = "1" if self.toplevel == self.physical else "0"
+            return ExecResult(
+                command=command,
+                exit_code=0,
+                stdout=(
+                    f"AGENT_DIRS\n{self.dirs}"
+                    f"AGENT_FILES\n{self.files}"
+                    f"AGENT_GIT\nINSIDE=1\nROOT={root}\nCLEAN=1\n"
+                ),
+                stderr="",
+                duration_ms=1,
+            )
         if "rev-parse --is-inside-work-tree" in command:
             return ExecResult(
                 command=command, exit_code=0, stdout="true\n", stderr="", duration_ms=1
@@ -820,7 +833,10 @@ def test_plan_tasks_falls_back_on_structured_failure() -> None:
 
 def test_plan_tasks_adds_a_second_task_when_model_returns_one() -> None:
     graph = TaskGraph(tasks=[TaskSpec(id="t1", role="explore", goal="定位")])
-    node = make_plan_tasks_node(_StructuredLLM(_Structured(graph)), _settings())
+    node = make_plan_tasks_node(
+        _StructuredLLM(_Structured(graph)),
+        _settings(orchestrator_add_explore_tests=True),
+    )
     out = _run(
         node(
             {
@@ -1372,3 +1388,30 @@ def test_orchestrator_routing() -> None:
         )
         == "synthesize"
     )
+
+
+def test_plan_tasks_consumes_prefetched_tasks_without_a_second_call() -> None:
+    structured = _Structured(error=RuntimeError("不应再调用模型"))
+    node = make_plan_tasks_node(_StructuredLLM(structured), _settings())
+    out = _run(
+        node(
+            {
+                "messages": [HumanMessage(content="做事")],
+                "repo_summary": {"file_count": 50},
+                "prefetched_tasks": [
+                    {
+                        "id": "t1",
+                        "role": "explore",
+                        "goal": "定位入口",
+                        "depends_on": [],
+                    }
+                ],
+                "prefetched_degraded": False,
+            },
+            None,
+        )
+    )
+
+    assert structured.calls == 0
+    assert out["tasks"][0]["id"] == "t1"
+    assert out["prefetched_tasks"] == []

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -145,6 +146,19 @@ class WslSandbox:
         # 在一次运行内不会变。挂在实例上而不是模块级，这样每个沙箱（也就是每次
         # 运行、每个测试）各记各的，不会跨运行串味。
         self._probe_cache: dict[str, object] = {}
+        self._probe_lock = threading.Lock()
+        # 并发 worker 会各自调沙箱；没有这层背压时 4 个 worker 的一次工具
+        # 轮次就能同时拉起十几个 wsl.exe。0 表示不限制。
+        limit = int(getattr(self.settings, "sandbox_max_concurrent_commands", 0) or 0)
+        self._command_slots = (
+            threading.BoundedSemaphore(limit) if limit > 0 else None
+        )
+        self._command_count = 0
+
+    @property
+    def command_count(self) -> int:
+        """本实例启动过多少次 wsl.exe（供评测/调试统计）。"""
+        return self._command_count
 
     # ---------------- 探测缓存 ----------------
 
@@ -152,14 +166,17 @@ class WslSandbox:
         """记住一次探测的结果：`producer` 只在第一次调用时真正执行。
 
         `producer` 抛异常时什么都不记 —— 失败不该被缓存成"这个人没有 $HOME"。
+        并发 worker 同时探测时用锁避免重复启动 wsl.exe。
         """
-        if key not in self._probe_cache:
-            self._probe_cache[key] = producer()
-        return cast(_T, self._probe_cache[key])
+        with self._probe_lock:
+            if key not in self._probe_cache:
+                self._probe_cache[key] = producer()
+            return cast(_T, self._probe_cache[key])
 
     def forget_probe(self, key: str) -> None:
         """丢掉一条探测缓存，用于「这次的结果不算数，下次重新探测」的情形。"""
-        self._probe_cache.pop(key, None)
+        with self._probe_lock:
+            self._probe_cache.pop(key, None)
 
     # ---------------- 环境探测 ----------------
 
@@ -263,7 +280,18 @@ class WslSandbox:
         return self._exec(script, wall=wall, command=command)
 
     def _exec(self, script: str, *, wall: int, command: str = "") -> ExecResult:
+        """按实例并发上限执行；具体逻辑见 `_exec_locked`。"""
+        slots = self._command_slots
+        if slots is None:
+            return self._exec_locked(script, wall=wall, command=command)
+        with slots:
+            return self._exec_locked(script, wall=wall, command=command)
+
+    def _exec_locked(
+        self, script: str, *, wall: int, command: str = ""
+    ) -> ExecResult:
         """把脚本经 stdin 交给登录 bash 执行（不套隔离包装，供 run/探测复用）。"""
+        self._command_count += 1
         limit = wall + OUTER_TIMEOUT_GRACE
         started = time.perf_counter()
         try:

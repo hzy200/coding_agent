@@ -65,10 +65,19 @@ def _parse_kv(output: str) -> dict[str, str]:
 class SandboxFs:
     """工作区内的文件读写。"""
 
-    def __init__(self, sandbox: WslSandbox, root: str) -> None:
+    def __init__(
+        self,
+        sandbox: WslSandbox,
+        root: str,
+        *,
+        cache: dict[str, bytes] | None = None,
+    ) -> None:
         self._sandbox = sandbox
         self.root = root
         self._real_root: str | None = None
+        # run 级只读内容缓存：并发只读 worker 共享同一份，避免重复读同一文件。
+        # 写路径会主动失效；实现 worker 使用独立 worktree + 独立缓存。
+        self._cache = cache
 
     # ------------------------------------------------------------------
     # 路径校验
@@ -204,6 +213,13 @@ fi
         `max_bytes` 会传进脚本，超限时脚本根本不读内容（见 `_stat_script`）。
         """
         lexical = ensure_inside(path, self.root, cwd=self.root)
+        cached = self._cache.get(lexical) if self._cache is not None else None
+        if cached is not None:
+            if len(cached) > max_bytes:
+                raise SandboxFsTooLarge(
+                    f"文件过大：{len(cached)} 字节（本次操作上限 {max_bytes} 字节）"
+                )
+            return cached
         result = self._sandbox.run(
             self._stat_script(lexical, include_data=True, max_bytes=max_bytes)
         )
@@ -226,6 +242,8 @@ fi
             )
         if data is None:
             raise SandboxFsError(f"读取失败：没有取到内容（{lexical}）")
+        if self._cache is not None:
+            self._cache[lexical] = data
         return data
 
     def read_text(self, path: str, *, max_bytes: int) -> str:
@@ -249,6 +267,8 @@ fi
         再顺着链接把内容写到工作区外。
         """
         lexical = ensure_inside(path, self.root, cwd=self.root)
+        if self._cache is not None:
+            self._cache.pop(lexical, None)
         payload = base64.b64encode(content.encode("utf-8")).decode("ascii")
         script = f"""\
 p={_quote(lexical)}
@@ -302,7 +322,10 @@ __AGENT_PAYLOAD__
         # 不必让沙箱去发现一个本来就能提前知道的问题。
         targets: dict[str, str] = {}
         for path, content in files.items():
-            targets[ensure_inside(path, self.root, cwd=self.root)] = content
+            lexical = ensure_inside(path, self.root, cwd=self.root)
+            targets[lexical] = content
+            if self._cache is not None:
+                self._cache.pop(lexical, None)
 
         payload = base64.b64encode(
             json.dumps(targets, ensure_ascii=False).encode("utf-8")
@@ -366,6 +389,8 @@ __AGENT_WRITE_MANY__
         目录、符号链接一律拒绝（符号链接可能是逃逸通道，删它也可能删到工作区外）。
         """
         lexical = ensure_inside(path, self.root, cwd=self.root)
+        if self._cache is not None:
+            self._cache.pop(lexical, None)
         # 先探一次：既拿到状态（存在吗、是文件吗），也完成 realpath 校验
         info = self.stat(lexical)
         self._check_real_path(lexical, info)
