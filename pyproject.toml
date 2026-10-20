@@ -45,7 +45,9 @@ agent = "coding_agent.cli.app:main"
 packages = ["src/coding_agent"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# "." 让 `from tests.eval...` 这类助手导入在 CI 的 console-script 入口下也成立
+# （`python -m pytest` 会把 cwd 放进 sys.path，`pytest` 不会 —— 两边必须一致）。
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 # 默认并行：集成测试的开销几乎全在 wsl.exe 进程启动上（每次约 0.3s），
 # 串行跑一遍要十分钟，且完全受 I/O 限制，并行几乎线性加速。
