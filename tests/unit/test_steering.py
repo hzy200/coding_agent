@@ -410,3 +410,42 @@ def test_replan_after_a_merged_patch_downgrades_new_write_tasks() -> None:
     new_tasks = [task for task in out["tasks"] if task["id"] != "done"]
     assert new_tasks
     assert all(task["role"] != "implement" for task in new_tasks)
+
+
+def test_pending_commands_survive_a_controller_restart(tmp_path) -> None:
+    first = SteeringController(tmp_path)
+    first.submit("t", SteeringCommand("add", "检查边界", "review"))
+    first.submit("t", SteeringCommand("replan", "换做法"))
+    first.mark_paused("t")
+
+    second = SteeringController(tmp_path)
+    assert [item.action for item in second.peek("t")] == ["add", "replan"]
+    assert second.is_paused("t")
+
+    consumed = second.consume("t")
+    assert [item.action for item in consumed] == ["add", "replan"]
+
+    third = SteeringController(tmp_path)
+    assert third.peek("t") == []
+    assert third.is_paused("t")
+
+
+def test_clear_removes_persisted_state(tmp_path) -> None:
+    first = SteeringController(tmp_path)
+    first.submit("t", SteeringCommand("cancel"))
+    first.mark_paused("t")
+    first.clear("t")
+
+    second = SteeringController(tmp_path)
+    assert second.peek("t") == []
+    assert second.is_paused("t") is False
+
+
+def test_corrupt_state_file_is_ignored(tmp_path) -> None:
+    first = SteeringController(tmp_path)
+    first.submit("t", SteeringCommand("add", "x", "review"))
+    for path in tmp_path.glob("*.json"):
+        path.write_text("{not json", encoding="utf-8")
+
+    second = SteeringController(tmp_path)
+    assert second.peek("t") == []

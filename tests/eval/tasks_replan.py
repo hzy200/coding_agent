@@ -110,7 +110,8 @@ class ShopTest(unittest.TestCase):
         self.assertEqual(invoice.line_total(19.99, 25), 14.99)
 
     def test_coupon_price(self):
-        self.assertEqual(coupon.price_with_coupon(49.95, 30), 34.96)
+        # 49.95 * 0.8 = 39.96，避免 34.965 这类浮点/舍入口径歧义。
+        self.assertEqual(coupon.price_with_coupon(49.95, 20), 39.96)
 ''',
         },
         hidden_tests={

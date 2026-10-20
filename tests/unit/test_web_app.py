@@ -14,10 +14,12 @@ from fastapi.testclient import TestClient
 from coding_agent import web
 from coding_agent.config import Settings
 from coding_agent.events import (
+    ApprovalRequested,
     AssistantToken,
     PlanCreated,
     RunFinished,
     RunStarted,
+    SteeringApplied,
     ToolCallFinished,
     ToolCallStarted,
 )
@@ -44,6 +46,10 @@ class FakeRuntime:
         self._history = history or []
         self.workspace = workspace
         self.ran: list[tuple[str, str]] = []
+        self.steered: list[tuple[str, str]] = []
+        self.resumed: list[tuple[str, dict[str, bool]]] = []
+        self.steering_resumed = 0
+        self.paused = False
         self.closed = False
 
     async def run(self, prompt: str, *, thread_id: str):
@@ -51,9 +57,35 @@ class FakeRuntime:
         if self._error is not None:
             raise self._error
         for event in self._events:
+            if isinstance(event, SteeringApplied) and event.action == "pause":
+                self.paused = True
             yield event
 
-    async def history(self, thread_id: str):
+    def steer(self, thread_id: str, action: str, **kwargs) -> None:
+        self.steered.append((thread_id, action))
+        if action == "pause":
+            self.paused = True
+
+    def is_paused(self, thread_id: str) -> bool:
+        return self.paused
+
+    async def resume(self, thread_id: str, decisions: dict[str, bool]):
+        self.resumed.append((thread_id, decisions))
+        self.paused = False
+        yield RunFinished(thread_id=thread_id, answer="resumed")
+
+    async def resume_steering(self, thread_id: str):
+        self.steering_resumed += 1
+        self.paused = False
+        yield RunFinished(thread_id=thread_id, answer="resumed")
+
+    async def history(
+        self,
+        thread_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ):
         return self._history
 
     async def aclose(self) -> None:
@@ -232,8 +264,7 @@ def test_run_rejects_empty_prompt(monkeypatch, settings) -> None:
     assert client.post("/api/run", json={"prompt": ""}).status_code == 422
 
 
-def test_run_denies_mutations_by_default(monkeypatch, settings) -> None:
-    """Web 没有审批交互，所以必须固定拒绝变更类命令（fail closed）。"""
+def test_run_uses_ask_mode_so_approvals_can_resume(monkeypatch, settings) -> None:
     seen: list[str] = []
 
     def _capture(*args, **kwargs):
@@ -244,7 +275,62 @@ def test_run_denies_mutations_by_default(monkeypatch, settings) -> None:
     TestClient(web.create_app(settings)).post("/api/run", json={"prompt": "hi"})
 
     assert seen == [web.app.WEB_APPROVAL_MODE]
-    assert web.app.WEB_APPROVAL_MODE == "deny"
+    assert web.app.WEB_APPROVAL_MODE == "ask"
+
+
+def test_steering_and_resume_share_the_suspended_runtime(
+    monkeypatch, settings
+) -> None:
+    runtime = FakeRuntime(
+        events=[
+            RunStarted(thread_id="t"),
+            SteeringApplied(action="pause", detail="paused"),
+        ]
+    )
+    monkeypatch.setattr(web.app, "AgentRuntime", lambda *a, **k: runtime)
+    client = TestClient(web.create_app(settings))
+
+    resp = client.post("/api/run", json={"prompt": "hi", "thread_id": "t"})
+    assert [f["type"] for f in _frames(resp.text)][-1] == "steering_applied"
+    assert runtime.closed is False
+
+    steer = client.post(
+        "/api/steer/t", json={"action": "add", "text": "检查边界", "role": "review"}
+    )
+    assert steer.status_code == 200
+    assert runtime.steered == [("t", "add")]
+
+    status = client.get("/api/status/t").json()
+    assert status["exists"] is True
+    assert status["paused"] is True
+
+    resumed = client.post("/api/resume_steering/t")
+    assert [f["type"] for f in _frames(resumed.text)][-1] == "run_finished"
+    assert runtime.steering_resumed == 1
+    assert runtime.closed is True
+
+
+def test_approval_resume_endpoint(monkeypatch, settings) -> None:
+    runtime = FakeRuntime(
+        events=[
+            RunStarted(thread_id="t"),
+            ApprovalRequested(
+                request_id="c1", tool="shell_exec", command="pip install x"
+            ),
+        ]
+    )
+    monkeypatch.setattr(web.app, "AgentRuntime", lambda *a, **k: runtime)
+    client = TestClient(web.create_app(settings))
+
+    client.post("/api/run", json={"prompt": "hi", "thread_id": "t"})
+    assert runtime.closed is False
+
+    resumed = client.post(
+        "/api/resume/t", json={"decisions": {"c1": True}}
+    )
+    assert [f["type"] for f in _frames(resumed.text)][-1] == "run_finished"
+    assert runtime.resumed == [("t", {"c1": True})]
+    assert runtime.closed is True
 
 
 # ---------------- 历史 ----------------
@@ -272,7 +358,13 @@ def test_thread_history_reports_unavailable(monkeypatch, settings) -> None:
     """历史拿不到要给 503 与原因，而不是空列表让前端以为没记录。"""
 
     class _Broken(FakeRuntime):
-        async def history(self, thread_id: str):
+        async def history(
+            self,
+            thread_id: str,
+            *,
+            limit: int | None = None,
+            offset: int = 0,
+        ):
             raise RuntimeError("checkpoint 打不开")
 
     monkeypatch.setattr(web.app, "AgentRuntime", lambda *a, **k: _Broken())

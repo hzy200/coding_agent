@@ -17,9 +17,9 @@ orchestrator 子图，拆成 DAG 并发处理，最后把结构化结果交回�
 
 | 项 | 结果 |
 |---|---|
-| 测试 | `pytest -m "not llm"` **1420 passed**（含真实 WSL） |
-| 覆盖率 | **89.1%** |
-| CI 子集 | `pytest -m "not wsl and not llm"` **1213 passed**，覆盖率 **81.5%** |
+| 测试 | `pytest -m "not llm"` **1561 passed**（含真实 WSL） |
+| 覆盖率 | **87.5%**（上次覆盖测量；本轮新增用例后未重测） |
+| CI 子集 | `pytest -m "not wsl and not llm"` **1350 passed**，覆盖率 **80.7%** |
 | lint | `ruff check src tests` 干净 |
 | 说明 | 另有 3 个 `llm` 标记用例需要 `DEEPSEEK_API_KEY`，默认排除；不加 `-m` 时会真实调用模型 |
 
@@ -76,9 +76,10 @@ orchestrator 子图，拆成 DAG 并发处理，最后把结构化结果交回�
 ```
 survey
   → select_and_plan        # 规则优先；模糊时一次结构化调用同时给出 workflow + 任务图
-  → scheduler              # 事件驱动 DAG
+  → write_gate             # 可选：并发前一次性确认整批 write_scope
+  → scheduler              # 事件驱动 DAG；429 退避、动态只读扩展
   ⇄ steering_dispatch      # 边界消费 /pause /cancel /add /replan
-  → fan_in                 # 结构化汇总 + artifact
+  → fan_in                 # 结构化汇总 + 可选 reducer + artifact
   → planner → act → ...    # 主 agent 负责最终实现、验证与答复
 ```
 
@@ -107,6 +108,8 @@ survey
 - 并发上限由 `AGENT_ORCHESTRATOR_MAX_CONCURRENT_WORKERS` 控制；
 - `WslSandbox` 另有 `AGENT_SANDBOX_MAX_CONCURRENT_COMMANDS` 背压，避免并发
   worker 同时拉起过多 `wsl.exe`；
+- 主 agent 同一条消息里的多个**只读工具**按 `AGENT_MAX_CONCURRENT_TOOLS`
+  并发执行；写工具与有依赖的调用保持串行；
 - implement worker 只绑定 `file_read/file_write/file_edit/search_code/find_files`，
   不绑定 shell/git/deps/test。
 
@@ -115,11 +118,12 @@ survey
 每个 implement worker 在独立 worktree 中修改，完成后导出 patch：
 
 ```
-git apply --check → 解析路径 → 为主工作区留快照 → git apply
+全部 --check → 解析路径 → 全部留快照 → 顺序 git apply → 失败则反向撤销/回滚
 ```
 
-合并由宿主串行执行，失败不会应用补丁。`write_scope` 有**写时校验**：
-文件工具在 I/O 前就拒绝越界路径，事后 diff 校验保留为第二道防线。
+同一批 implement 补丁作为**一个事务**合并：任一补丁冲突，整批回滚，不会留下
+半合并状态。`write_scope` 有**写时校验**：文件工具在 I/O 前就拒绝越界路径，
+事后 diff 校验保留为第二道防线。
 
 fan-in 不再只做位置截断：
 
@@ -160,7 +164,7 @@ CodingAgent/
 │  │  ├─ subgraph.py           #   子图组装与直接/事件驱动两种拓扑
 │  │  ├─ scheduler.py          #   事件驱动 DAG 调度
 │  │  ├─ workflow.py           #   工作流选择 + 任务图预取
-│  │  ├─ nodes.py              #   survey/plan/dispatch/extend/fan-in
+│  │  ├─ nodes.py              #   兼容导出层（实现已拆到 survey/plan/scheduler/fanin）
 │  │  ├─ workers.py            #   角色 → worker runner
 │  │  ├─ implement.py          #   worktree 写 worker
 │  │  ├─ merge.py              #   patch check/快照/apply
@@ -268,7 +272,8 @@ agent tui                         # 终端界面
 | `agent chat` | 纯流式对话（无工具），验证 API 联通 |
 | `agent run <指令>` | 跑一轮任务；`-C` 指定工作区，`--write` 放开写入，`-y` 跳过确认 |
 | `agent tui` | 终端界面（推荐，能力最全） |
-| `agent web` | 最小 Web 验证界面（需 `.[web]`） |
+| `agent steer --thread-id <id> <action>` | 向运行中的会话注入 pause/cancel/add/replan |
+| `agent web` | Web 验证界面：SSE、审批、pause/cancel/add/replan、resume（需 `.[web]`） |
 | `agent snapshots` / `undo` / `diff` | 查看快照、回滚、看改动 |
 | `agent sessions` | 历史会话列表 |
 | `agent memory` | 查看/维护项目记忆 |
@@ -360,6 +365,12 @@ TUI 快捷键：`Ctrl+Q` 退出 · `Ctrl+N` 新会话 · `Ctrl+L` 清屏。
 默认 `AGENT_SHELL_SANDBOX=off`，靠工作区 cwd 约束 + 词法升级。要内核级隔离，
 设 `AGENT_SHELL_SANDBOX=bwrap`：命令在挂载命名空间里执行，`/home`、`/root`、
 `/mnt` 不可见、仅工作区可写；配置了却不可用时**拒绝执行**，不静默降级。
+`AGENT_SHELL_NETWORK=false` 会再加 `--unshare-net`，彻底切断命令网络。
+
+审计落盘前会对常见密钥（`sk-*`、GitHub token、AWS key、JWT、私钥块、
+`password=...`）做脱敏；`file_write`/`file_edit` 默认拒绝 `.env`、私钥、
+`.git/`、`.agent/` 等敏感目标，可用 `AGENT_WRITE_DENY_GLOBS` 追加。
+`AGENT_ALLOW_RULES` 可把明确安全的 L2 命令持久放行，但不会绕过 L3 或 `deny` 模式。
 
 资产、假设与边界见 [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)。
 
@@ -369,6 +380,8 @@ TUI 快捷键：`Ctrl+Q` 退出 · `Ctrl+N` 新会话 · `Ctrl+L` 清屏。
 |---|---|---|
 | `shell_exec` | 按命令内容 | bash 命令，L2/L3 需确认 |
 | `file_read` | L0 | 带行号读文件，支持 offset/limit |
+| `symbol_search` | L0 | AST 符号定位（类/函数/方法 → 文件:行号） |
+| `code_intel` | L0 | LSP 定义/引用/诊断（需配置 `AGENT_LSP_COMMAND`） |
 | `file_write` / `file_edit` | L1 | 精确替换、diff、写前备份 |
 | `file_restore` | L1 | 回滚到某次修改前 |
 | `git_status` / `git_diff` / `git_log` | L0 | 只读 |
@@ -428,20 +441,30 @@ agent undo                   # 回滚最近一次改动
 agent sessions                       # 历史会话
 agent run --thread-id <id> "继续"     # 接着某个会话
 agent memory --add "本仓库用 uv"      # 记一条项目约定
+agent checkpoints --thread-id <id>   # 查看可回退/分叉的 checkpoint
+agent fork --thread-id <id>          # 从当前状态分叉出新会话
+agent rewind --thread-id <id> -n 1   # 回退 1 个 checkpoint（历史保留）
 ```
 
 会话存在 SQLite 中，跨进程可恢复。会话列表直接归纳自审计日志。
-项目记忆是 `.agent/memory.md` 的纯文本（一行一条），每次运行注入系统提示；
-刻意做成显式增删，不做 LLM 自动提炼。
+项目记忆是 `.agent/memory.md` 的纯文本（一行一条），每次运行按与请求的相关度
+取前 `AGENT_MEMORY_TOP_K` 条注入系统提示；模型也可以用 `memory_search` 按需检索，
+`--write` 会话可用 `memory_save` 记下一条稳定约定。写入前会扫描密钥；高度相似
+的新旧事实保留最新版本；来源/时间/过期信息在同目录的 `memory.meta.json`。
+仓库内的 `AGENTS.md` / `CLAUDE.md` 作为分层指令单独注入。刻意不做后台自动提炼。
 
 ## 界面
 
 **TUI 是主要界面**（`agent tui`）：计划面板、任务图/worker 时间线、流式输出、
 审批弹窗。侧栏常驻显示会话、工作区与权限等级。
 
-**Web 是最小验证**（`agent web`）：SSE 流式对话、多会话列表、API 联通测试。
-一个自包含 HTML，不引前端构建链。Web 端固定拒绝变更类命令（无审批交互），
-需要审批请用 TUI。
+**Web 是验证界面**（`agent web`）：SSE 流式对话、多会话列表、API 联通测试，
+以及 L2/L3 审批、pause/cancel/add/replan、审批/暂停后的 resume。
+一个自包含 HTML，不引前端构建链；端点与 TUI 共用同一套 runtime/steering 语义。
+
+**CLI 实时干预**：`agent steer --thread-id <id> pause|cancel|add|replan`
+把指令写入 `.agent/steering/`，运行中的进程在下一个边界消费；
+跨进程恢复审批/暂停仍建议用 TUI 或 Web（它们持有 runtime/checkpoint 生命周期）。
 
 ## 演示
 
@@ -473,6 +496,11 @@ python -m tests.eval.runner --suite default --repeat 2
 python tests/eval/compare.py <baseline-a> <baseline-b>
 # 干预延迟基准（不调用模型）
 python tests/eval/steering_bench.py --repeat 3
+
+# LangSmith 全功能评测：139 个能力任务 + 11 个机制探针
+python tests/eval/langsmith_suite.py --upload --kinds all
+python tests/eval/langsmith_suite.py --run --kinds mechanism
+python tests/eval/langsmith_suite.py --run --smoke
 ```
 
 CI 在无 WSL 的 runner 上跑 `ruff` + `pytest -m "not wsl and not llm" --cov`，
@@ -499,19 +527,37 @@ CI 在无 WSL 的 runner 上跑 `ruff` + `pytest -m "not wsl and not llm" --cov`
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | — | 必填 |
+| `DEEPSEEK_API_KEY` | — | 单 provider 时必填 |
 | `DEEPSEEK_MODEL` | `deepseek-chat` | 主模型 |
+| `AGENT_LLM_PROVIDERS` | 空 | 多 provider JSON；空 = 用 `DEEPSEEK_*` 单 provider |
+| `AGENT_LLM_FALLBACK_ON_ERROR` | `true` | 非 429 错误是否也切换下一个 provider |
+| `AGENT_LLM_PROVIDER_MAX_WAIT_S` | `30` | 所有 provider 冷却时单次调用最多等待秒数 |
+| `AGENT_LLM_ROUTING_STRATEGY` | `cost` | `cost` 按单价排序；`priority` 按配置顺序 |
+| `AGENT_RUN_COST_BUDGET_USD` | `0` | 单次 run 成本预算；0 = 不告警 |
+| `AGENT_COST_ALERT_RATIO` | `0.8` | 达到预算该比例时发出 `cost_report` 告警 |
+| `AGENT_BILLING_ENABLED` | `false` | run 结束时拉取 provider 账单做对账 |
+| `AGENT_BILLING_TIMEOUT_S` | `10` | 账单 API 超时（秒） |
 | `AGENT_ORCHESTRATOR_WORKER_MODEL` | 空 | worker 专用模型；空 = 继承主模型 |
 | `LANGSMITH_TRACING` / `LANGSMITH_API_KEY` | `false` / — | 调用链追踪 |
+
+配置多个 provider 时默认按 `AGENT_LLM_ROUTING_STRATEGY=cost` 选择可用且未超配额的最便宜 provider（`priority` 策略则按配置顺序）。每个 provider 可配置 `input_cost_per_1m` / `output_cost_per_1m`、`max_tokens`、`max_cost` 配额，以及 `capabilities` / `task_types` 过滤；用量从模型回报的 usage 累计。429 会把该 provider 放入冷却并自动切到下一个，非 429 错误由 `AGENT_LLM_FALLBACK_ON_ERROR` 控制是否 fallback。冷却与用量默认写入 `.agent/rate_limits.json`（文件锁 + 原子替换），多个 `agent` 进程共享；scheduler 的限流退避也会写入同一份全局协调器。每次 run 结束前会发出 `CostReport`（tokens、费用、provider 拆分、预算告警），CLI/TUI/Web 都会展示。开启 `AGENT_BILLING_ENABLED` 后，还会按 provider 的 `billing` 配置拉取账单 API，报告账单金额与本地估算的差额；单个 provider 对账失败不会影响 run。
 
 ### WSL2 沙箱
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `AGENT_WSL_DISTRO` | `Ubuntu` | |
-| `AGENT_WSL_WORKSPACE` | 空 = `$HOME/agent-ws` | 支持 Windows 路径写法 |
+| `AGENT_WSL_WORKSPACE` | 空 = `$HOME/agent-ws` | 支持 Windows 路径；Git Bash 下建议 `wsl:/home/u/proj` 避免 MSYS 路径转换 |
 | `AGENT_SHELL_SANDBOX` | `off` | `off` / `bwrap`；配了 bwrap 但不可用时拒绝执行 |
+| `AGENT_SHELL_NETWORK` | `true` | 仅 bwrap 生效；`false` 时加 `--unshare-net` |
+| `AGENT_PERSISTENT_SHELL` | `false` | 常驻 WSL bash 会话池；失败自动退回逐命令执行 |
+| `AGENT_PERSISTENT_SHELL_POOL` | `4` | 常驻会话数量（保留并发能力） |
 | `AGENT_SHELL_TIMEOUT` | `60` | 单条命令墙钟上限 |
+| `AGENT_WRITE_DENY_GLOBS` | 空 | 追加敏感写保护 glob（`.env`/密钥/`.git` 默认已保护） |
+| `AGENT_REPO_MAP_CHARS` | `4000` | 注入 planner 的 AST repo map 字符预算（0 = 关闭） |
+| `AGENT_LSP_COMMAND` | 空 | 可选 language server 命令（如 `pylsp`）；空则 `symbol_search` 用 AST |
+| `AGENT_LSP_TIMEOUT` | `10` | LSP 请求超时（秒） |
+| `AGENT_LSP_DIAGNOSTICS_WAIT_S` | `2` | pull 诊断不可用时等待 publishDiagnostics 的最长秒数 |
 | `AGENT_SHELL_CPU_SECONDS` / `_MEMORY_MB` / `_MAX_FILE_MB` / `_MAX_PROCESSES` | `600` / `0` / `512` / `1024` | 0 = 不限制 |
 | `AGENT_SANDBOX_MAX_CONCURRENT_COMMANDS` | `8` | 同时启动的 `wsl.exe` 上限 |
 
@@ -520,19 +566,22 @@ CI 在无 WSL 的 runner 上跑 `ruff` + `pytest -m "not wsl and not llm" --cov`
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `AGENT_ORCHESTRATOR_ENABLED` | `true` | 启用 harness；小仓库仍走 direct 快速路径 |
-| `AGENT_ORCHESTRATOR_SUBGRAPH_ENABLED` | `true` | 独立 orchestrator 子图 |
-| `AGENT_ORCHESTRATOR_EVENT_DRIVEN` | `true` | 事件驱动 DAG 调度 |
 | `AGENT_ORCHESTRATOR_WRITE_SCOPE_ENFORCE` | `true` | 写时校验 `write_scope` |
+| `AGENT_ORCHESTRATOR_ALLOW_OVERLAP` | `false` | 允许多个 implement 改同一文件；用 `git apply --3way` 合并，冲突整批回滚 |
 | `AGENT_ORCHESTRATOR_FANOUT_ARTIFACTS` | `true` | fan-in 落 `.agent/artifacts/` |
 | `AGENT_ORCHESTRATOR_MIN_FILES` | `30` | 文件数达到该值才进入编排 |
 | `AGENT_ORCHESTRATOR_MAX_TASKS` | `6` | 任务总数（含动态扩展） |
 | `AGENT_ORCHESTRATOR_MAX_CONCURRENT_WORKERS` | `4` | 并发 worker 上限 |
 | `AGENT_ORCHESTRATOR_TASK_RETRIES` | `1` | 单任务失败重试次数 |
+| `AGENT_ORCHESTRATOR_TASK_TOKENS` | `0` | 单个 worker 的 token 上限（0 = 不限制）；任务可用 `max_tokens` 覆盖 |
+| `AGENT_ORCHESTRATOR_TOTAL_TOKENS` | `0` | 整个编排阶段的 token 上限；scheduler 派发前按角色预留，超限不再启动新任务 |
 | `AGENT_ORCHESTRATOR_CHECKPOINT_EVERY` | `4` | 每完成多少个任务形成一次 checkpoint/干预边界 |
 | `AGENT_ORCHESTRATOR_RUN_DEADLINE_S` | `900` | 整个编排阶段墙钟上限（0 = 不限制） |
+| `AGENT_ORCHESTRATOR_RATE_LIMIT_BACKOFF_S` | `2.0` | 429/限流时的首次退避秒数，之后指数增长（上限 30s） |
 | `AGENT_ORCHESTRATOR_CONTEXT_CHARS` | `8000` | 交给主 agent 的汇总上限（字符） |
+| `AGENT_ORCHESTRATOR_FANIN_REDUCER` | `false` | 汇总超预算/有失败时调用一次 reducer LLM；失败回退确定性结果 |
+| `AGENT_ORCHESTRATOR_WRITE_PLAN_APPROVAL` | `false` | 派发 implement 前一次性确认整批 `write_scope` |
 | `AGENT_ORCHESTRATOR_ADD_EXPLORE_TESTS` | `false` | 单任务时是否强行补一个「找测试」explore |
-| `AGENT_ORCHESTRATOR_MAX_ROUNDS` | `3` | 兼容旧按批 dispatch 的轮次上限 |
 | `AGENT_EXPLORE_ENABLED` | `false` | 给主 agent 绑定 `delegate_explore`；orchestrator 的 explore/review runner 不受此开关影响 |
 | `AGENT_ORCHESTRATOR_WRITE_ENABLED` | `false` | 并发写 worker；还需 `--write` + git 仓库根 + 干净工作区 |
 | `AGENT_ORCHESTRATOR_WORKER_ROUNDS` / `_REPAIRS` / `_TIMEOUT` | `12` / `2` / `240` | implement worker 的工具预算 / 修复轮次 / 墙钟上限 |
@@ -542,6 +591,7 @@ CI 在无 WSL 的 runner 上跑 `ruff` + `pytest -m "not wsl and not llm" --cov`
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `AGENT_APPROVAL_MODE` | `ask` | `ask` / `approve` / `deny` |
+| `AGENT_ALLOW_RULES` | 空 | 持久放行规则，如 `shell_exec:git status*,run_tests:*`；只覆盖 L2 ASK |
 | `AGENT_VERIFY_ENABLED` / `AGENT_VERIFY_COMMAND` | `true` / 空 | 自动验证；命令留空按清单识别 |
 | `AGENT_VERIFY_ONLY_FINAL` | `true` | 多步任务只在 verify 步/最后一步跑全量 |
 | `AGENT_REVIEW_ENABLED` | `true` | 验证通过后的确定性代码审查 |
@@ -551,26 +601,32 @@ CI 在无 WSL 的 runner 上跑 `ruff` + `pytest -m "not wsl and not llm" --cov`
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `AGENT_CONTEXT_MAX_CHARS` / `_KEEP_RECENT` / `_TOOL_CHARS` | `60000` / `12` / `1500` | 上下文裁剪；max=0 关闭 |
+| `AGENT_CONTEXT_MAX_CHARS` / `_MAX_TOKENS` / `_KEEP_RECENT` / `_TOOL_CHARS` | `60000` / `0` / `12` / `1500` | 上下文裁剪；字符/token 任一超限即降档，0 = 该预算关闭 |
+| `AGENT_MEMORY_TOP_K` | `8` | 每次运行注入的相关记忆条数；0 = 全部注入 |
+| `AGENT_INSTRUCTIONS_ENABLED` | `true` | 发现并注入仓库内的 `AGENTS.md` / `CLAUDE.md`（最多 4 层、总量 24k 字符） |
 | `AGENT_MAX_PLAN_STEPS` / `_TOOL_ROUNDS` / `_REPAIR_ROUNDS` / `_MAX_RESUMES` | `5` / `12` / `3` / `50` | 循环与恢复上限 |
 | `AGENT_MAX_REPLANS` | `2` | 执行中重建剩余计划的次数 |
 | `AGENT_MAX_DELEGATE_CALLS` / `AGENT_MAX_CONCURRENT_AGENTS` | `6` / `4` | 主 agent 委派预算与并发 |
+| `AGENT_MAX_CONCURRENT_TOOLS` | `4` | 同一消息内只读工具的并发上限；写工具始终串行 |
 
 ### 持久化与审计
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `AGENT_CHECKPOINT_PATH` | 空 = `<cwd>/.agent/checkpoints.sqlite` | 填 `:memory:` 强制不落盘 |
+| `AGENT_CHECKPOINT_KEEP` | `200` | 每个会话/命名空间保留的 checkpoint 数；0 = 不轮转 |
 | `AGENT_AUDIT_ENABLED` / `AGENT_AUDIT_DIR` / `AGENT_AUDIT_MAX_MB` | `true` / `<cwd>/.agent/audit` / `0` | 审计日志；0 = 不轮转 |
+| `AGENT_STEERING_DIR` | 空 = `<cwd>/.agent/steering` | 未消费 add/replan 与 pause 标记的跨进程持久化目录 |
+| `AGENT_RATE_LIMIT_STATE_PATH` | 空 = `<cwd>/.agent/rate_limits.json` | 跨进程 provider/全局冷却状态；`:memory:` 关闭文件共享 |
 
 状态文件位置（宿主侧与沙箱侧）见 [docs/USAGE.md](docs/USAGE.md)。
 
 ## 已知限制与后续
 
-- 按改动文件的测试影响分析尚未实现；implement worker 目前仍跑完整验证命令；
-- 共享文件的多个 implement 仍靠 `write_scope` 不重叠来避免冲突，尚未实现 3-way 合并；
-- steering 队列只在进程内，重启后未消费的 add/replan 会丢失；
-- fan-in reducer、任务级 token 硬预算、429 自适应降并发尚未落地；
+- 测试影响分析优先用 **AST import 图 + 反向依赖闭包**，并保留文件名启发式兜底；动态 import/复杂包根仍可能漏判，匹配不到时跑完整验证；
+- 共享文件的多个 implement 默认仍要求 `write_scope` 不重叠；开启 `AGENT_ORCHESTRATOR_ALLOW_OVERLAP` 后用 3-way 合并，真实冲突会整批回滚；
+- steering 指令与 pause 标记默认落盘；跨进程恢复需走 `resume`，新 run 会按设计清空旧指令；
+- 任务级 token 上限与 scheduler 全局 token 准入已接入；预留是角色级估算，不是精确的 prompt token 计数；
 - 最近一轮只跑了非 LLM 回归；真实模型评测需自行执行并承担 API 费用。
 
 ## 文档

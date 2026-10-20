@@ -76,6 +76,27 @@ def test_edit_outside_scope_is_rejected_before_read(file_tools) -> None:
     assert "write_scope" in output
 
 
+def test_sensitive_file_is_rejected_even_inside_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(files_module, "SandboxFs", _FakeFs)
+    settings = Settings(_env_file=None, wsl_workspace="/ws")
+    tools = files_module.build_file_tools(
+        settings,
+        object(),  # type: ignore[arg-type]
+        allow_write=True,
+        write_scope=[".env", "app"],
+    )
+    write = {tool.name: tool for tool in tools}["file_write"]
+
+    output = write.invoke(
+        {"path": ".env", "content": "SECRET=1\n", "reason": "测试"}
+    )
+
+    assert "敏感写保护" in output
+    assert not _FakeFs.instances[-1].writes
+
+
 def test_write_inside_scope_reaches_the_filesystem(file_tools) -> None:
     tools, _settings = file_tools
     fs = _FakeFs.instances[-1]

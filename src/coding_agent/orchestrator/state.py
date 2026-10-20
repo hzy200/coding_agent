@@ -68,6 +68,10 @@ class OrchestratorState(TypedDict, total=False):
     scheduler_done: bool
     scheduler_continue: bool
     scheduler_deadline: float
+    token_budget_limit: int
+    token_budget_spent: int
+    token_budget_reserved: int
+    token_budget_exhausted: bool
 
 
 def request_of(state: Mapping[str, Any]) -> str:

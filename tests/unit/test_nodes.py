@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -9,7 +10,7 @@ from coding_agent.graph.nodes.act import BUDGET_EXHAUSTED_TEMPLATE, make_act_nod
 from coding_agent.graph.nodes.advance import advance
 from coding_agent.graph.nodes.tools import make_tools_node
 from coding_agent.llm.prompts import compose_system_prompt
-from coding_agent.tools.artifacts import ShellArtifact, pack
+from coding_agent.tools.artifacts import FileArtifact, ShellArtifact, pack
 
 
 class _EchoLLM:
@@ -216,13 +217,15 @@ class _FakeTool:
         self.result = result
         self.ok = ok
         self.seen: dict = {}
+        # 设为 FileArtifact 等可覆盖默认的 ShellArtifact 产物
+        self.artifact = None
 
     def invoke(self, args, config=None):  # noqa: ANN001
         self.seen = args
-        return pack(
-            self.result,
-            ShellArtifact(command=str(args.get("command", "")), ok=self.ok),
+        artifact = self.artifact or ShellArtifact(
+            command=str(args.get("command", "")), ok=self.ok
         )
+        return pack(self.result, artifact)
 
 
 class _BoomTool:
@@ -246,6 +249,73 @@ def _approved_state(message: AIMessage, **extra) -> dict:
 def _tools_run(node, state, config=None):  # noqa: ANN001
     """tools 节点是 async 的（要 await 子智能体），单测里同步驱动。"""
     return asyncio.run(node(state, config))
+
+
+class _SlowReadTool:
+    """只读工具的并发探针：同步 sleep，走 to_thread。"""
+
+    def __init__(self, name: str, delay: float = 0.2) -> None:
+        self.name = name
+        self.delay = delay
+        self.started_at = 0.0
+        self.ended_at = 0.0
+
+    def invoke(self, args, config=None):  # noqa: ANN001
+        self.started_at = time.perf_counter()
+        time.sleep(self.delay)
+        self.ended_at = time.perf_counter()
+        return pack("done", ShellArtifact(command=self.name, ok=True))
+
+
+def test_successful_file_write_marks_path_stale() -> None:
+    """写入成功后记录路径，act 据此提醒「历史读取可能已过期」。"""
+    tool = _FakeTool("file_write")
+    node = make_tools_node([tool])
+    message = _tool_call(
+        "file_write", {"path": "src/a.py", "content": "x", "reason": "r"}
+    )
+    tool.artifact = FileArtifact(
+        path="src/a.py", action="write", ok=True, added=1
+    )
+    out = _tools_run(node, _approved_state(message), None)
+    assert out["stale_paths"] == ["src/a.py"]
+
+    # 已记录过的路径不重复追加
+    again = _tools_run(
+        node, _approved_state(message, stale_paths=["src/a.py"]), None
+    )
+    assert again["stale_paths"] == ["src/a.py"]
+
+
+def test_failed_file_write_does_not_mark_stale() -> None:
+    tool = _FakeTool("file_write")
+    tool.artifact = FileArtifact(path="src/a.py", action="write", ok=False)
+    node = make_tools_node([tool])
+    message = _tool_call(
+        "file_write", {"path": "src/a.py", "content": "x", "reason": "r"}
+    )
+    out = _tools_run(node, _approved_state(message), None)
+    assert out["stale_paths"] == []
+
+
+def test_readonly_tools_in_one_message_run_concurrently() -> None:
+    tools = [_SlowReadTool("file_read"), _SlowReadTool("search_code")]
+    node = make_tools_node(tools, max_concurrent_tools=2)
+    message = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "file_read", "args": {"path": "a.py"}, "id": "c1"},
+            {"name": "search_code", "args": {"query": "x"}, "id": "c2"},
+        ],
+    )
+
+    out = _tools_run(node, _approved_state(message), None)
+
+    # 不看总耗时（CI/覆盖率下抖动大），直接断言两个调用区间有重叠。
+    first, second = tools
+    assert first.started_at < second.ended_at
+    assert second.started_at < first.ended_at
+    assert len(out["messages"]) == 2
 
 
 def test_tools_injects_state_cwd_when_model_omits_it() -> None:

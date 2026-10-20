@@ -24,6 +24,9 @@ class _NullMemory:
     def load(self) -> list[str]:
         return []
 
+    def search(self, query: str = "", limit: int = 8) -> list[str]:
+        return []
+
 
 class FakeGraph:
     def __init__(self, script: list[tuple[str, Any]]) -> None:

@@ -112,6 +112,9 @@ class SubAgentArtifact(ToolArtifact):
     input_tokens: int = 0
     output_tokens: int = 0
     duration_ms: int = 0
+    llm_ms: int = 0
+    tool_ms: int = 0
+    timed_out: bool = False
     error: str = ""
 
 

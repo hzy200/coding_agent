@@ -77,6 +77,35 @@ class Settings(BaseSettings):
     deepseek_api_key: str = Field(default="", alias="DEEPSEEK_API_KEY")
     deepseek_base_url: str = Field(default="https://api.deepseek.com", alias="DEEPSEEK_BASE_URL")
     deepseek_model: str = Field(default="deepseek-chat", alias="DEEPSEEK_MODEL")
+    # 可选多 provider JSON；空 = 只用 DEEPSEEK_* 单 provider。
+    # [{"name":"deepseek","base_url":"...","api_key":"...","model":"...",
+    #   "priority":0}, {"name":"backup","api_key_env":"BACKUP_API_KEY",...}]
+    llm_providers: str = Field(default="", alias="AGENT_LLM_PROVIDERS")
+    # 非 429 错误是否也尝试下一个 provider。
+    llm_fallback_on_error: bool = Field(
+        default=True, alias="AGENT_LLM_FALLBACK_ON_ERROR"
+    )
+    # 所有 provider 都在冷却时，单次调用最多等待多久再放弃。
+    llm_provider_max_wait_s: float = Field(
+        default=30.0, alias="AGENT_LLM_PROVIDER_MAX_WAIT_S"
+    )
+    # cost（按 provider 单价排序）| priority（按配置顺序）
+    llm_routing_strategy: str = Field(
+        default="cost", alias="AGENT_LLM_ROUTING_STRATEGY"
+    )
+    # 单次 run 的成本预算（USD）；0 = 不告警
+    run_cost_budget_usd: float = Field(
+        default=0.0, alias="AGENT_RUN_COST_BUDGET_USD"
+    )
+    # 达到预算的该比例时发出告警（0~1）
+    cost_alert_ratio: float = Field(
+        default=0.8, alias="AGENT_COST_ALERT_RATIO"
+    )
+    # 是否在 run 结束时拉取 provider 账单做对账；默认关闭避免额外网络请求。
+    billing_enabled: bool = Field(default=False, alias="AGENT_BILLING_ENABLED")
+    billing_timeout_s: float = Field(
+        default=10.0, alias="AGENT_BILLING_TIMEOUT_S"
+    )
 
     # ---------- LangSmith ----------
     langsmith_tracing: bool = Field(default=False, alias="LANGSMITH_TRACING")
@@ -90,7 +119,26 @@ class Settings(BaseSettings):
     # shell 隔离后端：off（默认，仅工作区 cwd 约束）| bwrap（挂载命名空间隔离）
     # bwrap 模式下若沙箱内不可用，会**拒绝执行**（fail closed），不静默降级
     shell_sandbox: str = Field(default="off", alias="AGENT_SHELL_SANDBOX")
+    # 仅 bwrap 模式生效：false 时加 --unshare-net，命令完全无网络。
+    # off 模式没有内核级隔离，词法策略无法禁止 curl/wget 出网。
+    shell_network: bool = Field(default=True, alias="AGENT_SHELL_NETWORK")
+    # 常驻 WSL bash 会话池；默认关闭（出问题时可退回逐命令 wsl.exe）。
+    persistent_shell: bool = Field(default=False, alias="AGENT_PERSISTENT_SHELL")
+    persistent_shell_pool: int = Field(
+        default=4, alias="AGENT_PERSISTENT_SHELL_POOL"
+    )
     shell_timeout: int = Field(default=60, alias="AGENT_SHELL_TIMEOUT")
+    # 追加的内容级写保护 glob（逗号分隔）；默认规则始终生效。
+    write_deny_globs: str = Field(default="", alias="AGENT_WRITE_DENY_GLOBS")
+    # repo map 注入 planner 的字符预算（0 = 关闭）。
+    repo_map_chars: int = Field(default=4_000, alias="AGENT_REPO_MAP_CHARS")
+    # 可选 language server 命令；空 = 不启用（symbol_search 仍用 AST）。
+    lsp_command: str = Field(default="", alias="AGENT_LSP_COMMAND")
+    lsp_timeout: float = Field(default=10.0, alias="AGENT_LSP_TIMEOUT")
+    # pull 诊断不可用时，等待 publishDiagnostics 的最长时间。
+    lsp_diagnostics_wait_s: float = Field(
+        default=2.0, alias="AGENT_LSP_DIAGNOSTICS_WAIT_S"
+    )
     # 沙箱资源上限，0 表示不限制
     shell_cpu_seconds: int = Field(default=600, alias="AGENT_SHELL_CPU_SECONDS")
     shell_memory_mb: int = Field(default=0, alias="AGENT_SHELL_MEMORY_MB")
@@ -107,8 +155,16 @@ class Settings(BaseSettings):
     # ---------- 上下文裁剪 ----------
     # 0 表示不裁剪；这些值作用于发给模型的历史，不改写会话状态
     context_max_chars: int = Field(default=60_000, alias="AGENT_CONTEXT_MAX_CHARS")
+    context_max_tokens: int = Field(default=0, alias="AGENT_CONTEXT_MAX_TOKENS")
     context_keep_recent: int = Field(default=12, alias="AGENT_CONTEXT_KEEP_RECENT")
     context_tool_chars: int = Field(default=1_500, alias="AGENT_CONTEXT_TOOL_CHARS")
+    # 每次运行注入系统提示的长期记忆条数（按与请求的相关度取前 K 条）。
+    # 0 表示不限制，整份注入 —— 记忆上限 50 条，但每条都会进入每一轮 system prompt。
+    memory_top_k: int = Field(default=8, alias="AGENT_MEMORY_TOP_K")
+    # 是否发现并注入仓库内的 AGENTS.md / CLAUDE.md（分层项目指令）。
+    instructions_enabled: bool = Field(
+        default=True, alias="AGENT_INSTRUCTIONS_ENABLED"
+    )
 
     # ---------- 验证 ----------
     verify_enabled: bool = Field(default=True, alias="AGENT_VERIFY_ENABLED")
@@ -153,6 +209,10 @@ class Settings(BaseSettings):
     # 同一条消息里的多个 delegate 调用最多同时跑几个。
     # 子智能体只读，所以并发不会产生写冲突；限制主要是控制成本与 wsl.exe 压力。
     max_concurrent_agents: int = Field(default=4, alias="AGENT_MAX_CONCURRENT_AGENTS")
+    # 同一条消息里的多个只读工具最多同时跑几个；写工具始终串行。
+    max_concurrent_tools: int = Field(
+        default=4, alias="AGENT_MAX_CONCURRENT_TOOLS"
+    )
     # ---- 成本感知的委派预算（按仓库文件数分级）----
     # 小于 min_files：不委派，直接读；[min, medium)：medium_calls；
     # [medium, large)：large_calls；>= large：max_delegate_calls。
@@ -174,8 +234,6 @@ class Settings(BaseSettings):
     orchestrator_max_concurrent_workers: int = Field(
         default=4, alias="AGENT_ORCHESTRATOR_MAX_CONCURRENT_WORKERS"
     )
-    # dispatch ⇄ collect 的轮次上限。
-    orchestrator_max_rounds: int = Field(default=3, alias="AGENT_ORCHESTRATOR_MAX_ROUNDS")
     # 单个任务失败后最多重试几次（0 = 不重试）。重试仍失败才把依赖方标 blocked。
     orchestrator_task_retries: int = Field(
         default=1, alias="AGENT_ORCHESTRATOR_TASK_RETRIES"
@@ -200,18 +258,14 @@ class Settings(BaseSettings):
         default=8_000, alias="AGENT_ORCHESTRATOR_CONTEXT_CHARS"
     )
 
-    # ---- Phase 5：统一 harness（迁移期开关）----
-    # 独立 orchestrator 子图。迁移期默认关闭，等价迁移验收后置为 true。
-    orchestrator_subgraph_enabled: bool = Field(
-        default=True, alias="AGENT_ORCHESTRATOR_SUBGRAPH_ENABLED"
-    )
-    # 事件驱动 DAG 调度。关闭时保留按批 dispatch 的旧实现。
-    orchestrator_event_driven: bool = Field(
-        default=True, alias="AGENT_ORCHESTRATOR_EVENT_DRIVEN"
-    )
     # 写 worker 的 write_scope 在 I/O 前强制校验（三重防线之一）。
     orchestrator_write_scope_enforce: bool = Field(
         default=True, alias="AGENT_ORCHESTRATOR_WRITE_SCOPE_ENFORCE"
+    )
+    # 允许多个 implement 修改同一文件；合并时用 git apply --3way。
+    # 有真实冲突时整批回滚，不会把冲突标记落进主工作区。
+    orchestrator_allow_overlap: bool = Field(
+        default=False, alias="AGENT_ORCHESTRATOR_ALLOW_OVERLAP"
     )
     # fan-in 是否落 artifact store 并输出结构化结果。
     orchestrator_fanout_artifacts: bool = Field(
@@ -224,6 +278,15 @@ class Settings(BaseSettings):
     # 单任务 token 上限，0 表示不限制（由 provider 回报的 usage 累计判断）。
     orchestrator_task_tokens: int = Field(
         default=0, alias="AGENT_ORCHESTRATOR_TASK_TOKENS"
+    )
+    # 整个编排阶段的 token 上限，0 = 不限制。scheduler 在派发前按角色预留，
+    # 预留 + 已用超过上限时不再启动新任务。
+    orchestrator_total_tokens: int = Field(
+        default=0, alias="AGENT_ORCHESTRATOR_TOTAL_TOKENS"
+    )
+    # 遇到 429/限流时 scheduler 的首次退避秒数；之后指数增长，上限 30s。
+    orchestrator_rate_limit_backoff_s: float = Field(
+        default=2.0, alias="AGENT_ORCHESTRATOR_RATE_LIMIT_BACKOFF_S"
     )
     # scheduler 每完成多少个任务返回一次父图，形成 checkpoint/干预边界。
     orchestrator_checkpoint_every: int = Field(
@@ -250,9 +313,18 @@ class Settings(BaseSettings):
     # ---------- 持久化与审计 ----------
     # 留空表示自动用 <当前目录>/.agent/checkpoints.sqlite；填 :memory: 强制不落盘
     checkpoint_path: str = Field(default="", alias="AGENT_CHECKPOINT_PATH")
+    # 每个 thread/命名空间保留的 checkpoint 数；0 = 不轮转。
+    # 每轮工具调用都会落一个 checkpoint，长期使用需要上限。
+    checkpoint_keep: int = Field(default=200, alias="AGENT_CHECKPOINT_KEEP")
     audit_enabled: bool = Field(default=True, alias="AGENT_AUDIT_ENABLED")
     # 留空表示自动用 <当前目录>/.agent/audit
     audit_dir: str = Field(default="", alias="AGENT_AUDIT_DIR")
+    # 未消费 steering 指令的持久化目录；留空 = <当前目录>/.agent/steering
+    steering_dir: str = Field(default="", alias="AGENT_STEERING_DIR")
+    # 跨进程限流状态文件；留空 = <当前目录>/.agent/rate_limits.json；:memory: 关闭
+    rate_limit_state_path: str = Field(
+        default="", alias="AGENT_RATE_LIMIT_STATE_PATH"
+    )
     # 单个审计文件超过该大小（MB）就轮转；0 表示不轮转
     audit_max_mb: int = Field(default=0, alias="AGENT_AUDIT_MAX_MB")
 
@@ -270,6 +342,9 @@ class Settings(BaseSettings):
     max_resumes: int = Field(default=50, alias="AGENT_MAX_RESUMES")
     # ask（逐条询问）| approve（一律放行）| deny（一律拒绝）
     approval_mode: str = Field(default="ask", alias="AGENT_APPROVAL_MODE")
+    # 持久放行规则，逗号分隔的 `tool:glob`，例如
+    # `shell_exec:git status*,run_tests:*`。只覆盖原本会 ASK 的 L2。
+    allow_rules: str = Field(default="", alias="AGENT_ALLOW_RULES")
     llm_temperature: float = Field(default=0.0, alias="AGENT_LLM_TEMPERATURE")
     llm_timeout: int = Field(default=120, alias="AGENT_LLM_TIMEOUT")
 
@@ -280,6 +355,7 @@ class Settings(BaseSettings):
 
         return ContextBudget(
             max_chars=self.context_max_chars,
+            max_tokens=self.context_max_tokens,
             keep_recent=self.context_keep_recent,
             tool_chars=self.context_tool_chars,
         )
@@ -292,6 +368,21 @@ class Settings(BaseSettings):
     @property
     def resolved_audit_dir(self) -> Path:
         return Path(self.audit_dir) if self.audit_dir else Path.cwd() / ".agent" / "audit"
+
+    @property
+    def resolved_steering_dir(self) -> Path:
+        return (
+            Path(self.steering_dir)
+            if self.steering_dir
+            else Path.cwd() / ".agent" / "steering"
+        )
+
+    @property
+    def resolved_rate_limit_state_path(self) -> str | None:
+        raw = str(self.rate_limit_state_path or "").strip()
+        if raw == ":memory:":
+            return None
+        return raw or str(Path.cwd() / ".agent" / "rate_limits.json")
 
     def apply_tracing_env(self) -> None:
         """把配置写回 os.environ，供 langsmith 自动读取。"""

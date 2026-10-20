@@ -22,6 +22,11 @@ class AgentState(TypedDict, total=False):
     cwd: str
     # 跨会话的项目事实，每次 run 从记忆文件刷新后注入系统提示
     memories: list[str]
+    # 本次运行中已被成功修改的文件。历史里对这些文件的读取结果可能已过期，
+    # act 用它生成「请重新读取」提示；planner 在 run 开始时清空。
+    stale_paths: list[str]
+    # 分层项目指令（AGENTS.md / CLAUDE.md）合并后的文本，run 开始时加载。
+    project_instructions: str
 
     # 计划与步进
     plan: list[str]
@@ -116,6 +121,8 @@ class AgentState(TypedDict, total=False):
     orchestrator_completed: int
     orchestrator_failed: int
     worker_context: str
+    # 最近一次 act/respond 的上下文裁剪报告（字符/估算 token）。
+    context_trim: dict[str, Any]
     # fan-in 的结构化产物索引；完整结果在 .agent/artifacts/ 下。
     worker_brief: str
     orchestration_artifacts: list[dict[str, Any]]

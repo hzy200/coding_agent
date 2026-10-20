@@ -13,6 +13,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypeVar, cast
+from uuid import uuid4
 
 from coding_agent.config import Settings, get_settings
 from coding_agent.sandbox.limits import (
@@ -96,6 +97,186 @@ def parse_distro_list(raw: bytes) -> list[str]:
     return names
 
 
+class _SessionError(RuntimeError):
+    pass
+
+
+def _parse_session_output(
+    raw: bytes, token: str
+) -> tuple[str, str, int] | None:
+    """从带 sentinel 的输出里拆出 stdout/stderr/exit_code。"""
+    out_marker = f"\n__AGENT_OUT_{token}__\n".encode()
+    err_marker = f"\n__AGENT_ERR_{token}__\n".encode()
+    end_marker = f"\n__AGENT_END_{token}__:".encode()
+    out_at = raw.find(out_marker)
+    err_at = raw.find(err_marker)
+    end_at = raw.find(end_marker)
+    if out_at < 0 or err_at < 0 or end_at < 0 or not (out_at < err_at < end_at):
+        return None
+    stdout = raw[out_at + len(out_marker) : err_at]
+    stderr = raw[err_at + len(err_marker) : end_at]
+    rc_text = raw[end_at + len(end_marker) :].split(b"\n", 1)[0].strip()
+    try:
+        rc = int(rc_text)
+    except ValueError:
+        return None
+    return (
+        stdout.decode("utf-8", errors="replace"),
+        stderr.decode("utf-8", errors="replace"),
+        rc,
+    )
+
+
+class _ShellSession:
+    """一个常驻的 WSL bash 进程；命令通过 stdin 发送并用 sentinel 分帧。"""
+
+    def __init__(self, argv: list[str]) -> None:
+        self._proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        self._lock = threading.Lock()
+
+    def alive(self) -> bool:
+        return self._proc.poll() is None
+
+    def close(self) -> None:
+        try:
+            self._proc.kill()
+        except OSError:
+            pass
+        try:
+            self._proc.wait(timeout=KILL_GRACE)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    def run(self, script: str, *, wall: int, command: str) -> ExecResult:
+        token = uuid4().hex
+        end_line = f"__AGENT_END_{token}__:".encode()
+        framed = f"""\
+__agent_out=$(mktemp)
+__agent_err=$(mktemp)
+(
+{script}
+) >"$__agent_out" 2>"$__agent_err"
+__agent_rc=$?
+printf '\\n__AGENT_OUT_{token}__\\n'
+cat "$__agent_out"
+printf '\\n__AGENT_ERR_{token}__\\n'
+cat "$__agent_err"
+printf '\\n__AGENT_END_{token}__:%s\\n' "$__agent_rc"
+rm -f "$__agent_out" "$__agent_err"
+"""
+        started = time.perf_counter()
+        with self._lock:
+            if not self.alive():
+                raise _SessionError("persistent shell 已退出")
+            try:
+                assert self._proc.stdin is not None
+                self._proc.stdin.write(framed.encode("utf-8"))
+                self._proc.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                raise _SessionError(f"persistent shell 写入失败：{exc}") from exc
+
+            timer = threading.Timer(
+                wall + OUTER_TIMEOUT_GRACE, self._kill
+            )
+            timer.daemon = True
+            timer.start()
+            raw = bytearray()
+            try:
+                assert self._proc.stdout is not None
+                while True:
+                    line = self._proc.stdout.readline()
+                    if not line:
+                        break
+                    raw += line
+                    # readline 按行切分，结束标记行本身不带前导换行。
+                    if end_line in line:
+                        break
+            finally:
+                timer.cancel()
+
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        parsed = _parse_session_output(bytes(raw), token)
+        if parsed is None:
+            return ExecResult(
+                command=command,
+                exit_code=TIMEOUT_EXIT_CODE,
+                stdout="",
+                stderr="persistent shell 未返回结束标记",
+                duration_ms=duration_ms,
+                timed_out=True,
+            )
+        stdout, stderr, rc = parsed
+        timed_out = (
+            rc == TIMEOUT_EXIT_CODE and duration_ms >= wall * 1000 * 0.9
+        )
+        return ExecResult(
+            command=command,
+            exit_code=rc,
+            stdout=stdout,
+            stderr=stderr,
+            duration_ms=duration_ms,
+            timed_out=timed_out,
+        )
+
+    def _kill(self) -> None:
+        try:
+            self._proc.kill()
+        except OSError:
+            pass
+
+
+class _ShellSessionPool:
+    """小型会话池：保留并发能力，同时避免每条命令启动一次 wsl.exe。"""
+
+    def __init__(
+        self,
+        argv: list[str],
+        size: int,
+        on_start: Callable[[], None] | None = None,
+    ) -> None:
+        self._argv = argv
+        self._on_start = on_start
+        self._semaphore = threading.BoundedSemaphore(max(1, size))
+        self._lock = threading.Lock()
+        self._idle: list[_ShellSession] = []
+
+    def run(self, script: str, *, wall: int, command: str) -> ExecResult:
+        with self._semaphore:
+            session = self._take()
+            try:
+                return session.run(script, wall=wall, command=command)
+            finally:
+                if session.alive():
+                    self._put(session)
+                else:
+                    session.close()
+
+    def _take(self) -> _ShellSession:
+        with self._lock:
+            if self._idle:
+                return self._idle.pop()
+        session = _ShellSession(self._argv)
+        if self._on_start is not None:
+            self._on_start()
+        return session
+
+    def _put(self, session: _ShellSession) -> None:
+        with self._lock:
+            self._idle.append(session)
+
+    def close(self) -> None:
+        with self._lock:
+            sessions = list(self._idle)
+            self._idle.clear()
+        for session in sessions:
+            session.close()
+
+
 SHELL_SANDBOX_OFF = "off"
 SHELL_SANDBOX_BWRAP = "bwrap"
 
@@ -111,11 +292,18 @@ _BWRAP_RO_BINDS_TRY = (("/lib64", "/lib64"), ("/sbin", "/sbin"))
 _BWRAP_TMPFS = ("/tmp", "/home", "/root")
 
 
-def build_bwrap_script(command: str, *, workdir: str, workspace: str = "") -> str:
+def build_bwrap_script(
+    command: str,
+    *,
+    workdir: str,
+    workspace: str = "",
+    network: bool = True,
+) -> str:
     """把一条命令包进 bubblewrap，返回可直接交给 bash 的脚本片段。
 
     工作区（及其工作目录）以原路径可写挂回；其余只读或隐藏。`workdir` 必须存在，
-    否则 bwrap 会因为 `--chdir` 目标缺失而失败。
+    否则 bwrap 会因为 `--chdir` 目标缺失而失败。`network=False` 时额外
+    `--unshare-net`，命令看不到任何网络接口。
     """
     rw: list[str] = []
     for path in (workdir, workspace):
@@ -123,6 +311,8 @@ def build_bwrap_script(command: str, *, workdir: str, workspace: str = "") -> st
             rw.append(path)
 
     args = ["bwrap", "--die-with-parent", "--unshare-user", "--unshare-pid"]
+    if not network:
+        args.append("--unshare-net")
     for src, dest in _BWRAP_RO_BINDS:
         args += ["--ro-bind", src, dest]
     for src, dest in _BWRAP_RO_BINDS_TRY:
@@ -154,11 +344,22 @@ class WslSandbox:
             threading.BoundedSemaphore(limit) if limit > 0 else None
         )
         self._command_count = 0
+        self._session_pool: _ShellSessionPool | None = None
+        self._session_disabled = False
 
     @property
     def command_count(self) -> int:
         """本实例启动过多少次 wsl.exe（供评测/调试统计）。"""
         return self._command_count
+
+    def _bump_command_count(self) -> None:
+        self._command_count += 1
+
+    def close(self) -> None:
+        """关闭常驻会话；进程退出时也会随之结束。"""
+        if self._session_pool is not None:
+            self._session_pool.close()
+            self._session_pool = None
 
     # ---------------- 探测缓存 ----------------
 
@@ -269,7 +470,10 @@ class WslSandbox:
                     "AGENT_SHELL_SANDBOX=bwrap 需要明确的工作区路径（AGENT_WSL_WORKSPACE 或 cwd）"
                 )
             body = build_bwrap_script(
-                command, workdir=workdir, workspace=self.settings.wsl_workspace
+                command,
+                workdir=workdir,
+                workspace=self.settings.wsl_workspace,
+                network=self.settings.shell_network,
             )
         else:
             body = command if cwd is None else f"cd {shlex.quote(cwd)} && {command}"
@@ -277,7 +481,31 @@ class WslSandbox:
         # 沙箱内再套一层 timeout：外层的 proc.kill() 只能杀掉 wsl.exe，
         # Linux 侧的子进程要靠这一层才能确定性清理。
         script = wrap_with_limits(body, limits=self.limits, wall_seconds=wall)
+        if self.settings.persistent_shell and not self._session_disabled:
+            try:
+                return self._run_in_session(
+                    script, wall=wall, command=command
+                )
+            except Exception:  # noqa: BLE001 - 会话失败退回一次性执行
+                self._session_disabled = True
+                self.close()
         return self._exec(script, wall=wall, command=command)
+
+    def _run_in_session(
+        self, script: str, *, wall: int, command: str
+    ) -> ExecResult:
+        if self._session_pool is None:
+            size = max(1, int(self.settings.persistent_shell_pool))
+            self._session_pool = _ShellSessionPool(
+                self._argv(),
+                size,
+                on_start=self._bump_command_count,
+            )
+        slots = self._command_slots
+        if slots is None:
+            return self._session_pool.run(script, wall=wall, command=command)
+        with slots:
+            return self._session_pool.run(script, wall=wall, command=command)
 
     def _exec(self, script: str, *, wall: int, command: str = "") -> ExecResult:
         """按实例并发上限执行；具体逻辑见 `_exec_locked`。"""

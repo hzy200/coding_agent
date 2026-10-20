@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from coding_agent.audit.models import AuditRecord
+from coding_agent.security.secrets import redact_secrets
 
 MAX_ARG_CHARS = 400
 MAX_DETAIL_CHARS = 2_000
@@ -57,19 +58,34 @@ class AuditError(RuntimeError):
     """审计写入失败。"""
 
 
+def _sanitize_value(value, max_chars: int):
+    if isinstance(value, str):
+        return truncate(value, max_chars)
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize_value(item, max_chars)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_value(item, max_chars) for item in value]
+    return value
+
+
 def sanitize_args(args: dict, max_chars: int = MAX_ARG_CHARS) -> dict:
-    """截断过长的参数值（尤其是 file_write 的 content）。"""
-    sanitized: dict = {}
-    for key, value in args.items():
-        if isinstance(value, str) and len(value) > max_chars:
-            sanitized[key] = f"{value[:max_chars]}…<已截断，原长 {len(value)}>"
-        else:
-            sanitized[key] = value
-    return sanitized
+    """先脱敏 secret，再截断过长参数（尤其是 file_write 的 content）。"""
+    return {
+        str(key): _sanitize_value(value, max_chars)
+        for key, value in args.items()
+    }
 
 
 def truncate(text: str, max_chars: int = MAX_DETAIL_CHARS) -> str:
-    return text if len(text) <= max_chars else f"{text[:max_chars]}…<已截断，原长 {len(text)}>"
+    text = redact_secrets(text)
+    return (
+        text
+        if len(text) <= max_chars
+        else f"{text[:max_chars]}…<已截断，原长 {len(text)}>"
+    )
 
 
 def now_iso() -> str:

@@ -16,7 +16,13 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
 from coding_agent.graph.state import AgentState
-from coding_agent.llm.context import ContextBudget, trim_messages
+from coding_agent.llm.context import (
+    ContextBudget,
+    is_context_length_error,
+    summarize_messages,
+    tighter_budget,
+    trim_messages,
+)
 from coding_agent.llm.prompts import RESPOND_INSTRUCTION, RESPOND_PROMPT
 from coding_agent.messages import text_of
 
@@ -92,13 +98,34 @@ def make_respond_node(
         if state.get("steering_cancelled"):
             system += "\n\n" + CANCELLED_NOTE
 
-        history, _ = trim_messages(state["messages"], budget)
+        summary = summarize_messages(state["messages"])
+        if summary:
+            system += (
+                "\n\n较早上下文摘要（原始消息可能已裁剪；"
+                "需要精确内容时请重新读取文件）：\n" + summary
+            )
+        history, trim_report = trim_messages(state["messages"], budget)
         messages = [
             SystemMessage(content=system),
             *history,
             HumanMessage(content=RESPOND_INSTRUCTION),
         ]
-        answer = await llm.ainvoke(messages, config)
+        try:
+            answer = await llm.ainvoke(messages, config)
+        except Exception as exc:  # noqa: BLE001
+            if not is_context_length_error(exc):
+                raise
+            tighter = tighter_budget(budget)
+            tighter_history, tighter_report = trim_messages(
+                state["messages"], tighter
+            )
+            trim_report = tighter_report
+            messages = [
+                SystemMessage(content=system),
+                *tighter_history,
+                HumanMessage(content=RESPOND_INSTRUCTION),
+            ]
+            answer = await llm.ainvoke(messages, config)
 
         # 确定性护栏：模型可能忽略提示，仍然声称成功。验证失败是事实，
         # 直接追加到用户可见的答复里，不依赖模型自觉。
@@ -121,6 +148,19 @@ def make_respond_node(
                     + "\n\n（系统提示：本次运行已按用户要求取消。）"
                 }
             )
-        return {"messages": [answer]}
+        return {
+            "messages": [answer],
+            "context_trim": {
+                **{
+                    "trimmed": trim_report.trimmed,
+                    "before_chars": trim_report.before_chars,
+                    "after_chars": trim_report.after_chars,
+                    "before_tokens": trim_report.before_tokens,
+                    "after_tokens": trim_report.after_tokens,
+                    "escalated": trim_report.escalated,
+                },
+                "node": "respond",
+            },
+        }
 
     return respond

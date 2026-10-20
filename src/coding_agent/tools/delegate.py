@@ -13,17 +13,31 @@ from __future__ import annotations
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
 
+from coding_agent.tools.code_intel import CODE_INTEL
 from coding_agent.tools.files import READ_TOOL_NAME
+from coding_agent.tools.memory import MEMORY_SEARCH
 from coding_agent.tools.search import FIND_FILES, SEARCH_CODE
+from coding_agent.tools.symbols import SYMBOL_SEARCH
 
 DELEGATE_EXPLORE = "delegate_explore"
 
 # 子智能体唯一允许的工具集合。**只读、零副作用**：
 # - file_read：读文件
 # - search_code / find_files：检索
+# - symbol_search：AST 符号定位（只读）
+# - memory_search：项目长期记忆检索（只读）
 # 写工具、shell、run_tests 一律不放开 —— 特别是 run_tests 会执行工作区里的代码，
 # 而子智能体的输入包含仓库内容，不能让它获得执行/写入能力。
-EXPLORE_TOOL_NAMES = frozenset({READ_TOOL_NAME, SEARCH_CODE, FIND_FILES})
+EXPLORE_TOOL_NAMES = frozenset(
+    {
+        READ_TOOL_NAME,
+        SEARCH_CODE,
+        FIND_FILES,
+        SYMBOL_SEARCH,
+        CODE_INTEL,
+        MEMORY_SEARCH,
+    }
+)
 
 
 class DelegateInput(BaseModel):

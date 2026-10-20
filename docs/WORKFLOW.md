@@ -47,7 +47,7 @@ direct 路径的失败分支：verify/review 没过且还有预算 → repair �
 
 三者通过**条件边**（`graph/routing.py`）组合；节点彼此不知道对方存在，加一个机制不用改其它两个。
 节点**只读状态、返回状态增量**，不产事件、不写审计——那是 `runtime` 的职责；
-唯一例外是 `scheduler`/`dispatch` 用 custom stream 实时推送 worker 开始/结束。
+唯一例外是 `scheduler` 用 custom stream 实时推送 worker 开始/结束。
 
 ### 2.2 状态生命周期
 
@@ -104,7 +104,7 @@ direct 路径的失败分支：verify/review 没过且还有预算 → repair �
 
 `runtime._stream` 消费 LangGraph 的 `updates`，**同一份更新**既翻译成领域事件（给前端）又写成审计：
 
-- 节点不产事件（例外：`dispatch` 的 custom stream）；前端测试不关心图，
+- 节点不产事件（例外：`scheduler` 的 custom stream）；前端测试不关心图，
   节点测试不关心事件。
 - 流式只在 `act` / `respond`（`messages` 模式），planner 的结构化调用不流式。
 - **挂起时以 `ApprovalRequested` 收尾，不发 `RunFinished`** → 前端据此判断该 resume 还是收工。
@@ -273,7 +273,9 @@ CI（ubuntu，无 WSL）: pip install -e ".[dev,ui,web]" → ruff → pytest -m 
 
 暂停期间普通 prompt 会被拒绝，必须先 `/resume` 或 `/cancel`。事件侧新增
 `SteeringApplied` 与 `WorkflowRevised`；审计写 `kind=steering`（含来源与动作）。
-CLI 与 Web 目前不提供实时控制入口。
+CLI 用 `agent steer --thread-id <id> pause|cancel|add|replan` 注入指令；
+Web 端点提供 `/api/steer`、`/api/resume`、`/api/resume_steering`，
+页面也带审批与暂停/恢复按钮。
 
 ---
 
@@ -292,10 +294,10 @@ CLI 与 Web 目前不提供实时控制入口。
 
 | 优先级 | 改进 | 要点 |
 |---|---|---|
-| P1 | 全局/任务/worker token 预算 | 当前只计量与事后报告，未在运行中硬停 |
-| P1 | Web/CLI 实时控制入口 | 目前只有 TUI 能 pause/cancel/add/replan |
-| P2 | 共享文件的多 worker 合并 | 当前用 write_scope 不重叠规避 3-way rebase |
-| P2 | steering 队列持久化 | checkpoint 存暂停状态，未消费指令不跨进程 |
+| — | 全局/任务/worker token 预算 | **已实现**：任务级硬停 + scheduler 派发前角色预留准入 |
+| — | Web/CLI 实时控制入口 | **已实现**：Web SSE 审批/steering/resume + `agent steer` |
+| — | 共享文件的多 worker 合并 | **已实现**：`AGENT_ORCHESTRATOR_ALLOW_OVERLAP` + 临时 index 3-way 预演 |
+| — | steering 队列持久化 | **已实现**：`.agent/steering/` 原子落盘，`resume` 跨进程恢复 |
 
 **已完成**：`recursion_limit` 拓扑推导（W7）、shell 变更"未留底"提示、每 thread 恢复次数上限
 （`AGENT_MAX_RESUMES`）、token 用量累计（`usage_metadata` → `run_end` 审计，未引入 tokenizer）、

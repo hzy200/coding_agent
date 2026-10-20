@@ -35,8 +35,22 @@ SILENT_NODES = {
     # 审批决定本身不是给用户看的结果：需要确认时走 __interrupt__ → ApprovalRequested，
     # 放行/拒绝则由 tools 节点执行后产出 ToolCallFinished。它只往 state 写 approvals。
     "approval_gate",
-    # survey 只把仓库画像写进 state；用户可见的选择结果由 select_workflow 发出。
+    # 子图包装节点本身不直接产生事件；内层 survey/select_plan/scheduler/
+    # fan_in 的更新由 `subgraphs=True` 上报，另有子图事件测试覆盖。
+    "orchestrator",
+}
+
+# 子图内部节点：运行时通过 subgraphs=True 看到它们，但父图拓扑里只有
+# orchestrator 一个节点。反向约束必须把它们算作“真实存在”。
+_ORCHESTRATOR_INNER_NODES = {
     "survey",
+    "select_workflow",
+    "plan_tasks",
+    "steering_plan",
+    "write_gate",
+    "scheduler",
+    "steering_dispatch",
+    "synthesize",
 }
 
 _META_NODES = {"__start__", "__end__"}
@@ -52,9 +66,6 @@ def real_graph(monkeypatch: pytest.MonkeyPatch):
         _env_file=None,
         deepseek_api_key="x",
         wsl_workspace="/tmp/agent-eval",
-        # 这个约束检查的是父图节点翻译；独立子图的内层事件由子图测试覆盖。
-        orchestrator_subgraph_enabled=False,
-        orchestrator_event_driven=False,
     )
     return build_graph(settings, checkpointer=MemorySaver())
 
@@ -123,14 +134,9 @@ def test_every_graph_node_is_translated_or_declared_silent(real_graph) -> None:
 
 def test_no_translation_branch_for_a_missing_node(real_graph) -> None:
     """反向约束：翻译分支必须对应真实节点，防止节点改名后留下死分支。"""
-    nodes = _graph_nodes(real_graph)
+    nodes = _graph_nodes(real_graph) | _ORCHESTRATOR_INNER_NODES
     names, prefixes = _translated_nodes()
-    # dispatch 与 scheduler 是同一职责的两套实现，由
-    # AGENT_ORCHESTRATOR_EVENT_DRIVEN 选择；默认图只有前者。
-    conditional = {"dispatch", "scheduler"}
-    dead = {
-        name for name in names if name not in nodes and name not in conditional
-    }
+    dead = {name for name in names if name not in nodes}
     assert not dead, f"这些翻译分支对应的节点已不存在：{sorted(dead)}"
     for prefix in prefixes:
         assert any(node.startswith(prefix) for node in nodes), (

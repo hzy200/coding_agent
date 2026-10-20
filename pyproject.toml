@@ -83,3 +83,5 @@ select = ["E", "F", "I", "UP", "B"]
 # textual 是可选依赖：必须先 importorskip，再导入它，否则缺 ui extras 时
 # 会以 collection error 而非 skip 收场。E402 在这里是有意为之。
 "tests/tui/test_tui_app.py" = ["E402"]
+# 任务种子/测试是嵌在字符串里的 Python 源码，长行不可避免。
+"tests/eval/tasks_full.py" = ["E501"]

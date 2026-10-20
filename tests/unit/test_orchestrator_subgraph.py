@@ -117,13 +117,9 @@ async def _fake_worker(task: dict[str, Any], **_kwargs: Any) -> WorkerResult:
 def _settings(**overrides: Any) -> Settings:
     base = {
         "orchestrator_enabled": True,
-        "orchestrator_subgraph_enabled": True,
         "orchestrator_min_files": 30,
         "orchestrator_max_tasks": 6,
         "orchestrator_max_concurrent_workers": 2,
-        "orchestrator_max_rounds": 3,
-        # 默认测等价迁移的旧子图；事件驱动用例显式覆盖。
-        "orchestrator_event_driven": False,
     }
     base.update(overrides)
     return Settings(_env_file=None, **base)
@@ -170,25 +166,14 @@ def test_subgraph_runs_inner_nodes_and_emits_worker_events() -> None:
 
     assert "worker_context" in states
     assert len(states["worker_results"]) == 2
-    assert {"survey", "select_workflow", "plan_tasks", "dispatch"} <= set(names)
-    assert any(event.get("type") == "worker_started" for event in events)
-    assert any(event.get("type") == "worker_finished" for event in events)
-
-
-def test_event_driven_subgraph_uses_scheduler_and_gate() -> None:
-    subgraph = build_orchestrator_subgraph(
-        llm=_TaskGraphLLM(),  # type: ignore[arg-type]
-        settings=_settings(orchestrator_event_driven=True),
-        sandbox=_FakeSandbox(),  # type: ignore[arg-type]
-        root="/mnt/d/proj",
-        worker_runner=_fake_worker,
-        steering=SteeringController(),
-    )
-
-    states, events, names = asyncio.run(_run_subgraph(subgraph))
-
-    assert {"scheduler", "steering_dispatch", "synthesize"} <= set(names)
+    assert {
+        "survey",
+        "select_workflow",
+        "plan_tasks",
+        "scheduler",
+        "steering_dispatch",
+        "synthesize",
+    } <= set(names)
     assert "dispatch" not in names
-    assert len(states["worker_results"]) == 2
     assert any(event.get("type") == "worker_started" for event in events)
     assert any(event.get("type") == "worker_finished" for event in events)

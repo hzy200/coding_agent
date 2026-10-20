@@ -43,6 +43,25 @@ def test_monotonic_in_all_inputs() -> None:
     assert estimate_recursion_limit(5, 12, 3, 2) > estimate_recursion_limit(5, 12, 3, 1)
 
 
+def test_event_driven_scheduler_boundaries_are_counted() -> None:
+    """事件驱动按 checkpoint 边界循环，不能再套旧 dispatch 的固定轮次。"""
+    base = estimate_recursion_limit(5, 12, 3, 2)
+    event = estimate_recursion_limit(
+        5,
+        12,
+        3,
+        2,
+        orchestrator_enabled=True,
+        orchestrator_max_tasks=6,
+        orchestrator_checkpoint_every=1,
+    )
+
+    # 6 个任务、每个边界只完成 1 个 -> 6 个 scheduler + 6 个 steering 边界；
+    # 子图固定节点 6 个（survey/select/plan/steering_plan/write_gate/fan_in）。
+    assert event > base
+    assert event == base + (2 + 1) * (6 + 6 * 2) + 2
+
+
 def test_covers_a_maxed_out_default_plan() -> None:
     """默认上限下的最坏路径不能超过限额 —— 含把每一轮修复与每一次重规划都烧光。"""
     s = Settings(_env_file=None)

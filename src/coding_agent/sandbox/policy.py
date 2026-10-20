@@ -12,11 +12,13 @@
 
 from __future__ import annotations
 
+import fnmatch
 import posixpath
 import re
 import shlex
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Any
 
 
 class CommandLevel(IntEnum):
@@ -65,16 +67,27 @@ APPROVAL_APPROVE = "approve"
 APPROVAL_DENY = "deny"
 
 
+def parse_allow_rules(text: str) -> frozenset[str]:
+    """解析 `tool:glob,tool:glob` 形式的持久放行规则。"""
+    return frozenset(
+        item.strip() for item in str(text or "").split(",") if item.strip()
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SessionPolicy:
     """一次会话的授权范围。
 
     刻意不做成全局单例：策略必须是图的显式输入，否则「谁批的」就说不清楚，
     审计也无从追溯。
+
+    `allow_rules` 是显式配置的持久放行规则（`tool:glob`）。它只覆盖
+    **L2 询问**，不能绕过 L3/DANGER 或 `approval_mode=deny`。
     """
 
     allow_write: bool = False
     approval_mode: str = APPROVAL_ASK
+    allow_rules: frozenset[str] = frozenset()
 
     def decide(self, level: CommandLevel) -> str:
         if level <= CommandLevel.READ:
@@ -90,6 +103,39 @@ class SessionPolicy:
         if self.approval_mode == APPROVAL_DENY:
             return DENY
         return ASK
+
+    def _rule_matches(self, tool: str, args: dict[str, Any]) -> bool:
+        value = str(
+            args.get("path")
+            or args.get("command")
+            or args.get("cwd")
+            or args.get("reason")
+            or ""
+        )
+        if not value:
+            return False
+        for rule in self.allow_rules:
+            rule_tool, sep, pattern = rule.partition(":")
+            if not sep or not pattern:
+                continue
+            if rule_tool not in {"*", tool}:
+                continue
+            if fnmatch.fnmatchcase(value, pattern):
+                return True
+        return False
+
+    def decide_call(
+        self, tool: str, args: dict[str, Any], level: CommandLevel
+    ) -> str:
+        """按具体调用判定；持久规则只影响原本需要 ASK 的 L2 调用。"""
+        decision = self.decide(level)
+        if (
+            decision == ASK
+            and level == CommandLevel.MUTATE
+            and self._rule_matches(tool, args)
+        ):
+            return AUTO
+        return decision
 
 
 # --------------------------------------------------------------------------

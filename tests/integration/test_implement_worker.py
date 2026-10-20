@@ -20,6 +20,17 @@ from coding_agent.sandbox.fs import SandboxFs
 from coding_agent.sandbox.snapshots import SnapshotStore
 
 
+class _SlowLLM:
+    """一直不返回，用于验证宿主取消时 worktree 仍会被清理。"""
+
+    def bind_tools(self, tools):  # noqa: ANN001
+        return self
+
+    async def ainvoke(self, messages, config=None):  # noqa: ANN001
+        await asyncio.sleep(30)
+        return AIMessage(content="不应该走到这里")
+
+
 class _FakeLLM:
     def __init__(
         self,
@@ -496,6 +507,78 @@ def test_cancelled_implement_worker_discards_the_worktree(require_wsl) -> None: 
         assert "VALUE = 1" in sandbox.run(
             f"cat {shlex.quote(root)}/app/sample.py"
         ).stdout
+        leftovers = sandbox.run(f"ls -A {shlex.quote(root)}/.agent/worktrees")
+        assert not leftovers.stdout.strip()
+    finally:
+        sandbox.run(f"rm -rf {shlex.quote(root)}")
+
+
+@pytest.mark.wsl
+def test_host_cancellation_still_removes_the_worktree(require_wsl) -> None:  # noqa: ANN001
+    """调度器 deadline 直接 cancel 任务时，finally 也必须清理 worktree。"""
+    sandbox = require_wsl
+    root = sandbox.run(
+        "mktemp -d /tmp/agent-implement-cancel-task-XXXXXX"
+    ).stdout.strip()
+    assert root
+    try:
+        setup = sandbox.run(
+            f"""
+            cd {shlex.quote(root)}
+            git init -q
+            git config user.email eval@example.invalid
+            git config user.name eval
+            mkdir -p app
+            printf 'VALUE = 1\\n' > app/sample.py
+            git add -A
+            git commit -qm init
+            """,
+            cwd=root,
+        )
+        assert setup.ok, setup.render(500)
+
+        settings = sandbox.settings.model_copy(
+            update={"orchestrator_write_enabled": True}
+        )
+        runner = make_implement_runner(
+            llm=_SlowLLM(),  # type: ignore[arg-type]
+            sandbox=sandbox,
+            root=root,
+            settings=settings,
+        )
+
+        async def run_and_cancel() -> None:
+            task = asyncio.create_task(
+                runner(
+                    {
+                        "id": "implement-host-cancel",
+                        "role": "implement",
+                        "goal": "等待取消",
+                        "write_scope": ["app/sample.py"],
+                    },
+                    parent_request="取消这个写任务",
+                    cwd=root,
+                    cancel=lambda: False,
+                )
+            )
+            # 等 worktree 真正建出来再取消；否则测试没有覆盖清理路径。
+            for _ in range(100):
+                listing = sandbox.run(
+                    f"ls -A {shlex.quote(root)}/.agent/worktrees"
+                )
+                if listing.stdout.strip():
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                task.cancel()
+                raise AssertionError("worktree 没有被创建")
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(run_and_cancel())
+
         leftovers = sandbox.run(f"ls -A {shlex.quote(root)}/.agent/worktrees")
         assert not leftovers.stdout.strip()
     finally:

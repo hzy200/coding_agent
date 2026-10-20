@@ -37,8 +37,8 @@ LLM 拿不到操作系统句柄，只能产出结构化调用 `{tool, args}`；�
 │ graph/  state.py routing.py build.py nodes/               │
 │   planner → act ⇄ (approval_gate → tools) → verify        │
 │   → review → advance → steering_step → replan → …         │
-│   编排路径：plan_tasks → steering_plan → dispatch         │
-│             ⇄ steering_dispatch → synthesize              │
+│   编排路径：plan_tasks → steering_plan → scheduler        │
+│             ⇄ steering_dispatch → fan-in              │
 │   所有收尾路径经 steering_final → respond                  │
 │   两道质量关：verify 管行为对不对，review 管代码干不干净      │
 │   一步没有产生任何改动 → nudge 打回重做一次（上限一次）        │
@@ -82,7 +82,7 @@ Web 页面上一个按钮就能跳过命令分级。这条约束是安全属性�
 | `runtime.py` | 编排、事件翻译、审计、生命周期 | 不含业务规则（分级在 policy） |
 | `events.py` | 前端契约（领域事件） | 不含逻辑 |
 | `graph/state.py` | 跨节点传递的状态 | 不放能推导出来的派生值 |
-| `graph/nodes/` | 单个节点的纯函数 | 不直接 yield 事件（例外：`dispatch` 用 custom stream 发 worker 实时事件） |
+| `graph/nodes/` | 单个节点的纯函数 | 不直接 yield 事件（例外：`scheduler` 用 custom stream 发 worker 实时事件） |
 | `graph/routing.py` | 条件边 | 不做副作用 |
 | `agents/` | 子智能体循环（独立上下文） | 不直接写主 state、不产生写路径 |
 | `tools/` | 能力：执行 + 回报 | 不做安全判定（判定在 approval_gate） |
@@ -142,11 +142,11 @@ Web 页面上一个按钮就能跳过命令分级。这条约束是安全属性�
 要点：
 
 - **节点不直接调用前端**。绝大多数事件由 runtime 从 `updates` 里翻译；
-  `dispatch` 是唯一例外：它通过 LangGraph `get_stream_writer()` 推送 worker
+  `scheduler` 是唯一例外：它通过 LangGraph `get_stream_writer()` 推送 worker
   开始/结束的 custom 事件（实时进度），runtime 用 `worker_id:attempt` 去重后
   翻译成领域事件。
   这样节点的测试不需要关心事件，前端的测试不需要关心图。
-- **审计与事件同源**。绝大多数事件来自同一份 `updates`；`dispatch` 的 worker
+- **审计与事件同源**。绝大多数事件来自同一份 `updates`；`scheduler` 的 worker
   事件来自 custom stream，runtime 同样在翻译时写审计，不存在“界面显示了但没记账”。
 - **挂起时以 `ApprovalRequested` 收尾**，不发 `RunFinished` —— 前端据此判断该 resume 还是收工。
 
@@ -156,7 +156,10 @@ Web 页面上一个按钮就能跳过命令分级。这条约束是安全属性�
 |---|---|---|
 | `messages` | 对话与工具轨迹 | `add_messages` 追加 |
 | `cwd` | 沙箱内工作目录 | 每次 run 由 runtime 注入 |
-| `memories` | 项目长期事实 | 每次 run 从文件重读 |
+| `memories` | 项目长期事实（按请求检索的 top-K） | 每次 run 从文件重读 |
+| `project_instructions` | 分层 `AGENTS.md` / `CLAUDE.md` 合并文本 | 每次 run 加载 |
+| `stale_paths` | 本轮已成功修改的文件 | runtime 每轮置空；tools 追加 |
+| `context_trim` | 最近一次 act/respond 的裁剪报告 | 节点每次覆盖 |
 | `plan` / `plan_kinds` / `step_idx` | 子任务、类型与进度 | planner 初始化，advance 递增，replan 改写剩余部分（文本与 kind 同步） |
 | `replan_count` | 已重建计划的次数 | planner 清零、replan 递增；**整个任务**的额度，advance 不动 |
 | `tool_rounds` | 当前步骤已用轮次 | planner / advance / repair 清零 |
@@ -171,7 +174,7 @@ Web 页面上一个按钮就能跳过命令分级。这条约束是安全属性�
 | `approvals` | call_id → 审批结果 | approval_gate 写入，tools **消费后清空** |
 | `steering_cancelled` / `steering_replan` / `steering_replans` | 用户干预结果与次数 | runtime 每轮归零；steering 节点写入；plan_tasks 消费 replan |
 | `steering_applied` / `workflow_revised_reason` | runtime 翻译事件用 | steering / plan_tasks 每次写入 |
-| `tasks` / `task_status` / `task_attempts` / `worker_results` | 编排任务图与每轮结果 | plan_tasks 初始化；dispatch / extend_tasks 增量写入 |
+| `tasks` / `task_status` / `task_attempts` / `worker_results` | 编排任务图与每轮结果 | plan_tasks 初始化；scheduler 增量写入 |
 | `task_extensions_seen` / `task_extensions_applied` | worker 提议只读任务的扫描位置与本轮新增 | extend_tasks 写入；runtime 每轮归零 |
 
 `approvals` 的一次性语义是安全属性：不清空的话，下一轮的调用会复用上一轮的批准。
@@ -179,7 +182,8 @@ Web 页面上一个按钮就能跳过命令分级。这条约束是安全属性�
 
 steering 的**指令队列不在 state 里**：它是外部输入，worker 需要一边运行一边
 非破坏性轮询 `cancel_requested`，而 state 更新与图执行是串行的。暂停状态由
-checkpoint 保存，队列只活在当前进程。
+checkpoint 保存；未消费指令与 pause 标记由 `SteeringController` 原子落盘到
+`.agent/steering/`，进程重启后可通过 `resume` 恢复。
 
 ## 6. 不变量
 
@@ -218,7 +222,7 @@ checkpoint 保存，队列只活在当前进程。
 | 29 | **`implement` 步骤必须有实际改动才能推进** | 委派探索可以把「读」做完，但不能因此把实现步当成完成。`plan_kinds` 与 `plan` 逐项对齐：explore/verify 允许零改动直接步进；implement 先 nudge 一次，仍无 `dirty` 就收尾，不再静默 advance | `test_an_implement_step_nudged_without_changes_responds`、`test_an_explore_step_without_changes_advances_without_nudge` |
 | 30 | **同一失败签名连续出现就改走 replan，且跨 replan 继续累积** | 24 次相同失败验证说明 repair 只是重复同一类修改。失败签名由失败测试 id + 归一化错误消息组成；连续达到 `max_same_failures` 后不再 repair。replan 会清空 `verification`，所以签名另存 `last_failure_signature`：新做法若仍撞同一个失败，计数继续增长，不会「清零→再修两轮→再 replan」循环。repair 时只重跑上次失败的 pytest 测试，子集通过后自动补跑全量。 | `test_the_same_failure_signature_goes_to_replan`、`test_stagnation_survives_a_replan_that_clears_the_verification`、`test_selected_pass_is_confirmed_by_a_full_run` |
 | 31 | **委派只在 explore 步、且受仓库规模预算约束** | 38 文件的任务实测会拆 3–5 个子智能体，成本 +43%。默认：<30 文件不委派；30–99 最多 2 次；100–299 最多 4 次；≥300 用配置上限。实现/验证步一律拒绝委派 | `test_small_repo_disables_delegation`、`test_delegate_is_rejected_outside_an_explore_step`、`test_delegate_budget_comes_from_the_cost_policy` |
-| 32 | **编排写 worker 只能在隔离 worktree 中并发，且写范围在 I/O 前就被校验** | 多个 implement 同时改主工作区会互相覆盖。每个 worker 一个 worktree；scheduler/dispatch 串行执行 `git apply --check` → 留快照 → `git apply`；文件工具在写入前拒绝 `write_scope` 外路径，事后 diff 校验保留为第二道防线 | `test_concurrent_implement_workers_ignore_agent_state`、`test_merged_patch_takes_snapshots_so_undo_can_restore`、`test_dispatch_marks_a_conflicting_patch_failed`、`test_write_outside_scope_is_rejected_before_io` |
+| 32 | **编排写 worker 只能在隔离 worktree 中并发，且写范围在 I/O 前就被校验** | 多个 implement 同时改主工作区会互相覆盖。每个 worker 一个 worktree；scheduler 串行执行 `git apply --check` → 留快照 → `git apply`；文件工具在写入前拒绝 `write_scope` 外路径，事后 diff 校验保留为第二道防线 | `test_concurrent_implement_workers_ignore_agent_state`、`test_merged_patch_takes_snapshots_so_undo_can_restore`、`test_dispatch_marks_a_conflicting_patch_failed`、`test_write_outside_scope_is_rejected_before_io` |
 
 ## 7. 关键取舍
 
@@ -319,7 +323,7 @@ START ─ route_entry ─┬─ direct → planner → act ...
   `checkpoint_every` 到达边界时 drain 在飞任务再返回，交给
   `steering_dispatch` 消费 pause/add/replan/cancel；
 - `orchestrator/merge.py`：implement 补丁串行合并（check → 解析路径 → 留快照 →
-  apply），旧 dispatch 与新 scheduler 共用同一套判定；
+  apply），统一由 `merge.py` 实现；
 - `orchestrator/artifacts.py`：fan-in 完整结果落 `.agent/artifacts/`；
   `worker_brief` 给 planner/act，完整结果可追溯；
 - `orchestrator/workflow.py`：规则优先；规则不确定时一次结构化调用同时返回
@@ -364,7 +368,7 @@ drain 后的边界消费。pause 用 `interrupt()` + checkpoint，恢复时已�
 7. 前端（`cli/app.py`、`tui/app.py`）补事件映射
 
 节点里不要 yield 事件、不要写审计 —— 那些是 runtime 的职责。
-唯一例外是 `dispatch` 的 `get_stream_writer()` custom 事件（worker 实时进度），
+唯一例外是 `scheduler` 的 `get_stream_writer()` custom 事件（worker 实时进度），
 它只推事件载荷，审计仍由 runtime 统一写。
 
 第 4 与第 7 步都有守卫：`test_graph_event_coverage.py` 用 AST 断言「每个图节点要么

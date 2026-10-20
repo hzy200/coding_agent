@@ -15,7 +15,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from langchain_core.messages import AIMessage, AnyMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AnyMessage,
+    HumanMessage,
+    ToolMessage,
+)
 
 # 硬裁剪档位：先降到 SOFT，仍超预算再降到 HARD
 HARD_TOOL_CHARS = 300
@@ -23,15 +28,21 @@ HARD_TOOL_CHARS = 300
 
 @dataclass(frozen=True, slots=True)
 class ContextBudget:
-    """0 或 keep_recent<=0 表示不裁剪。"""
+    """字符/估算 token 双预算；都为 0 或 keep_recent<=0 表示不裁剪。"""
 
     max_chars: int = 60_000
     keep_recent: int = 12
     tool_chars: int = 1_500
+    # 0 = 只按字符预算；>0 时按保守估算的 token 数再兜一层。
+    max_tokens: int = 0
 
     @property
     def enabled(self) -> bool:
-        return self.max_chars > 0 and self.keep_recent > 0 and self.tool_chars > 0
+        return (
+            (self.max_chars > 0 or self.max_tokens > 0)
+            and self.keep_recent > 0
+            and self.tool_chars > 0
+        )
 
 
 @dataclass(slots=True)
@@ -39,6 +50,8 @@ class TrimReport:
     trimmed: int = 0
     before_chars: int = 0
     after_chars: int = 0
+    before_tokens: int = 0
+    after_tokens: int = 0
     escalated: bool = False
 
     @property
@@ -71,6 +84,51 @@ def message_chars(message: AnyMessage) -> int:
 
 def total_chars(messages: list[AnyMessage]) -> int:
     return sum(message_chars(m) for m in messages)
+
+
+def estimate_tokens(text: str) -> int:
+    """保守 token 估算：CJK 约 1 字/token，其余约 4 字符/token。
+
+    不引 tokenizer：这里要的是预算护栏，不是计费精确值；真正的 usage
+    仍以 provider 回报为准。
+    """
+    if not text:
+        return 0
+    cjk = sum(
+        1
+        for char in text
+        if "\u3400" <= char <= "\u9fff" or "\uf900" <= char <= "\ufaff"
+    )
+    # 非 CJK 部分向上取整：1–3 个字符也算 1 token；纯中文不应凭空多出 1。
+    return cjk + (len(text) - cjk + 3) // 4
+
+
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return "".join(parts)
+    return str(content)
+
+
+def message_tokens(message: AnyMessage) -> int:
+    return estimate_tokens(_content_text(message.content))
+
+
+def total_tokens(messages: list[AnyMessage]) -> int:
+    return sum(message_tokens(m) for m in messages)
+
+
+def _over_budget(messages: list[AnyMessage], budget: ContextBudget) -> bool:
+    if budget.max_chars > 0 and total_chars(messages) > budget.max_chars:
+        return True
+    return budget.max_tokens > 0 and total_tokens(messages) > budget.max_tokens
 
 
 def _omission_note(omitted: int) -> str:
@@ -142,17 +200,8 @@ def _shorten(message: AnyMessage, limit: int) -> tuple[AnyMessage, bool]:
 
 
 def _cap_single(message: AnyMessage, budget: ContextBudget) -> tuple[AnyMessage, bool]:
-    """单条消息的绝对上限。
-
-    `keep_recent` 的本意是留住模型刚拿到的工具结果，但它挡不住「一条消息就把
-    整个预算吃光」—— 那不是设计取舍而是缺陷：`file_read` 的 limit 一度没有
-    上界，一次就能读进 2MB，而最近的消息根本不参与裁剪，于是原样进了请求。
-    后果不是变慢，而是超长请求直接 400。
-
-    阈值取整个预算：正常读取（几百行、十几 KB）碰不到它，
-    只有真正病态的单条消息才会被截断。
-    """
-    if message_chars(message) <= budget.max_chars:
+    """单条消息的绝对上限（只按字符预算时生效）。"""
+    if budget.max_chars <= 0 or message_chars(message) <= budget.max_chars:
         return message, False
     return _shorten(message, budget.max_chars)
 
@@ -167,47 +216,129 @@ def _is_trimmable(message: AnyMessage) -> bool:
     return isinstance(message, AIMessage) and not getattr(message, "tool_calls", None)
 
 
+_CONTEXT_ERROR_HINTS = (
+    "context length",
+    "context_length_exceeded",
+    "maximum context",
+    "too many tokens",
+    "reduce the length",
+    "prompt is too long",
+)
+
+
+def is_context_length_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(hint in text for hint in _CONTEXT_ERROR_HINTS)
+
+
+def tighter_budget(budget: ContextBudget) -> ContextBudget:
+    """context-length 400 后的降档预算。"""
+    return ContextBudget(
+        max_chars=max(1_000, budget.max_chars // 2)
+        if budget.max_chars > 0
+        else 0,
+        max_tokens=max(1_000, budget.max_tokens // 2)
+        if budget.max_tokens > 0
+        else 0,
+        keep_recent=max(2, budget.keep_recent // 2),
+        tool_chars=max(100, budget.tool_chars // 2),
+    )
+
+
+def summarize_messages(
+    messages: list[AnyMessage], *, max_chars: int = 1_500
+) -> str:
+    """从消息历史生成确定性压缩摘要（不调模型）。
+
+    重点保留：用户目标、最近结论、最近工具动作。它不能替代完整历史，
+    但能在裁剪掉旧工具结果后，让模型仍知道“之前做过什么/为什么”。
+    """
+    users: list[str] = []
+    answers: list[str] = []
+    actions: list[str] = []
+    for message in messages:
+        text = _content_text(message.content).strip()
+        if isinstance(message, HumanMessage) and text:
+            users.append(" ".join(text.split())[:300])
+        elif (
+            isinstance(message, AIMessage)
+            and not getattr(message, "tool_calls", None)
+            and text
+        ):
+            answers.append(" ".join(text.split())[:300])
+        for call in getattr(message, "tool_calls", None) or []:
+            name = str(call.get("name", ""))
+            args = call.get("args") or {}
+            target = (
+                args.get("path")
+                or args.get("command")
+                or args.get("query")
+                or ""
+            )
+            actions.append(f"{name}({str(target)[:120]})")
+
+    parts: list[str] = []
+    if users:
+        parts.append("用户目标：" + " / ".join(users[-3:]))
+    if answers:
+        parts.append("最近结论：" + " / ".join(answers[-3:]))
+    if actions:
+        parts.append("最近工具动作：" + "；".join(actions[-12:]))
+    summary = "\n".join(parts)
+    if len(summary) > max_chars:
+        summary = summary[:max_chars] + "…（摘要已截断）"
+    return summary
+
+
 def trim_messages(
     messages: list[AnyMessage], budget: ContextBudget
 ) -> tuple[list[AnyMessage], TrimReport]:
-    """返回裁剪后的消息列表与报告。原列表不会被就地修改。"""
-    report = TrimReport(before_chars=total_chars(messages))
-    if not budget.enabled or len(messages) <= budget.keep_recent:
+    """返回裁剪后的消息列表与报告。原列表不会被就地修改。
+
+    两阶段：
+    1. 老的 trimmable 消息降到 `tool_chars`；最近窗口只做单条上限；
+    2. 如果总字符/估算 token 仍超预算，**最近窗口也参与降档**，
+       从老到新依次降到 HARD/120/40/占位说明。消息结构始终保留。
+    """
+    report = TrimReport(
+        before_chars=total_chars(messages),
+        before_tokens=total_tokens(messages),
+    )
+    if not budget.enabled:
         report.after_chars = report.before_chars
+        report.after_tokens = report.before_tokens
         return list(messages), report
 
-    cutoff = len(messages) - budget.keep_recent
+    cutoff = max(0, len(messages) - budget.keep_recent)
     trimmed: list[AnyMessage] = []
 
     for index, message in enumerate(messages):
-        if index >= cutoff:
-            # 最近的消息不参与常规裁剪，但仍受单条上限约束
-            if _is_trimmable(message):
-                new_message, changed = _cap_single(message, budget)
-                report.trimmed += int(changed)
-                trimmed.append(new_message)
-            else:
-                trimmed.append(message)
-            continue
         if not _is_trimmable(message):
             trimmed.append(message)
             continue
-        new_message, changed = _shorten(message, budget.tool_chars)
+        limit = budget.tool_chars if index < cutoff else budget.max_chars
+        if limit <= 0:
+            trimmed.append(message)
+            continue
+        new_message, changed = _shorten(message, limit)
         report.trimmed += int(changed)
         trimmed.append(new_message)
 
-    # 降档仍然超预算时，对老消息再狠一点
-    if total_chars(trimmed) > budget.max_chars:
-        harsher: list[AnyMessage] = []
-        for index, message in enumerate(trimmed):
-            if index >= cutoff or not _is_trimmable(message):
-                harsher.append(message)
-                continue
-            new_message, changed = _shorten(message, HARD_TOOL_CHARS)
-            report.trimmed += int(changed)
-            harsher.append(new_message)
-        trimmed = harsher
+    if _over_budget(trimmed, budget):
         report.escalated = True
+        order = [*range(cutoff), *range(cutoff, len(trimmed))]
+        for limit in (HARD_TOOL_CHARS, 120, 40, 0):
+            for index in order:
+                message = trimmed[index]
+                if not _is_trimmable(message):
+                    continue
+                new_message, changed = _shorten(message, limit)
+                if changed:
+                    report.trimmed += 1
+                    trimmed[index] = new_message
+            if not _over_budget(trimmed, budget):
+                break
 
     report.after_chars = total_chars(trimmed)
+    report.after_tokens = total_tokens(trimmed)
     return trimmed, report

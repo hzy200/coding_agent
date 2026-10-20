@@ -65,6 +65,11 @@ class AuditRecord(BaseModel):
     # ---- run_end：模型回报的 token 用量（provider 未提供时为 None）----
     input_tokens: int | None = None
     output_tokens: int | None = None
+    cost_usd: float | None = None
+    billed_usd: float | None = None
+    # provider prefix cache 命中/未命中 token（未回报时为 None）
+    cache_hit_tokens: int | None = None
+    cache_miss_tokens: int | None = None
 
     # ---- file_change ----
     path: str = ""
@@ -90,3 +95,12 @@ class AuditRecord(BaseModel):
     worker_id: str | None = None
     attempt: int | None = None
     merged: bool | None = None
+    # ---- worker 成本/隔离指标 ----
+    artifact_id: str | None = None
+    timed_out: bool | None = None
+    queue_wait_ms: int | None = None
+    llm_ms: int | None = None
+    tool_ms: int | None = None
+    depth: int | None = None
+    priority: int | None = None
+    scope_violations: list[str] = Field(default_factory=list)

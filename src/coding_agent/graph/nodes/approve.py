@@ -19,6 +19,7 @@ from coding_agent.graph.state import AgentState
 from coding_agent.sandbox.policy import APPROVED, ASK, DENIED, SessionPolicy
 from coding_agent.sandbox.policy import CommandLevel as _Level
 from coding_agent.sandbox.policy import classify as _classify
+from coding_agent.tools.code_intel import CODE_INTEL
 from coding_agent.tools.delegate import DELEGATE_EXPLORE
 from coding_agent.tools.deps import DEPS_INSTALL, DEPS_LIST
 from coding_agent.tools.files import (
@@ -28,8 +29,10 @@ from coding_agent.tools.files import (
     WRITE_TOOL_NAME,
 )
 from coding_agent.tools.git import GIT_ADD, GIT_COMMIT, GIT_DIFF, GIT_LOG, GIT_STATUS
+from coding_agent.tools.memory import MEMORY_SAVE, MEMORY_SEARCH
 from coding_agent.tools.search import FIND_FILES, SEARCH_CODE
 from coding_agent.tools.shell import SHELL_TOOL_NAME
+from coding_agent.tools.symbols import SYMBOL_SEARCH
 from coding_agent.tools.testrun import RUN_TESTS_TOOL
 
 # 只读工具：无条件放行。
@@ -44,13 +47,19 @@ _READ_TOOLS = frozenset(
         DEPS_LIST,
         SEARCH_CODE,
         FIND_FILES,
+        SYMBOL_SEARCH,
+        CODE_INTEL,
         DELEGATE_EXPLORE,
+        MEMORY_SEARCH,
     }
 )
 
 # 低风险写：由 --write 一次性授权，不逐条询问。
 # 文件工具是受控路径（有 diff、有备份）；git add 只动索引，可 restore 撤销。
-_WRITE_TOOLS = frozenset({WRITE_TOOL_NAME, EDIT_TOOL_NAME, RESTORE_TOOL_NAME, GIT_ADD})
+# memory_save 只改 `.agent/memory.md`，与 CLI `/remember` 同一份文件。
+_WRITE_TOOLS = frozenset(
+    {WRITE_TOOL_NAME, EDIT_TOOL_NAME, RESTORE_TOOL_NAME, GIT_ADD, MEMORY_SAVE}
+)
 
 # 变更性：产生提交、改动依赖环境、执行项目代码，一律逐条询问。
 # 注意自动 verify 不走这里 —— 它只跑命令文本由宿主写死的命令（见 nodes/verify.py）；
@@ -83,6 +92,8 @@ def _describe(name: str, args: dict[str, Any]) -> str:
         return f"git add {' '.join(args.get('paths') or [])}"
     if name == RUN_TESTS_TOOL:
         return "运行本项目的测试"
+    if name == MEMORY_SAVE:
+        return f"记住：{args.get('fact', '')}"
     if name == DELEGATE_EXPLORE:
         return f"探索：{args.get('goal', '')}"
     return str(args.get("path") or args.get("command") or name)
@@ -108,7 +119,7 @@ def make_approval_gate_node(
             name = str(call.get("name", ""))
             args = dict(call.get("args") or {})
             level = tool_level(name, args)
-            decision = policy.decide(level)
+            decision = policy.decide_call(name, args, level)
 
             if decision == ASK:
                 pending.append(

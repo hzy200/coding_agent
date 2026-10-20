@@ -124,7 +124,7 @@ def make_select_workflow_node(
         if decision is None:
             # 规则不确定时一次调用同时拿到 workflow 和任务图，省掉
             # select → plan 的第二次 LLM 往返。
-            from coding_agent.orchestrator.nodes import (
+            from coding_agent.orchestrator.plan import (
                 _IMPLEMENT_ROLE_NOTES,
                 _IMPLEMENT_RULES,
                 _READ_ONLY_ROLE_NOTES,

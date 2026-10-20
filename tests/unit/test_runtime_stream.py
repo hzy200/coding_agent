@@ -52,6 +52,9 @@ class _NullMemory:
     def load(self) -> list[str]:
         return []
 
+    def search(self, query: str = "", limit: int = 8) -> list[str]:
+        return []
+
 
 def _no_wsl(runtime: AgentRuntime) -> AgentRuntime:
     runtime._memory = _NullMemory()  # type: ignore[assignment]
@@ -162,6 +165,7 @@ def test_full_run_event_sequence(tmp_path) -> None:
         # 第 2 步开了头却直接收尾（真实图里由 replan 砍掉剩余步骤触发），
         # 收尾前必须补一个 step_finished —— 否则前端进度条永远停在「进行中」
         "step_finished",
+        "cost_report",
         "run_finished",
     ]
 
@@ -634,6 +638,9 @@ def test_approved_tool_call_keeps_args_across_resume(tmp_path) -> None:
 
 class _BoomMemory:
     def load(self) -> list[str]:
+        raise RuntimeError("记忆文件读不了")
+
+    def search(self, query: str = "", limit: int = 8) -> list[str]:
         raise RuntimeError("记忆文件读不了")
 
 

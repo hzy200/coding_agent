@@ -171,6 +171,34 @@ def test_returns_a_structured_report() -> None:
     assert (artifact.input_tokens, artifact.output_tokens) == (110, 25)
 
 
+def test_task_token_budget_stops_the_loop_and_skips_report_call() -> None:
+    llm = _ScriptedLLM(
+        [_ScriptedLLM.tool_call("file_read", {"path": "a.py", "reason": "看"})]
+    )
+    tool = _FakeTool("file_read")
+
+    artifact = _run(
+        _runner(llm, [tool]),
+        args={"goal": "找入口", "max_tokens": 50},
+    )
+
+    assert artifact.status == "partial"
+    assert llm.structured.calls == 0
+    assert artifact.rounds == 1
+
+
+def test_repo_map_is_included_in_the_task_context() -> None:
+    llm = _ScriptedLLM([AIMessage(content="完成")])
+
+    _run(
+        _runner(llm, [_FakeTool("file_read")]),
+        args={"goal": "找入口", "repo_map": "app/main.py: def main"},
+    )
+
+    human = llm.seen[0][1]
+    assert "app/main.py: def main" in human.content
+
+
 def test_child_context_is_isolated() -> None:
     llm = _ScriptedLLM([AIMessage(content="完成")])
     _run(_runner(llm, [_FakeTool("file_read")]), args={"goal": "看结构"})
@@ -227,6 +255,7 @@ def test_timeout_returns_a_failed_artifact() -> None:
 
     assert artifact.status == "failed"
     assert "超时" in artifact.error
+    assert artifact.timed_out is True
     assert artifact.tool_calls == []
 
 

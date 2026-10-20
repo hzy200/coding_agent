@@ -76,6 +76,15 @@ def test_windows_style_root_is_normalized() -> None:
     assert ensure_inside("src/a.py", root, cwd=root) == "/mnt/d/proj/ws/src/a.py"
 
 
+def test_wsl_scheme_bypasses_msys_path_conversion() -> None:
+    assert normalize_root("wsl:/home/hong/proj") == "/home/hong/proj"
+    assert normalize_wsl("wsl:/home/hong/proj") == "/home/hong/proj"
+    assert (
+        ensure_inside("wsl:/home/hong/proj/a.py", "wsl:/home/hong/proj")
+        == "/home/hong/proj/a.py"
+    )
+
+
 def test_windows_style_child_path_is_normalized() -> None:
     assert ensure_inside("D:\\proj\\ws\\a.py", "/mnt/d/proj/ws") == "/mnt/d/proj/ws/a.py"
 

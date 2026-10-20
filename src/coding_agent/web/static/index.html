@@ -52,6 +52,16 @@
   .sep { color: var(--dim); border-top: 1px solid var(--border); padding-top: 6px;
          margin-top: 10px; }
 
+  #controls {
+    border-bottom: 1px solid var(--border); padding: 6px 14px;
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-size: 12px;
+  }
+  #controls input[type=text] { flex: 0 1 220px; padding: 5px 8px; }
+  #controls button { padding: 5px 10px; }
+  #controls select {
+    background: var(--panel); border: 1px solid var(--border); color: var(--fg);
+    padding: 5px 8px; border-radius: 4px; font: inherit;
+  }
   footer { border-top: 1px solid var(--border); padding: 10px 14px; display: flex; gap: 10px; }
   input[type=text] {
     flex: 1; background: var(--panel); border: 1px solid var(--border); color: var(--fg);
@@ -71,8 +81,25 @@
   <span class="name">CodingAgent</span>
   <span class="meta" id="health">检查中…</span>
   <span class="meta" id="thread"></span>
-  <span class="meta">变更类命令会被拒绝（无审批交互，请用 TUI）</span>
+  <span class="meta" id="state">就绪</span>
 </header>
+
+<div id="controls">
+  <button id="pause">暂停</button>
+  <button id="cancel">取消</button>
+  <select id="steer-action">
+    <option value="add">add</option>
+    <option value="replan">replan</option>
+  </select>
+  <select id="steer-role">
+    <option value="explore">explore</option>
+    <option value="review">review</option>
+    <option value="test">test</option>
+  </select>
+  <input type="text" id="steer-text" placeholder="add/replan 说明">
+  <button id="steer">发送指令</button>
+  <button id="resume">恢复</button>
+</div>
 
 <main>
   <aside>
@@ -98,8 +125,14 @@ const healthEl = document.getElementById('health');
 const threadEl = document.getElementById('thread');
 const sessionsEl = document.getElementById('sessions');
 
+const stateEl = document.getElementById('state');
+const steerActionEl = document.getElementById('steer-action');
+const steerRoleEl = document.getElementById('steer-role');
+const steerTextEl = document.getElementById('steer-text');
+
 let threadId = '';
 let busy = false;
+let pendingApprovals = [];
 
 function line(text, cls) {
   const div = document.createElement('div');
@@ -211,14 +244,81 @@ function render(ev) {
     case 'repair_started':
       line(`↻ 第 ${ev.attempt}/${ev.limit} 次修复  ${ev.summary}`, 'warn');
       break;
+    case 'approval_requested':
+      window._cur = null;
+      pendingApprovals.push(ev);
+      line(`⚠ 需要确认 [${ev.level || ''}] ${ev.tool}: ${ev.command}`, 'warn');
+      break;
+    case 'steering_applied':
+      if (ev.action === 'pause') {
+        stateEl.textContent = '已暂停';
+        line('⏸ 已暂停；点击“恢复”继续', 'warn');
+      } else {
+        line(`steering: ${ev.action}${ev.detail ? ' ' + ev.detail : ''}`, 'tool');
+      }
+      break;
+    case 'cost_report': {
+      let text = `成本 $${ev.cost_usd.toFixed(4)}`;
+      if (ev.budget_usd > 0) {
+        text += ` / 预算 $${ev.budget_usd.toFixed(2)}（${Math.round(ev.ratio * 100)}%）`;
+      }
+      if (ev.billed_usd) {
+        text += ` / 账单 $${ev.billed_usd.toFixed(4)}（差 $${ev.billing_delta_usd.toFixed(4)}）`;
+      }
+      line(text, 'tool');
+      if (ev.billing_error) line('账单对账失败：' + ev.billing_error, 'warn');
+      for (const alert of ev.alerts || []) line('⚠ ' + alert, 'warn');
+      break;
+    }
     case 'run_failed':
       window._cur = null;
+      stateEl.textContent = '失败';
       line('运行失败：' + ev.message, 'bad');
       break;
     case 'run_finished':
       window._cur = null;
       break;
   }
+}
+
+async function consumeStream(r) {
+  if (!threadId) {
+    threadId = r.headers.get('X-Thread-Id') || '';
+    threadEl.textContent = `会话 ${threadId}`;
+  }
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const frames = buf.split('\n\n');
+    buf = frames.pop();
+    for (const frame of frames) {
+      const payload = frame.replace(/^data: /, '');
+      if (payload) { try { render(JSON.parse(payload)); } catch (e) {} }
+    }
+  }
+  if (pendingApprovals.length) await answerApprovals();
+}
+
+async function answerApprovals() {
+  const approvals = pendingApprovals;
+  pendingApprovals = [];
+  const decisions = {};
+  for (const ev of approvals) {
+    decisions[ev.request_id] = window.confirm(
+      `批准 ${ev.tool}？\n${ev.command}\n${ev.reason || ''}`
+    );
+  }
+  const r = await fetch(`/api/resume/${threadId}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ decisions }),
+  });
+  if (r.ok) await consumeStream(r);
+  else line('恢复失败：' + (await r.text()), 'bad');
 }
 
 async function send() {
@@ -228,7 +328,9 @@ async function send() {
   line('你 › ' + text, 'you');
   window._answered = false;
   window._cur = null;
+  pendingApprovals = [];
   setBusy(true);
+  stateEl.textContent = '运行中…';
 
   try {
     const r = await fetch('/api/run', {
@@ -236,31 +338,56 @@ async function send() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ prompt: text, thread_id: threadId }),
     });
-    if (!threadId) {
-      threadId = r.headers.get('X-Thread-Id') || '';
-      threadEl.textContent = `会话 ${threadId}`;
-    }
-    const reader = r.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const frames = buf.split('\n\n');
-      buf = frames.pop();
-      for (const frame of frames) {
-        const payload = frame.replace(/^data: /, '');
-        if (payload) { try { render(JSON.parse(payload)); } catch (e) {} }
-      }
-    }
+    if (!r.ok) { line('请求失败：' + (await r.text()), 'bad'); return; }
+    await consumeStream(r);
   } catch (e) {
     line('请求失败：' + e, 'bad');
   } finally {
     setBusy(false);
+    if (!pendingApprovals.length && stateEl.textContent !== '已暂停') {
+      stateEl.textContent = '就绪';
+    }
     loadSessions();
   }
 }
+
+async function steer(action) {
+  if (!threadId) return;
+  const text = steerTextEl.value.trim();
+  try {
+    const r = await fetch(`/api/steer/${threadId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action,
+        text: action === 'add' || action === 'replan' ? text : '',
+        role: steerRoleEl.value,
+      }),
+    });
+    if (r.ok) line(`→ steering ${action} 已提交`, 'tool');
+    else line('steering 失败：' + (await r.text()), 'bad');
+  } catch (e) {
+    line('steering 失败：' + e, 'bad');
+  }
+}
+
+async function resumeSteering() {
+  if (!threadId) return;
+  try {
+    const r = await fetch(`/api/resume_steering/${threadId}`, { method: 'POST' });
+    if (!r.ok) { line('恢复失败：' + (await r.text()), 'bad'); return; }
+    stateEl.textContent = '运行中…';
+    await consumeStream(r);
+    if (stateEl.textContent !== '已暂停') stateEl.textContent = '就绪';
+  } catch (e) {
+    line('恢复失败：' + e, 'bad');
+  }
+}
+
+document.getElementById('pause').onclick = () => steer('pause');
+document.getElementById('cancel').onclick = () => steer('cancel');
+document.getElementById('steer').onclick = () => steer(steerActionEl.value);
+document.getElementById('resume').onclick = resumeSteering;
 
 sendBtn.onclick = send;
 promptEl.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });

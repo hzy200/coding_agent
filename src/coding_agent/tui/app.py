@@ -23,6 +23,7 @@ from coding_agent.config import Settings, get_settings
 from coding_agent.events import (
     ApprovalRequested,
     AssistantToken,
+    CostReport,
     Event,
     FileChanged,
     OrchestrationFinished,
@@ -61,6 +62,8 @@ HELP_TEXT = """\
 /undo [快照id|路径] 回滚到某次改动前（不带参数则回滚最近一次）
 /sessions [n]      列出历史会话
 /switch <会话id>   切换到某个历史会话（会载入它的对话记录）
+/fork [检查点id]   从当前（或指定 checkpoint）分叉出新会话并切换过去
+/rewind [n]        回退 n 个 checkpoint（默认 1；历史保留）
 /memory            查看项目记忆
 /remember <事实>   记下一条跨会话的项目事实
 /forget <序号>     删除第 N 条记忆
@@ -514,6 +517,19 @@ class AgentTuiApp(App[None]):
             self._flush_stream()
             self._write(f"运行失败：{event.message}", "red")
 
+        elif isinstance(event, CostReport):
+            self._flush_stream()
+            line = f"成本 ${event.cost_usd:.4f}"
+            if event.budget_usd > 0:
+                line += f" / 预算 ${event.budget_usd:.2f}（{event.ratio:.0%}）"
+            if event.billed_usd:
+                line += f" / 账单 ${event.billed_usd:.4f}（差 ${event.billing_delta_usd:+.4f}）"
+            self._write(line, "dim")
+            if event.billing_error:
+                self._write(f"账单对账失败：{event.billing_error}", "yellow")
+            for alert in event.alerts:
+                self._write(f"⚠ {alert}", "yellow")
+
         elif isinstance(event, RunFinished):
             self._flush_stream()
             if (
@@ -615,6 +631,10 @@ class AgentTuiApp(App[None]):
             self._show_sessions(rest)
         elif name == "/switch":
             self._switch_session(rest.strip())
+        elif name == "/fork":
+            self._fork(rest.strip())
+        elif name == "/rewind":
+            self._rewind(rest.strip())
         elif name == "/memory":
             self._show_memory()
         elif name == "/remember":
@@ -765,6 +785,47 @@ class AgentTuiApp(App[None]):
             return
         self._load_session(thread_id)
 
+    def _fork(self, checkpoint_id: str) -> None:
+        if self._busy:
+            self._write("（当前任务执行中，无法分叉会话）", "yellow")
+            return
+        self._fork_worker(checkpoint_id)
+
+    @work(exclusive=True)
+    async def _fork_worker(self, checkpoint_id: str) -> None:
+        try:
+            target = await self._runtime.fork(
+                self._session_id, checkpoint_id=checkpoint_id
+            )
+        except Exception as exc:  # noqa: BLE001 - 分叉失败要提示而不是崩
+            self._write(f"分叉失败：{exc}", "red")
+            return
+        self._write(f"已分叉到 {target}", "green")
+        self._load_session(target)
+
+    def _rewind(self, raw_steps: str) -> None:
+        if self._busy:
+            self._write("（当前任务执行中，无法回退会话）", "yellow")
+            return
+        try:
+            steps = max(int(raw_steps.strip() or 1), 1)
+        except ValueError:
+            self._write("用法：/rewind [回退的 checkpoint 数]", "yellow")
+            return
+        self._rewind_worker(steps)
+
+    @work(exclusive=True)
+    async def _rewind_worker(self, steps: int) -> None:
+        try:
+            checkpoint = await self._runtime.rewind(
+                self._session_id, steps=steps
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._write(f"回退失败：{exc}", "red")
+            return
+        self._write(f"已回退到新 checkpoint：{checkpoint}", "green")
+        self._load_session(self._session_id)
+
     @work(exclusive=True)
     async def _load_session(self, thread_id: str) -> None:
         self._session_id = thread_id
@@ -818,7 +879,11 @@ class AgentTuiApp(App[None]):
         except Exception as exc:  # noqa: BLE001 - 上限/写盘失败要提示而不是崩
             self._write(str(exc), "red")
             return
-        self._write(f"已记住（共 {len(facts)} 条）：{text}", "green")
+        note = ""
+        replaced = getattr(self._runtime.memory, "last_replaced", [])
+        if replaced:
+            note = "（已替换旧版本：" + "；".join(replaced) + "）"
+        self._write(f"已记住（共 {len(facts)} 条）：{text}{note}", "green")
 
     def _forget(self, raw: str) -> None:
         try:

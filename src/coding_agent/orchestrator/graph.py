@@ -69,6 +69,7 @@ def validate_tasks(
     request: str,
     max_tasks: int,
     allow_write: bool = False,
+    allow_overlap: bool = False,
 ) -> tuple[list[dict[str, Any]], bool, list[str]]:
     """把模型输出归一化为任务列表。
 
@@ -124,6 +125,22 @@ def validate_tasks(
             )
             mode = "full"
         task["depends_mode"] = mode
+        # 任务级预算：模型给的值只做归一化，真正的上限由宿主在 runner 里
+        # 与全局配置取小；非法值直接丢弃，避免把 worker 预算设成负数。
+        for budget_key in (
+            "max_repairs",
+            "max_rounds",
+            "timeout",
+            "max_tokens",
+            "priority",
+        ):
+            raw_value = task.get(budget_key)
+            if raw_value is None:
+                continue
+            try:
+                task[budget_key] = max(0, int(raw_value))
+            except (TypeError, ValueError):
+                task.pop(budget_key, None)
         raw_scope = [str(v) for v in (task.get("write_scope") or [])]
         scope = [_normalize_scope(item) for item in raw_scope]
         scope = [item for item in scope if item]
@@ -156,17 +173,18 @@ def validate_tasks(
                     "写任务必须独立，不能互相依赖"
                 )
 
-    # 并发写范围必须两两不重叠，否则合并会冲突。
-    implement = [task for task in tasks if task["role"] == "implement"]
-    for index, left in enumerate(implement):
-        for right in implement[index + 1 :]:
-            for left_scope in left.get("write_scope") or []:
-                for right_scope in right.get("write_scope") or []:
-                    if _scopes_overlap(left_scope, right_scope):
-                        errors.append(
-                            f"写范围重叠：{left['id']} {left_scope} 与 "
-                            f"{right['id']} {right_scope}"
-                        )
+    # 默认并发写范围必须两两不重叠；开启 allow_overlap 后交给 3-way 合并。
+    if not allow_overlap:
+        implement = [task for task in tasks if task["role"] == "implement"]
+        for index, left in enumerate(implement):
+            for right in implement[index + 1 :]:
+                for left_scope in left.get("write_scope") or []:
+                    for right_scope in right.get("write_scope") or []:
+                        if _scopes_overlap(left_scope, right_scope):
+                            errors.append(
+                                f"写范围重叠：{left['id']} {left_scope} 与 "
+                                f"{right['id']} {right_scope}"
+                            )
 
     if not errors and _has_cycle(tasks):
         errors.append("任务图存在环")

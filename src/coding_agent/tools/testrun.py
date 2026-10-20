@@ -436,6 +436,50 @@ def detect_test_command(
     return found
 
 
+def related_test_paths(
+    sandbox: WslSandbox,
+    root: str,
+    changed: list[str],
+) -> list[str]:
+    """从改动文件推断相关测试文件。
+
+    只做**文件名级**映射（`foo.py` → `test_foo.py` / `foo_test.py`），
+    不做 import 图分析：误判的代价是漏跑测试，所以只在能明确匹配时收窄；
+    匹配不到就返回空，让调用方退回完整验证。
+    """
+    changed_py = [
+        str(path).replace("\\", "/")
+        for path in changed
+        if str(path).endswith(".py")
+    ]
+    if not changed_py:
+        return []
+    script = (
+        "find . -type f \\( -name 'test_*.py' -o -name '*_test.py' \\) "
+        "-not -path './.agent/*' -not -path '*/__pycache__/*' "
+        "| sed 's|^\\./||' | sort"
+    )
+    result = sandbox.run(script, cwd=root)
+    if not result.ok:
+        return []
+    available = [
+        line.strip() for line in result.stdout.splitlines() if line.strip()
+    ]
+    selected: set[str] = set()
+    for path in changed_py:
+        name = path.rsplit("/", 1)[-1]
+        if name.startswith("test_") or name.endswith("_test.py"):
+            if path in available:
+                selected.add(path)
+            continue
+        stem = name[:-3]
+        wanted = {f"test_{stem}.py", f"{stem}_test.py"}
+        for candidate in available:
+            if candidate.rsplit("/", 1)[-1] in wanted:
+                selected.add(candidate)
+    return sorted(selected)[:20]
+
+
 def run_verification(
     sandbox: WslSandbox,
     root: str,
@@ -443,6 +487,7 @@ def run_verification(
     command: str = "",
     allow_manifest: bool = True,
     only: tuple[str, ...] = (),
+    full_after_selected: bool = True,
 ) -> VerifyResult:
     """执行一次验证并解析结果。
 
@@ -453,9 +498,9 @@ def run_verification(
     命令文本来自工作区文件的命令（见 `_detect`）。模型主动调 `run_tests`
     走的是默认的 True —— 那条路径有审批兜着。
 
-    `only` 是 repair 的快速通道：只重跑上次失败的 pytest 测试。**子集通过后
-    必须补跑完整命令**，否则修复可能悄悄破坏其它测试；子集失败则直接返回，
-    省掉一次完整套件的等待。
+    `only` 是 repair/影响分析的快速通道：只跑指定 pytest 测试。
+    `full_after_selected=True`（默认）时，子集通过后补跑完整命令，避免修复
+    悄悄破坏其它测试；编排写 worker 传 False，把全量验证留给合并后的主 agent。
     """
     resolved = detect_test_command(
         sandbox,
@@ -476,8 +521,8 @@ def run_verification(
 
     result = sandbox.run(effective, cwd=root)
 
-    # 只跑失败测试通过了，不能据此宣布整步通过：补跑完整套件，抓回归。
-    if scope == "selected" and result.ok:
+    # 默认补跑完整套件抓回归；编排 worker 可以把全量留给合并后的主 agent。
+    if scope == "selected" and result.ok and full_after_selected:
         effective = resolved
         scope = "full"
         result = sandbox.run(effective, cwd=root)

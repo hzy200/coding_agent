@@ -15,7 +15,7 @@ from pydantic import BaseModel, Field
 
 from coding_agent.config import Settings
 from coding_agent.sandbox.pathguard import SandboxPathError, ensure_inside
-from coding_agent.sandbox.policy import classify
+from coding_agent.sandbox.policy import CommandLevel, classify
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
 from coding_agent.tools.artifacts import ShellArtifact, pack
 
@@ -43,7 +43,12 @@ class ShellInput(BaseModel):
     )
 
 
-def build_shell_tool(settings: Settings, sandbox: WslSandbox) -> BaseTool:
+def build_shell_tool(
+    settings: Settings,
+    sandbox: WslSandbox,
+    *,
+    read_cache: dict[str, bytes] | None = None,
+) -> BaseTool:
     workspace = resolve_workspace(settings, sandbox)
 
     def _run(command: str, reason: str, cwd: str | None = None) -> str:
@@ -64,6 +69,11 @@ def build_shell_tool(settings: Settings, sandbox: WslSandbox) -> BaseTool:
             return pack(f"工作目录非法：{exc}", artifact)
 
         result = sandbox.run(command, cwd=workdir)
+        # shell 是读缓存的盲区：它绕过 SandboxFs，宿主无法知道改了哪些文件。
+        # 只要不是纯只读命令，就保守地清空整份 run 级缓存，避免后续
+        # file_read 读到 shell 修改前的旧内容。
+        if read_cache is not None and level > CommandLevel.READ:
+            read_cache.clear()
         text = f"[{level.label}] {reason}\n{result.render(settings.max_output_chars)}"
         artifact = ShellArtifact(
             command=command,

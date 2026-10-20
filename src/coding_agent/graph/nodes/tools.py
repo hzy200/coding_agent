@@ -141,6 +141,7 @@ def make_tools_node(
     delegate_runner: DelegateRunner | None = None,
     max_delegate_calls: int = 0,
     max_concurrent_agents: int = 1,
+    max_concurrent_tools: int = 4,
 ) -> Callable[[AgentState, RunnableConfig], Awaitable[dict[str, Any]]]:
     tool_map = {tool.name: tool for tool in tools}
 
@@ -153,6 +154,8 @@ def make_tools_node(
         # 整个任务是否改过东西 —— 只在收尾时用来阻止「零改动却声称完成」。
         # 必须与 dirty 分开：dirty 每步被 advance/planner 重置，存不住。
         run_dirty = bool(state.get("run_dirty"))
+        # 本次运行已改过的文件：一旦写入成功，历史里更早的 file_read 就过期了
+        stale_paths = list(state.get("stale_paths") or [])
         # 任务级委派预算：planner 归零，这里递增
         delegate_calls = int(state.get("delegate_calls", 0))
         # 成本策略：按仓库规模给出的预算，以及「只有探索步能委派」的约束。
@@ -198,7 +201,15 @@ def make_tools_node(
                 async with semaphore:
                     try:
                         sub = await runner(
-                            args=args,
+                            args={
+                                **args,
+                                # 子智能体也遵守同一批项目约定与指令
+                                "memories": state.get("memories") or [],
+                                "instructions": state.get(
+                                    "project_instructions"
+                                )
+                                or "",
+                            },
                             call_id=call_id,
                             parent_request=parent_request,
                             cwd=cwd,
@@ -238,6 +249,79 @@ def make_tools_node(
                     delegate_messages[call_id] = outcome
             delegate_calls += len(jobs)
 
+        # ---- 同一条消息里的多个只读工具并发执行 ----
+        # 写工具、未知工具与审批未通过的调用不进入这里，仍走下面的串行路径。
+        parallel_jobs: list[tuple[str, str, dict[str, Any], str]] = []
+        for call in calls:
+            name = str(call.get("name", ""))
+            call_id = str(call.get("id", ""))
+            decision = approvals.get(call_id)
+            if decision not in _EXECUTABLE or name == DELEGATE_EXPLORE:
+                continue
+            tool = tool_map.get(name)
+            if tool is None:
+                continue
+            args = dict(call.get("args", {}) or {})
+            if name in CWD_INJECTED_TOOLS and args.get("cwd") is None and state.get("cwd"):
+                args["cwd"] = state["cwd"]
+            if tool_level(name, args) != CommandLevel.READ:
+                continue
+            parallel_jobs.append((call_id, name, args, decision))
+
+        parallel_messages: dict[str, ToolMessage] = {}
+        if len(parallel_jobs) > 1:
+            tool_semaphore = asyncio.Semaphore(
+                max(1, int(max_concurrent_tools))
+            )
+
+            async def _read_only(
+                call_id: str,
+                name: str,
+                args: dict[str, Any],
+                decision: str,
+            ) -> ToolMessage:
+                async with tool_semaphore:
+                    tool = tool_map[name]
+                    try:
+                        content, artifact = unpack(
+                            await asyncio.to_thread(
+                                tool.invoke, args, config
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        content = (
+                            f"工具执行异常：{type(exc).__name__}: {exc}"
+                        )
+                        artifact = None
+                    if isinstance(artifact, dict):
+                        artifact["decision"] = decision
+                        content = pack(content, artifact)
+                    return ToolMessage(
+                        content=content,
+                        tool_call_id=call_id,
+                        name=name,
+                        artifact=artifact,
+                    )
+
+            outcomes = await asyncio.gather(
+                *(_read_only(*job) for job in parallel_jobs),
+                return_exceptions=True,
+            )
+            for (call_id, name, _args, _decision), outcome in zip(
+                parallel_jobs, outcomes, strict=True
+            ):
+                if isinstance(outcome, BaseException):
+                    parallel_messages[call_id] = ToolMessage(
+                        content=(
+                            f"工具执行异常：{type(outcome).__name__}: {outcome}"
+                        ),
+                        tool_call_id=call_id,
+                        name=name,
+                        artifact=None,
+                    )
+                else:
+                    parallel_messages[call_id] = outcome
+
         results: list[ToolMessage] = []
         for call in calls:
             name = str(call.get("name", ""))
@@ -265,6 +349,11 @@ def make_tools_node(
 
             if name in CWD_INJECTED_TOOLS and args.get("cwd") is None and state.get("cwd"):
                 args["cwd"] = state["cwd"]
+
+            precomputed = parallel_messages.get(call_id)
+            if precomputed is not None:
+                results.append(precomputed)
+                continue
 
             # 子智能体：由宿主执行，不走普通工具的 invoke 路径。
             # 它同样是 tools 节点的子分支，审批与预算检查已经在上面完成。
@@ -368,6 +457,13 @@ def make_tools_node(
                     if name == SHELL_TOOL_NAME or artifact.get("ok"):
                         dirty = True
                         run_dirty = True
+                        if name in _FILE_TOOLS:
+                            changed = str(
+                                artifact.get("path") or args.get("path") or ""
+                            )
+                            if changed and changed not in stale_paths:
+                                stale_paths.append(changed)
+                                del stale_paths[:-50]  # 只留最近 50 个
                     if name == SHELL_TOOL_NAME:
                         content += _SHELL_MUTATION_NOTE
                 content = pack(content, artifact)
@@ -385,6 +481,7 @@ def make_tools_node(
             "dirty": dirty,
             "run_dirty": run_dirty,
             "delegate_calls": delegate_calls,
+            "stale_paths": stale_paths,
         }
 
     return run_tools

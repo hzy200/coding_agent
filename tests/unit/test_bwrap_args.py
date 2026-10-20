@@ -41,6 +41,18 @@ def test_binding_extra_workspace_when_cwd_is_a_subdir() -> None:
     assert "--chdir /ws/sub" in script
 
 
+def test_network_can_be_unshared() -> None:
+    script = build_bwrap_script(
+        "curl https://example.invalid", workdir="/ws", network=False
+    )
+    assert "--unshare-net" in script
+
+
+def test_network_is_shared_by_default() -> None:
+    script = build_bwrap_script("true", workdir="/ws")
+    assert "--unshare-net" not in script
+
+
 def test_command_with_special_chars_survives_quoting() -> None:
     command = "echo 'a b' && grep -n \"x y\" f.txt"
     parts = shlex.split(build_bwrap_script(command, workdir="/ws"))

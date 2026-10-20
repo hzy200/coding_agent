@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
 from langchain_core.messages import AIMessage
 
 from coding_agent.agents.policy import RepoProfile
 from coding_agent.audit import AuditLogger, read_records
 from coding_agent.config import Settings
 from coding_agent.events import (
+    CostReport,
     OrchestrationFinished,
     RunFinished,
     TaskGraphCreated,
@@ -20,6 +22,7 @@ from coding_agent.events import (
     WorkflowSelected,
 )
 from coding_agent.graph.build import estimate_recursion_limit
+from coding_agent.llm.ratelimit import GLOBAL_LIMITER
 from coding_agent.runtime import AgentRuntime
 
 THREAD = "t-orch"
@@ -27,6 +30,9 @@ THREAD = "t-orch"
 
 class _NullMemory:
     def load(self) -> list[str]:
+        return []
+
+    def search(self, query: str = "", limit: int = 8) -> list[str]:
         return []
 
 
@@ -104,7 +110,7 @@ def test_orchestrator_events_are_translated_and_audited(tmp_path) -> None:
                 }
             ),
             _updates(
-                dispatch={
+                scheduler={
                     "worker_results": [_worker_result()],
                     "task_status": {"t1": "success"},
                     "orchestrator_round": 1,
@@ -179,7 +185,7 @@ def test_worker_tool_calls_and_merge_are_audited(tmp_path) -> None:
                 }
             ),
             _updates(
-                dispatch={
+                scheduler={
                     "worker_results": [result],
                     "task_status": {"t1": "success"},
                     "orchestrator_round": 1,
@@ -237,7 +243,7 @@ def test_task_graph_extended_is_translated_and_audited(tmp_path) -> None:
     runtime._graph = FakeGraph(
         [
             _updates(
-                extend_tasks={
+                scheduler={
                     "task_extensions_applied": [
                         {
                             "id": "ext-1",
@@ -295,11 +301,12 @@ def test_custom_worker_events_are_not_duplicated_by_the_dispatch_update(
                     "role": "explore",
                     "goal": "定位实现",
                     "attempt": 1,
+                    "queue_wait_ms": 37,
                 },
             ),
             ("custom", {"type": "worker_finished", "result": result}),
             _updates(
-                dispatch={
+                scheduler={
                     "worker_results": [result],
                     "task_status": {"t1": "success"},
                     "orchestrator_round": 1,
@@ -311,7 +318,9 @@ def test_custom_worker_events_are_not_duplicated_by_the_dispatch_update(
 
     events = _collect(runtime)
 
-    assert len([event for event in events if isinstance(event, WorkerStarted)]) == 1
+    started = [event for event in events if isinstance(event, WorkerStarted)]
+    assert len(started) == 1
+    assert started[0].queue_wait_ms == 37
     assert len([event for event in events if isinstance(event, WorkerFinished)]) == 1
     assert isinstance(events[-1], RunFinished)
     # 主 agent 的 token 与 worker token 分列，后者不会漏记
@@ -327,9 +336,79 @@ def test_estimate_recursion_limit_includes_the_orchestrator_path() -> None:
         3,
         2,
         orchestrator_enabled=True,
-        orchestrator_max_rounds=3,
+        orchestrator_max_tasks=6,
+        orchestrator_checkpoint_every=4,
     )
-    # survey/select/plan_tasks/steering_plan + 每轮
-    # dispatch/extend_tasks/steering_dispatch；
-    # 用户重规划会让轮次归零，按 (max_replans + 1) 乘一层。
-    assert orch == base + (2 + 1) * (4 + 3 * 3)
+    # 6 个任务 / 每边界 4 个 -> 2 个边界；每个边界 scheduler + gate。
+    boundaries = 2
+    assert orch == base + (2 + 1) * (6 + boundaries * 2) + 2
+
+
+def test_cost_report_includes_billing_reconciliation(
+    monkeypatch, tmp_path
+) -> None:
+    import coding_agent.runtime as runtime_module
+    from coding_agent.llm.billing import BillingResult
+
+    monkeypatch.setattr(
+        runtime_module,
+        "fetch_billing",
+        lambda settings, start, end: [
+            BillingResult(provider="provider-a", cost_usd=1.2)
+        ],
+    )
+    runtime = _runtime(
+        tmp_path,
+        billing_enabled=True,
+        rate_limit_state_path=":memory:",
+    )
+    GLOBAL_LIMITER.reset()
+    GLOBAL_LIMITER.record_usage(
+        "provider-a",
+        input_tokens=10,
+        output_tokens=5,
+        cost_usd=0.5,
+        run_id=THREAD,
+    )
+    runtime._graph = FakeGraph(
+        [_updates(respond={"messages": [AIMessage(content="完成")]})]
+    )
+
+    events = _collect(runtime)
+
+    report = next(event for event in events if isinstance(event, CostReport))
+    assert report.billed_usd == 1.2
+    assert report.billing_delta_usd == pytest.approx(0.7)
+    assert report.billing_providers["provider-a"]["cost_usd"] == 1.2
+    assert "provider 账单金额明显高于本地估算" in report.alerts
+
+
+def test_run_emits_cost_report_and_budget_alert(tmp_path) -> None:
+    runtime = _runtime(
+        tmp_path,
+        run_cost_budget_usd=1.0,
+        cost_alert_ratio=0.8,
+        rate_limit_state_path=":memory:",
+    )
+    GLOBAL_LIMITER.reset()
+    GLOBAL_LIMITER.record_usage(
+        "provider-a",
+        input_tokens=100,
+        output_tokens=50,
+        cost_usd=0.9,
+        run_id=THREAD,
+    )
+    runtime._graph = FakeGraph(
+        [_updates(respond={"messages": [AIMessage(content="完成")]})]
+    )
+
+    events = _collect(runtime)
+
+    report = next(event for event in events if isinstance(event, CostReport))
+    assert report.run_id == THREAD
+    assert report.input_tokens == 100
+    assert report.output_tokens == 50
+    assert report.cost_usd == 0.9
+    assert report.budget_usd == 1.0
+    assert report.alerts
+    assert "provider-a" in report.providers

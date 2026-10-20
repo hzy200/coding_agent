@@ -12,7 +12,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage
 
 from coding_agent.config import Settings
-from coding_agent.orchestrator import nodes as orchestrator_nodes
+from coding_agent.orchestrator import scheduler as scheduler_module
 from coding_agent.orchestrator.contracts import (
     TaskGraph,
     TaskSpec,
@@ -52,7 +52,6 @@ def _settings(**overrides) -> Settings:
         "orchestrator_min_files": 30,
         "orchestrator_max_tasks": 6,
         "orchestrator_max_concurrent_workers": 4,
-        "orchestrator_max_rounds": 3,
         "orchestrator_context_chars": 2_000,
     }
     values.update(overrides)
@@ -189,6 +188,24 @@ def test_overlapping_write_scopes_are_rejected() -> None:
     )
     assert degraded is True
     assert any("写范围重叠" in error for error in errors)
+
+
+def test_overlapping_write_scopes_are_allowed_for_three_way_merge() -> None:
+    tasks, degraded, errors = validate_tasks(
+        [
+            TaskSpec(id="t1", role="implement", goal="a", write_scope=["app/"]),
+            TaskSpec(
+                id="t2", role="implement", goal="b", write_scope=["app/a.py"]
+            ),
+        ],
+        request="r",
+        max_tasks=6,
+        allow_write=True,
+        allow_overlap=True,
+    )
+    assert degraded is False
+    assert errors == []
+    assert len(tasks) == 2
 
 
 def test_implement_tasks_cannot_depend_on_each_other() -> None:
@@ -738,6 +755,27 @@ def test_plan_tasks_validates_and_initializes_status() -> None:
     assert out["orchestrator_degraded"] is False
 
 
+def test_plan_tasks_attaches_repo_map_to_each_task() -> None:
+    graph = TaskGraph(
+        tasks=[TaskSpec(id="t1", role="explore", goal="定位实现")]
+    )
+    node = make_plan_tasks_node(_StructuredLLM(_Structured(graph)), _settings())
+    out = _run(
+        node(
+            {
+                "messages": [HumanMessage(content="改功能")],
+                "repo_summary": {
+                    "file_count": 50,
+                    "repo_map": "app/main.py: def main",
+                },
+            },
+            None,
+        )
+    )
+
+    assert out["tasks"][0]["repo_map"] == "app/main.py: def main"
+
+
 def test_plan_tasks_write_mode_falls_back_to_one_implement_task() -> None:
     node = make_plan_tasks_node(
         _StructuredLLM(_Structured(error=RuntimeError("boom"))),
@@ -946,14 +984,11 @@ def test_dispatch_retries_a_failed_task_before_blocking_dependents() -> None:
         "orchestrator_round": 0,
     }
 
-    first = _run(node(state, None))
-    assert first["task_status"]["t1"] == "pending"
-    assert first["task_attempts"] == {"t1": 1}
-
-    second = _run(node({**state, **first}, None))
-    assert second["task_status"]["t1"] == "success"
-    assert second["task_attempts"] == {"t1": 2}
-    assert [r["attempt"] for r in second["worker_results"]] == [1, 2]
+    # scheduler 在同一个节点内完成重试，不再需要调用方再进一轮。
+    out = _run(node(state, None))
+    assert out["task_status"]["t1"] == "success"
+    assert out["task_attempts"] == {"t1": 2}
+    assert [r["attempt"] for r in out["worker_results"]] == [1, 2]
 
 
 def test_failed_task_without_retries_blocks_dependents() -> None:
@@ -1141,7 +1176,7 @@ def test_dispatch_streams_worker_started_before_the_worker_finishes(
     runner_ended = 0.0
 
     monkeypatch.setattr(
-        orchestrator_nodes,
+        scheduler_module,
         "get_stream_writer",
         lambda: (lambda payload: emitted.append((time.perf_counter(), payload))),
     )
@@ -1264,7 +1299,7 @@ def test_dispatch_marks_a_conflicting_patch_failed() -> None:
     assert out["worker_results"][0]["merged"] is False
     assert out["worker_results"][0]["merge_error"]
     assert out["task_status"]["t1"] == "failed"
-    assert "dirty" not in out
+    assert not out.get("dirty")
 
 
 def test_synthesize_marks_merged_implement_tasks() -> None:
@@ -1301,23 +1336,27 @@ def test_implement_scope_helper() -> None:
     assert _within_scope("app2/x.py", ["app"]) is False
 
 
-def test_dispatch_marks_pending_blocked_after_max_rounds() -> None:
-    node = make_dispatch_node(
-        worker_runner=None,  # type: ignore[arg-type]
-        settings=_settings(orchestrator_max_rounds=1),
-    )
-    out = _run(
-        node(
-            {
-                "messages": [HumanMessage(content="r")],
-                "tasks": [{"id": "t1", "role": "explore", "goal": "a"}],
-                "task_status": {"t1": "pending"},
-                "orchestrator_round": 1,
-            },
-            None,
+def test_peer_dependency_failure_does_not_consume_repairs() -> None:
+    from coding_agent.orchestrator.implement import _peer_dependency_failure
+
+    verification = {
+        "output_tail": (
+            "ImportError: cannot import name 'double' from 'pkg.m2'"
+        ),
+        "issues": [],
+    }
+    assert (
+        _peer_dependency_failure(
+            verification, ["pkg/m1.py"], ["pkg/m1.py"]
         )
+        is True
     )
-    assert out["task_status"] == {"t1": "blocked"}
+    assert (
+        _peer_dependency_failure(
+            verification, ["pkg/m2.py"], ["pkg/m2.py"]
+        )
+        is False
+    )
 
 
 def test_synthesize_blocks_dependents_and_counts() -> None:
@@ -1367,7 +1406,7 @@ def test_orchestrator_routing() -> None:
     assert route_after_select({"workflow": "parallel_readonly"}) == "plan_tasks"
     assert route_after_select({"workflow": "orchestrated_implement"}) == "plan_tasks"
     assert route_after_select({"workflow": "direct"}) == "planner"
-    route = make_route_after_dispatch(_settings(orchestrator_max_rounds=2))
+    route = make_route_after_dispatch(_settings())
     assert (
         route(
             {

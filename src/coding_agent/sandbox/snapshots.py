@@ -113,6 +113,36 @@ class SnapshotStore:
             self._write(snapshot_id, f"{relpath}{ABSENT_SUFFIX}", "")
         return snapshot_id
 
+    def save_many(
+        self, items: list[tuple[str, str, bool]]
+    ) -> list[str]:
+        """批量留底：所有快照文件一次 `write_many` 落盘。
+
+        `items` 是 `(path, original, existed)`。返回与输入顺序对齐的
+        snapshot_id 列表；某个文件写失败时整体抛错，不返回半套 ID。
+        """
+        if not items:
+            return []
+        files: dict[str, str] = {}
+        snapshot_ids: list[str] = []
+        for path, original, existed in items:
+            snapshot_id = _new_snapshot_id()
+            relpath = _relpath(path, self.root)
+            files[
+                posixpath.join(self.backup_root, snapshot_id, relpath)
+            ] = original
+            if not existed:
+                files[
+                    posixpath.join(
+                        self.backup_root,
+                        snapshot_id,
+                        f"{relpath}{ABSENT_SUFFIX}",
+                    )
+                ] = ""
+            snapshot_ids.append(snapshot_id)
+        self._fs.write_many(files)
+        return snapshot_ids
+
     def was_absent(self, entry: SnapshotEntry) -> bool:
         """这份留底是否代表「当时文件不存在」。"""
         marker = posixpath.join(

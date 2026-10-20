@@ -122,14 +122,32 @@ agent run --thread-id <id> "继续"
 
 会话存在 SQLite 里，跨进程可恢复。TUI 里 `/sessions` `/switch <id>`。
 
+需要试另一条路时，从历史 checkpoint 分叉，原会话不受影响：
+
+```bash
+agent checkpoints --thread-id <id>     # 看可选的 checkpoint
+agent fork --thread-id <id>            # 从当前状态分叉（也可 -c <checkpoint>）
+agent rewind --thread-id <id> -n 1     # 回退 1 个 checkpoint
+```
+
+回退是在旧 checkpoint 上新建分支，历史不会被删除，误操作还能找回。
+TUI 里对应 `/fork` `/rewind [n]`。checkpoint 默认每个会话保留 200 个
+（`AGENT_CHECKPOINT_KEEP`），超出后自动轮转。
+
 ### 记住项目约定
 
 ```bash
 agent memory --add "这个仓库用 uv 管理依赖，不要用 pip"
 ```
 
-写进 `<工作区>/.agent/memory.md`，每次运行注入系统提示。也可以直接编辑那个文件。
+写进 `<工作区>/.agent/memory.md`，每次运行按请求相关度注入 top-K 条。
+也可以直接编辑那个文件；来源/时间/过期信息在 `.agent/memory.meta.json`。
+写入会拒绝疑似密钥，相似的新事实会替换旧版本。模型在运行中可用
+`memory_search` 检索，`--write` 会话可用 `memory_save` 写入带 TTL 的记忆。
 TUI 里 `/remember` `/memory` `/forget`。
+
+仓库里的 `AGENTS.md` / `CLAUDE.md` 会作为分层指令单独注入（最多 4 层），
+与长期记忆分开维护。
 
 ### 查审计
 

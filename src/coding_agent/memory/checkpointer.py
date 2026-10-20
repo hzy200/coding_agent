@@ -53,6 +53,56 @@ class CheckpointStore:
         await self.saver.setup()
         return self.saver
 
+    async def aprune(self, thread_id: str, keep: int) -> int:
+        """只保留某个 thread 最近 `keep` 个 checkpoint，返回删除条数。
+
+        多进程/多前端长期使用同一个 thread 时，checkpoint 会无限增长：
+        每轮工具调用都会落一个，SQLite 文件和恢复耗时都会持续变大。
+        `keep<=0` 表示不限制。
+
+        按 `checkpoint_id` 排序：LangGraph 使用单调递增的 UUIDv6，
+        字符串序等价于时间序。checkpoint 被删时对应 writes 一并清理，
+        否则会留下永远读不到的孤儿行。
+        """
+        if not self.persistent or self._connection is None or keep <= 0:
+            return 0
+        cursor = await self._connection.execute(
+            """
+            DELETE FROM writes AS w
+            WHERE w.thread_id = ? AND NOT EXISTS (
+                SELECT 1 FROM checkpoints AS c
+                WHERE c.thread_id = w.thread_id
+                  AND c.checkpoint_ns = w.checkpoint_ns
+                  AND c.checkpoint_id = w.checkpoint_id
+                  AND c.checkpoint_id IN (
+                      SELECT c2.checkpoint_id FROM checkpoints AS c2
+                      WHERE c2.thread_id = w.thread_id
+                        AND c2.checkpoint_ns = w.checkpoint_ns
+                      ORDER BY c2.checkpoint_id DESC LIMIT ?
+                  )
+            )
+            """,
+            (thread_id, keep),
+        )
+        removed = cursor.rowcount
+        await self._connection.execute(
+            """
+            DELETE FROM checkpoints AS c
+            WHERE c.thread_id = ? AND NOT EXISTS (
+                SELECT 1 FROM (
+                    SELECT c2.checkpoint_id FROM checkpoints AS c2
+                    WHERE c2.thread_id = c.thread_id
+                      AND c2.checkpoint_ns = c.checkpoint_ns
+                    ORDER BY c2.checkpoint_id DESC LIMIT ?
+                ) AS kept
+                WHERE kept.checkpoint_id = c.checkpoint_id
+            )
+            """,
+            (thread_id, keep),
+        )
+        await self._connection.commit()
+        return max(removed, 0)
+
     async def aclose(self) -> None:
         # 每次写入都已 commit，所以异常退出也不会丢已落盘的 checkpoint
         if self._connection is not None:

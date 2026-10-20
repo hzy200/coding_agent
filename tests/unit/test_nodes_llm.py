@@ -15,7 +15,7 @@ import asyncio
 from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from coding_agent.graph.nodes.act import make_act_node
 from coding_agent.graph.nodes.planner import TaskPlan, make_planner_node
@@ -27,6 +27,7 @@ from coding_agent.graph.nodes.respond import (
     make_respond_node,
 )
 from coding_agent.graph.plan import PlanStepModel
+from coding_agent.llm.context import ContextBudget
 from coding_agent.llm.prompts import (
     DELEGATION_NOTE,
     DELEGATION_NOTE_DISABLED,
@@ -576,3 +577,68 @@ def test_respond_never_loses_the_failure_note(retry: int) -> None:
         _respond_state(verification={"status": "failed"}, retry=retry), None
     )
     assert "失败了" in llm.seen[0].content
+
+
+# ---------------- context-length 400 降档 ----------------
+
+
+class _ContextBoomLLM:
+    """第一次调用返回 context-length 400，之后正常。"""
+
+    def __init__(self) -> None:
+        self.seen: list[Any] = []
+
+    async def ainvoke(self, messages: Any, config: Any = None) -> AIMessage:
+        self.seen.append(messages)
+        if len(self.seen) == 1:
+            raise RuntimeError("Error code: 400 - context_length_exceeded")
+        return AIMessage(content="ok")
+
+
+def _big_history() -> list[Any]:
+    return [
+        HumanMessage(content="干活"),
+        AIMessage(
+            content="",
+            tool_calls=[{"name": "file_read", "args": {"path": "a.py"}, "id": "c1"}],
+        ),
+        ToolMessage(content="x" * 5_000, tool_call_id="c1", name="file_read"),
+    ]
+
+
+def _seen_chars(messages: list[Any]) -> int:
+    return sum(len(str(getattr(m, "content", ""))) for m in messages)
+
+
+def test_act_retries_with_tighter_budget_on_context_400() -> None:
+    llm = _ContextBoomLLM()
+    budget = ContextBudget(max_chars=6_000, keep_recent=12, tool_chars=100)
+    out = _sync(make_act_node(llm, max_tool_rounds=5, budget=budget))(
+        {
+            "messages": _big_history(),
+            "plan": ["干活"],
+            "plan_kinds": ["implement"],
+            "step_idx": 0,
+            "tool_rounds": 0,
+        },
+        None,
+    )
+
+    assert out["messages"][0].content == "ok"
+    assert len(llm.seen) == 2
+    # 第二次请求必须比第一次更小 —— 否则「降档」只是重发同一个超长请求
+    assert _seen_chars(llm.seen[1]) < _seen_chars(llm.seen[0])
+    assert out["context_trim"]["after_chars"] <= 600
+
+
+def test_respond_retries_with_tighter_budget_on_context_400() -> None:
+    llm = _ContextBoomLLM()
+    budget = ContextBudget(max_chars=6_000, keep_recent=12, tool_chars=100)
+    out = _sync(make_respond_node(llm, budget=budget))(
+        {"messages": _big_history(), "plan": ["干活"]}, None
+    )
+
+    assert out["messages"][0].content == "ok"
+    assert len(llm.seen) == 2
+    assert _seen_chars(llm.seen[1]) < _seen_chars(llm.seen[0])
+    assert out["context_trim"]["after_chars"] <= 600

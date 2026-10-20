@@ -281,6 +281,42 @@ class OrchestrationFinished(Event):
     summary: str = ""
 
 
+class ContextTrimmed(Event):
+    """一次 act/respond 的上下文裁剪报告。"""
+
+    type: Literal["context_trimmed"] = "context_trimmed"
+    node: str = ""
+    trimmed: int = 0
+    before_chars: int = 0
+    after_chars: int = 0
+    before_tokens: int = 0
+    after_tokens: int = 0
+    escalated: bool = False
+
+
+class CostReport(Event):
+    """一次 run 的成本对账与预算告警。"""
+
+    type: Literal["cost_report"] = "cost_report"
+    run_id: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
+    budget_usd: float = 0.0
+    ratio: float = 0.0
+    billed_usd: float = 0.0
+    billing_delta_usd: float = 0.0
+    billing_error: str = ""
+    alerts: list[str] = Field(default_factory=list)
+    # provider prefix cache：命中/未命中 token；未回报的 provider 记 0。
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
+    providers: dict[str, dict[str, float]] = Field(default_factory=dict)
+    billing_providers: dict[str, dict[str, float]] = Field(
+        default_factory=dict
+    )
+
+
 class SubAgentFinished(Event):
     """子智能体结束。
 
@@ -413,6 +449,8 @@ EventType = (
     | SubAgentFinished
     | WorkflowRevised
     | SteeringApplied
+    | ContextTrimmed
+    | CostReport
     | ApprovalRequested
     | RunStarted
     | RunFinished

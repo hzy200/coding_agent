@@ -15,9 +15,12 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 
 from coding_agent.agents.explore import DelegateRunner
+from coding_agent.instructions import load_project_instructions
+from coding_agent.memory.longterm import LongTermMemory
 from coding_agent.orchestrator.contracts import WorkerResult
 from coding_agent.orchestrator.implement import ImplementRunner
 from coding_agent.orchestrator.retry import format_retry_context
+from coding_agent.sandbox.fs import SandboxFs
 from coding_agent.sandbox.wsl_exec import WslSandbox
 from coding_agent.tools.testrun import run_verification
 
@@ -31,7 +34,31 @@ def make_worker_runner(
     implement_runner: ImplementRunner | None = None,
     sandbox: WslSandbox,
     root: str,
+    memory_top_k: int = 8,
 ) -> WorkerRunner:
+    # 并发 worker 共享同一份记忆读取；只读文件，不持有业务状态
+    memory = LongTermMemory(SandboxFs(sandbox, root), root)
+    # 指令加载要起一次 WSL `find`：延迟到第一次真正跑 worker 时再做，
+    # 纯 direct 会话不为编排功能付启动成本。
+    instructions_cache: list[str] = []
+
+    def _instructions() -> str:
+        if not instructions_cache:
+            try:
+                text = load_project_instructions(sandbox, root)
+            except Exception:  # noqa: BLE001 - 指令读取失败不阻断 worker
+                text = ""
+            instructions_cache.append(text)
+        return instructions_cache[0]
+
+    def _memories(task: dict[str, Any], parent_request: str) -> list[str]:
+        """按任务目标筛 top-K；记忆读取失败不能阻断 worker。"""
+        query = f"{task.get('goal', '')}\n{parent_request}"
+        try:
+            return memory.search(query, memory_top_k)
+        except Exception:  # noqa: BLE001 - 记忆是增强信息，不是执行前提
+            return []
+
     async def run(
         task: dict[str, Any],
         *,
@@ -45,6 +72,7 @@ def make_worker_runner(
         goal = str(task.get("goal", ""))
         retry_note = format_retry_context(task)
         worker_id = f"{role}:{task_id}"
+        memories = _memories(task, parent_request)
 
         if role in {"explore", "review"}:
             runner = explore_runner if role == "explore" else review_runner
@@ -61,6 +89,9 @@ def make_worker_runner(
                 args={
                     "goal": f"{goal}\n{retry_note}" if retry_note else goal,
                     "paths": list(task.get("inputs") or []),
+                    "repo_map": str(task.get("repo_map") or ""),
+                    "memories": memories,
+                    "instructions": _instructions(),
                     "reason": f"编排器派发的只读 {role} 任务",
                 },
                 call_id=task_id,
@@ -82,6 +113,13 @@ def make_worker_runner(
                 input_tokens=artifact.input_tokens,
                 output_tokens=artifact.output_tokens,
                 duration_ms=artifact.duration_ms,
+                llm_ms=artifact.llm_ms,
+                tool_ms=artifact.tool_ms,
+                timed_out=artifact.timed_out,
+                budget_used={
+                    "input_tokens": artifact.input_tokens,
+                    "output_tokens": artifact.output_tokens,
+                },
             )
 
         if role == "implement":
@@ -100,6 +138,8 @@ def make_worker_runner(
                 cwd=cwd,
                 config=config,
                 cancel=cancel,
+                memories=memories,
+                instructions=_instructions(),
             )
 
         if role == "test":

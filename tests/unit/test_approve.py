@@ -27,6 +27,7 @@ from coding_agent.sandbox.policy import (
     DENY,
     CommandLevel,
     SessionPolicy,
+    parse_allow_rules,
 )
 from coding_agent.tools.artifacts import ShellArtifact, pack
 
@@ -64,6 +65,45 @@ def test_low_write_never_prompts() -> None:
     assert policy.decide(CommandLevel.LOW_WRITE) == AUTO
 
 
+def test_allow_rule_matches_only_the_configured_call() -> None:
+    policy = SessionPolicy(
+        approval_mode=APPROVAL_ASK,
+        allow_rules=parse_allow_rules("shell_exec:git status*"),
+    )
+
+    assert (
+        policy.decide_call(
+            "shell_exec", {"command": "git status --short"}, CommandLevel.MUTATE
+        )
+        == AUTO
+    )
+    assert (
+        policy.decide_call(
+            "shell_exec", {"command": "git push"}, CommandLevel.MUTATE
+        )
+        == ASK
+    )
+
+
+def test_allow_rule_does_not_bypass_danger_or_deny_mode() -> None:
+    rules = parse_allow_rules("shell_exec:*")
+    ask_policy = SessionPolicy(approval_mode=APPROVAL_ASK, allow_rules=rules)
+    deny_policy = SessionPolicy(approval_mode=APPROVAL_DENY, allow_rules=rules)
+
+    assert (
+        ask_policy.decide_call(
+            "shell_exec", {"command": "rm -rf /"}, CommandLevel.DANGER
+        )
+        == ASK
+    )
+    assert (
+        deny_policy.decide_call(
+            "shell_exec", {"command": "git status"}, CommandLevel.MUTATE
+        )
+        == DENY
+    )
+
+
 # ---------------- tool_level ----------------
 
 def test_shell_level_comes_from_command() -> None:
@@ -77,6 +117,22 @@ def test_file_tools_are_governed_by_write_flag() -> None:
     assert tool_level("file_read", {"path": "a"}) is CommandLevel.READ
     assert tool_level("file_write", {"path": "a"}) is CommandLevel.LOW_WRITE
     assert tool_level("file_edit", {"path": "a"}) is CommandLevel.LOW_WRITE
+
+
+def test_symbol_search_is_read_only() -> None:
+    assert (
+        tool_level("symbol_search", {"query": "DiscountService"})
+        is CommandLevel.READ
+    )
+
+
+def test_code_intel_is_read_only() -> None:
+    assert (
+        tool_level(
+            "code_intel", {"action": "definition", "path": "app.py"}
+        )
+        is CommandLevel.READ
+    )
 
 
 def test_unregistered_tool_fails_closed() -> None:

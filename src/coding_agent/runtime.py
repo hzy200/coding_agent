@@ -10,11 +10,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import posixpath
+import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
@@ -32,6 +35,8 @@ from coding_agent.diffing import unified_diff
 from coding_agent.events import (
     ApprovalRequested,
     AssistantToken,
+    ContextTrimmed,
+    CostReport,
     Event,
     FileChanged,
     OrchestrationFinished,
@@ -59,13 +64,21 @@ from coding_agent.events import (
 )
 from coding_agent.graph.build import build_graph, estimate_recursion_limit
 from coding_agent.graph.nodes.approve import tool_level
+from coding_agent.llm.billing import fetch_billing
+from coding_agent.llm.ratelimit import GLOBAL_LIMITER
 from coding_agent.memory.checkpointer import CheckpointStore
 from coding_agent.memory.longterm import LongTermMemory
 from coding_agent.memory.sessions import SessionIndex
 from coding_agent.messages import text_of
 from coding_agent.sandbox.fs import SandboxFs
 from coding_agent.sandbox.pathguard import normalize_root
-from coding_agent.sandbox.policy import APPROVED, DENIED, SessionPolicy, classify
+from coding_agent.sandbox.policy import (
+    APPROVED,
+    DENIED,
+    SessionPolicy,
+    classify,
+    parse_allow_rules,
+)
 from coding_agent.sandbox.snapshots import (
     ACTION_RESTORE,
     RestoreResult,
@@ -192,17 +205,19 @@ class AgentRuntime:
         approval_mode: str | None = None,
     ) -> None:
         self.settings = settings or get_settings()
+        GLOBAL_LIMITER.configure(self.settings.resolved_rate_limit_state_path)
         self.allow_write = allow_write
         self.policy = SessionPolicy(
             allow_write=allow_write,
             approval_mode=approval_mode or self.settings.approval_mode,
+            allow_rules=parse_allow_rules(self.settings.allow_rules),
         )
         self._sandbox = WslSandbox(self.settings)
         self._workspace = normalize_root(workspace) if workspace else None
         self._graph: Any = None
         # Phase 3D：用户干预队列。图节点与 runtime 共用同一实例；
         # 不放进 state —— 它是外部输入，且 worker 需要在运行中非破坏性轮询。
-        self.steering = SteeringController()
+        self.steering = SteeringController(self.settings.resolved_steering_dir)
         # 仓库画像每个 runtime 只探一次；工作区在本实例生命周期内固定。
         self._repo_profile_cache: RepoProfile | None = None
         self._snapshots: SnapshotStore | None = None
@@ -292,7 +307,7 @@ class AgentRuntime:
         return SessionIndex(self.settings.resolved_audit_dir)
 
     def remember(self, text: str) -> list[str]:
-        return self.memory.add(text)
+        return self.memory.add(text, source="user")
 
     def forget(self, index: int) -> list[str]:
         return self.memory.remove(index)
@@ -300,11 +315,20 @@ class AgentRuntime:
     def memories(self) -> list[str]:
         return self.memory.load()
 
-    async def history(self, thread_id: str) -> list[HistoryMessage]:
+    async def history(
+        self,
+        thread_id: str,
+        *,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[HistoryMessage]:
         """从 checkpoint 还原某个会话的对话（供 `/switch` 展示）。
 
         只取人和助手的自然语言往来；工具调用与工具结果不展示 ——
         它们是过程噪声，重新渲染只会淹没真正的对话。
+
+        `limit`/`offset` 对**过滤后的对话**分页（按时间正序），长会话前端
+        不必一次拉回全部历史；`limit=None` 保持旧行为。
 
         刻意**直读 checkpoint 而不建图**：回放历史不该要求 API Key 或可用的沙箱
         （`_ensure_graph` 会拉起 `build_llm` 与 WSL 探测）。
@@ -330,7 +354,137 @@ class AgentRuntime:
                 text = text_of(message)
                 if text.strip():
                     history.append(HistoryMessage("assistant", text))
+        offset = max(0, int(offset))
+        if offset:
+            history = history[offset:]
+        if limit is not None:
+            history = history[: max(0, int(limit))]
         return history
+
+    async def checkpoints(
+        self, thread_id: str, *, limit: int = 20
+    ) -> list[dict[str, Any]]:
+        """列出会话的 checkpoint（新的在前），供 fork/rewind 选择落点。
+
+        直读 checkpointer 的 `alist`，不建图：列个历史不该要求 API Key
+        或可用的沙箱（与 `history()` 同一考虑）。
+        """
+        saver = await self._checkpointer()
+        config = {"configurable": {"thread_id": thread_id}}
+        found: list[dict[str, Any]] = []
+        async for item in saver.alist(config, limit=limit or None):
+            checkpoint = getattr(item, "checkpoint", None) or {}
+            metadata = getattr(item, "metadata", None) or {}
+            values = checkpoint.get("channel_values") or {}
+            preview = ""
+            for message in reversed(values.get("messages") or []):
+                if isinstance(message, (HumanMessage, AIMessage)):
+                    text = text_of(message).strip()
+                    if text:
+                        preview = " ".join(text.split())[:120]
+                        break
+            found.append(
+                {
+                    "checkpoint_id": str(checkpoint.get("id", "")),
+                    "step": int(metadata.get("step", 0) or 0),
+                    "created_at": str(metadata.get("created_at", "")),
+                    "preview": preview,
+                }
+            )
+            if limit > 0 and len(found) >= limit:
+                break
+        return found
+
+    async def _resolve_snapshot(
+        self,
+        graph: Any,
+        thread_id: str,
+        *,
+        checkpoint_id: str = "",
+        steps: int = 1,
+    ) -> Any:
+        config = {"configurable": {"thread_id": thread_id}}
+        if not checkpoint_id:
+            if steps <= 0:
+                return await graph.aget_state(config)
+            index = 0
+            async for snapshot in graph.aget_state_history(config):
+                if index == steps:
+                    return snapshot
+                index += 1
+            raise ValueError(
+                f"会话 {thread_id} 没有第 {steps} 个历史 checkpoint。"
+            )
+        async for snapshot in graph.aget_state_history(config):
+            found = (
+                (getattr(snapshot, "config", {}) or {})
+                .get("configurable", {})
+                .get("checkpoint_id", "")
+            )
+            if str(found) == checkpoint_id:
+                return snapshot
+        raise ValueError(f"找不到 checkpoint：{checkpoint_id}")
+
+    async def fork(
+        self,
+        thread_id: str,
+        *,
+        checkpoint_id: str = "",
+        new_thread_id: str = "",
+    ) -> str:
+        """从当前或指定 checkpoint 分叉出一个新会话，返回新 thread_id。
+
+        分叉复制的是**状态值**（消息、计划等），原会话不受影响。
+        """
+        graph = await self._ensure_graph()
+        source = await self._resolve_snapshot(
+            graph, thread_id, checkpoint_id=checkpoint_id, steps=0
+        )
+        target = new_thread_id.strip() or (
+            f"{thread_id}-fork-{uuid4().hex[:8]}"
+        )
+        await graph.aupdate_state(
+            {"configurable": {"thread_id": target}},
+            dict(getattr(source, "values", None) or {}),
+            as_node=None,
+        )
+        return target
+
+    async def rewind(
+        self,
+        thread_id: str,
+        *,
+        checkpoint_id: str = "",
+        steps: int = 1,
+    ) -> str:
+        """把会话回退到更早的 checkpoint（默认退一步），返回新 checkpoint id。
+
+        实现方式是**在回退点上新建一个分支**，历史记录不会被删除 ——
+        误回退时仍可通过 checkpoint id 找回来。
+        """
+        graph = await self._ensure_graph()
+        target = await self._resolve_snapshot(
+            graph, thread_id, checkpoint_id=checkpoint_id, steps=steps
+        )
+        updated = await graph.aupdate_state(
+            target.config, {}, as_node=None
+        )
+        return str(
+            (updated or {}).get("configurable", {}).get("checkpoint_id", "")
+        )
+
+    async def _prune_checkpoints(self, thread_id: str) -> None:
+        """按 `checkpoint_keep` 轮转当前 thread 的 checkpoint。
+
+        失败只影响磁盘占用，不能影响已经完成的这一轮 —— 因此静默吞掉。
+        """
+        keep = int(getattr(self.settings, "checkpoint_keep", 0) or 0)
+        if keep <= 0 or self._store is None or not self._store.persistent:
+            return
+        try:
+            await self._store.aprune(thread_id, keep)
+        except Exception:  # noqa: BLE001 - 轮转是维护动作，不阻断会话
+            pass
 
     @property
     def persistent(self) -> bool:
@@ -410,7 +564,7 @@ class AgentRuntime:
         # 读记忆（工作区 `.agent/memory.md`）需要沙箱；失败也必须以事件收尾，
         # 否则异常会在生成器第一步裸抛给前端（CLI 会以 traceback 收场）。
         try:
-            memories = self.memories()
+            memories = self.memory.search(prompt, self.settings.memory_top_k)
         except Exception as exc:  # noqa: BLE001 - 启动即失败同样是编排层错误
             detail = f"{type(exc).__name__}: {exc}"
             try:
@@ -427,6 +581,18 @@ class AgentRuntime:
             self._forget_thread(thread_id)
             yield RunFailed(message=detail)
             return
+
+        # 分层项目指令是增强信息：发现失败（沙箱不可用、find 缺失）不影响运行
+        instructions = ""
+        if self.settings.instructions_enabled:
+            try:
+                from coding_agent.instructions import load_project_instructions
+
+                instructions = load_project_instructions(
+                    self._sandbox, self.workspace
+                )
+            except Exception:  # noqa: BLE001 - 指令加载失败不应阻断任务
+                instructions = ""
 
         # 成本策略 / 编排策略都需要仓库画像；只开启其中任一功能时才探一次。
         profile = (
@@ -452,9 +618,12 @@ class AgentRuntime:
             "budget_exhausted": False,
             "dirty": False,
             "run_dirty": False,
+            # 本轮改过的文件会累积到这里，act 据此提醒「旧读取已过期」
+            "stale_paths": [],
             "approvals": {},
             # 每轮都从文件重新读：会话中途 /remember 加的事实应当立刻生效
             "memories": memories,
+            "project_instructions": instructions,
             "repo_profile": {
                 "file_count": profile.file_count,
                 "test_file_count": profile.test_file_count,
@@ -591,6 +760,8 @@ class AgentRuntime:
         self, payload: Any, *, thread_id: str, fresh_run: bool, prompt: str = ""
     ) -> AsyncIterator[Event]:
         settings = self.settings
+        run_started_at = time.time()
+        GLOBAL_LIMITER.start_run(thread_id)
         config = {
             "configurable": {"thread_id": thread_id},
             # 按图拓扑推导，别再把系数算歪（见 estimate_recursion_limit）
@@ -600,8 +771,10 @@ class AgentRuntime:
                 settings.max_repair_rounds,
                 settings.max_replans,
                 orchestrator_enabled=settings.orchestrator_enabled,
-                orchestrator_max_rounds=settings.orchestrator_max_rounds,
-                orchestrator_subgraph=settings.orchestrator_subgraph_enabled,
+                orchestrator_max_tasks=settings.orchestrator_max_tasks,
+                orchestrator_checkpoint_every=(
+                    settings.orchestrator_checkpoint_every
+                ),
             ),
             # 这些会随 trace 一起上报，LangSmith 里可按会话/工作区/权限筛选
             "run_name": f"agent:{thread_id}",
@@ -706,6 +879,9 @@ class AgentRuntime:
                                 role=str(payload_data.get("role", "")),
                                 goal=str(payload_data.get("goal", "")),
                                 attempt=int(payload_data.get("attempt", 1)),
+                                queue_wait_ms=int(
+                                    payload_data.get("queue_wait_ms") or 0
+                                ),
                             )
                     elif kind == "worker_finished":
                         result = payload_data.get("result") or {}
@@ -755,6 +931,26 @@ class AgentRuntime:
                 for node, update in data.items():
                     if not isinstance(update, dict):
                         continue
+
+                    trim = update.get("context_trim")
+                    if isinstance(trim, dict):
+                        yield ContextTrimmed(
+                            node=str(trim.get("node") or node),
+                            trimmed=int(trim.get("trimmed", 0) or 0),
+                            before_chars=int(
+                                trim.get("before_chars", 0) or 0
+                            ),
+                            after_chars=int(
+                                trim.get("after_chars", 0) or 0
+                            ),
+                            before_tokens=int(
+                                trim.get("before_tokens", 0) or 0
+                            ),
+                            after_tokens=int(
+                                trim.get("after_tokens", 0) or 0
+                            ),
+                            escalated=bool(trim.get("escalated")),
+                        )
 
                     # Phase 3D：四个 steering 消费点共用同一套事件载荷。
                     if node.startswith("steering"):
@@ -851,36 +1047,7 @@ class AgentRuntime:
                                 reason=revised_reason, tasks=tasks
                             )
 
-                    elif node == "extend_tasks":
-                        added = update.get("task_extensions_applied") or []
-                        rejected = update.get("task_extension_errors") or []
-                        if added or rejected:
-                            if added:
-                                self._audit(
-                                    AuditRecord(
-                                        ts=now_iso(),
-                                        kind=audit_models.TASK_GRAPH,
-                                        thread_id=thread_id,
-                                        workflow=progress.get("workflow"),
-                                        steps=[
-                                            str(task.get("goal", ""))
-                                            for task in added
-                                        ],
-                                        detail=(
-                                            f"运行中扩展 {len(added)} 个只读任务"
-                                            + (
-                                                f"；拒绝 {len(rejected)} 个"
-                                                if rejected
-                                                else ""
-                                            )
-                                        ),
-                                    )
-                                )
-                            yield TaskGraphExtended(
-                                added=added, rejected=rejected
-                            )
-
-                    elif node in {"dispatch", "scheduler"}:
+                    elif node == "scheduler":
                         results = update.get("worker_results") or []
                         emitted = int(progress.get("workers_emitted", 0))
                         fresh = results[emitted:]
@@ -1208,6 +1375,7 @@ class AgentRuntime:
                 if progress.get("worker_tokens_reported")
                 else None
             )
+            await self._prune_checkpoints(thread_id)
             self._forget_thread(thread_id)
             yield RunFailed(
                 message=f"{type(exc).__name__}: {exc}",
@@ -1223,6 +1391,45 @@ class AgentRuntime:
             return
 
         final = answer or "".join(streamed)
+        usage = GLOBAL_LIMITER.run_usage(thread_id)
+        budget = float(settings.run_cost_budget_usd or 0.0)
+        ratio = (usage["cost_usd"] / budget) if budget > 0 else 0.0
+        alerts: list[str] = []
+        if budget > 0:
+            if ratio >= 1.0:
+                alerts.append("已超出本次运行成本预算")
+            elif ratio >= float(settings.cost_alert_ratio):
+                alerts.append("接近本次运行成本预算")
+
+        billed_usd = 0.0
+        billing_error = ""
+        billing_providers: dict[str, dict[str, float]] = {}
+        if settings.billing_enabled:
+            started = float(usage.get("started_at") or run_started_at)
+            try:
+                billing = await asyncio.to_thread(
+                    fetch_billing, settings, started, time.time()
+                )
+                for item in billing:
+                    billed_usd += float(item.cost_usd)
+                    billing_providers[item.provider] = {
+                        "cost_usd": float(item.cost_usd),
+                        "input_tokens": float(item.input_tokens),
+                        "output_tokens": float(item.output_tokens),
+                    }
+                    if item.error:
+                        billing_error = (
+                            f"{item.provider}: {item.error}"
+                            if not billing_error
+                            else f"{billing_error}; {item.provider}: {item.error}"
+                        )
+            except Exception as exc:  # noqa: BLE001 - 对账失败不拖垮 run
+                billing_error = f"{type(exc).__name__}: {exc}"
+        billing_delta = billed_usd - float(usage["cost_usd"])
+        if billed_usd > 0 and billing_delta > max(
+            0.01, float(usage["cost_usd"]) * 0.2
+        ):
+            alerts.append("provider 账单金额明显高于本地估算")
         self._audit(
             AuditRecord(
                 ts=now_iso(),
@@ -1232,6 +1439,10 @@ class AgentRuntime:
                 # provider 未回报用量时保持 None（exclude_none 会省略该字段）
                 input_tokens=input_tokens or None,
                 output_tokens=output_tokens or None,
+                cost_usd=usage["cost_usd"] or None,
+                billed_usd=billed_usd or None,
+                cache_hit_tokens=int(usage.get("cache_hit_tokens", 0)) or None,
+                cache_miss_tokens=int(usage.get("cache_miss_tokens", 0)) or None,
             )
         )
         # 收尾兜底：正常路径下 act 已经收口（空操作），但若某条路径让 act 没能
@@ -1248,6 +1459,36 @@ class AgentRuntime:
             if progress.get("worker_tokens_reported")
             else None
         )
+        yield CostReport(
+            run_id=thread_id,
+            input_tokens=int(usage["input_tokens"]),
+            output_tokens=int(usage["output_tokens"]),
+            cost_usd=float(usage["cost_usd"]),
+            budget_usd=budget,
+            ratio=ratio,
+            billed_usd=billed_usd,
+            billing_delta_usd=billing_delta,
+            billing_error=billing_error,
+            alerts=alerts,
+            cache_hit_tokens=int(usage.get("cache_hit_tokens", 0)),
+            cache_miss_tokens=int(usage.get("cache_miss_tokens", 0)),
+            billing_providers=billing_providers,
+            providers={
+                str(key): {
+                    "input_tokens": float(value.get("input_tokens", 0) or 0),
+                    "output_tokens": float(value.get("output_tokens", 0) or 0),
+                    "cost_usd": float(value.get("cost_usd", 0) or 0),
+                    "cache_hit_tokens": float(
+                        value.get("cache_hit_tokens", 0) or 0
+                    ),
+                    "cache_miss_tokens": float(
+                        value.get("cache_miss_tokens", 0) or 0
+                    ),
+                }
+                for key, value in (usage.get("providers") or {}).items()
+            },
+        )
+        await self._prune_checkpoints(thread_id)
         self._forget_thread(thread_id)
         yield RunFinished(
             thread_id=thread_id,
@@ -1527,6 +1768,17 @@ class AgentRuntime:
                 worker_id=str(result.get("worker_id", "")),
                 attempt=int(result.get("attempt", 1)),
                 merged=bool(result.get("merged")),
+                artifact_id=str(result.get("artifact_id") or "") or None,
+                timed_out=bool(result.get("timed_out")),
+                queue_wait_ms=int(result.get("queue_wait_ms") or 0) or None,
+                llm_ms=int(result.get("llm_ms") or 0) or None,
+                tool_ms=int(result.get("tool_ms") or 0) or None,
+                depth=int(result.get("depth") or 0) or None,
+                priority=int(result.get("priority") or 0) or None,
+                scope_violations=[
+                    str(item)
+                    for item in (result.get("scope_violations") or [])
+                ],
                 ok=(
                     True
                     if status == "success"

@@ -23,6 +23,7 @@ from coding_agent.sandbox.fs import SandboxFs, SandboxFsError, SandboxFsTooLarge
 from coding_agent.sandbox.pathguard import SandboxPathError
 from coding_agent.sandbox.snapshots import MAX_OPERATIONAL_BYTES, SnapshotStore
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
+from coding_agent.security.write_policy import protected_write_reason
 from coding_agent.tools.artifacts import FileArtifact, pack
 
 READ_TOOL_NAME = "file_read"
@@ -189,6 +190,11 @@ def build_file_tools(
     def _scope_allows(target: str) -> bool:
         return _scope_allows_rel(_relpath(target, root))
 
+    def _protected_reason(target: str) -> str | None:
+        return protected_write_reason(
+            _relpath(target, root), settings.write_deny_globs
+        )
+
     # ------------------------------------------------------------------
     # read
     # ------------------------------------------------------------------
@@ -263,6 +269,9 @@ def build_file_tools(
                 f"路径不在 write_scope 内：{_relpath(target, root)}。"
                 f"允许写入：{', '.join(write_scope_norm)}",
             )
+        protected = _protected_reason(target)
+        if protected:
+            return _reject(path, "overwrite", protected)
 
         original: str | None = None
         if info.exists:
@@ -354,6 +363,9 @@ def build_file_tools(
                 f"路径不在 write_scope 内：{_relpath(target, root)}。"
                 f"允许写入：{', '.join(write_scope_norm)}",
             )
+        protected = _protected_reason(target)
+        if protected:
+            return _reject(path, "edit", protected)
 
         try:
             original = fs.read_text(target, max_bytes=internal_max_bytes)

@@ -1,0 +1,343 @@
+{
+  "project": "coding-agent-capability-139-final-2b8ea1a3",
+  "total": 139,
+  "passed": 138,
+  "pass_rate": 0.9928,
+  "verdicts": {
+    "passed": 138,
+    "failed": 1
+  },
+  "categories": {
+    "cross_file": {
+      "total": 35,
+      "passed": 35,
+      "pass_rate": 1.0,
+      "main_tokens": 4675515.0,
+      "worker_tokens": 577612.0,
+      "agent_seconds": 1331.5,
+      "avg_agent_seconds": 38.04
+    },
+    "debug": {
+      "total": 29,
+      "passed": 29,
+      "pass_rate": 1.0,
+      "main_tokens": 2053717.0,
+      "worker_tokens": 0.0,
+      "agent_seconds": 739.13,
+      "avg_agent_seconds": 25.49
+    },
+    "single_file": {
+      "total": 63,
+      "passed": 63,
+      "pass_rate": 1.0,
+      "main_tokens": 3552944.0,
+      "worker_tokens": 0.0,
+      "agent_seconds": 1353.47,
+      "avg_agent_seconds": 21.48
+    },
+    "spec": {
+      "total": 12,
+      "passed": 11,
+      "pass_rate": 0.9167,
+      "main_tokens": 1783035.0,
+      "worker_tokens": 157048.0,
+      "agent_seconds": 429.89,
+      "avg_agent_seconds": 35.82
+    }
+  },
+  "tiers": {
+    "basic": {
+      "total": 110,
+      "passed": 110,
+      "pass_rate": 1.0,
+      "main_tokens": 6784491.0,
+      "worker_tokens": 0.0,
+      "agent_seconds": 2547.12,
+      "avg_agent_seconds": 23.16
+    },
+    "deep": {
+      "total": 17,
+      "passed": 17,
+      "pass_rate": 1.0,
+      "main_tokens": 1331060.0,
+      "worker_tokens": 0.0,
+      "agent_seconds": 473.51,
+      "avg_agent_seconds": 27.85
+    },
+    "long": {
+      "total": 12,
+      "passed": 11,
+      "pass_rate": 0.9167,
+      "main_tokens": 3949660.0,
+      "worker_tokens": 734660.0,
+      "agent_seconds": 833.36,
+      "avg_agent_seconds": 69.45
+    }
+  },
+  "workflows": {
+    "direct": 133,
+    "parallel_readonly": 6
+  },
+  "tokens": {
+    "main_input": {
+      "sum": 11848048.0,
+      "avg": 85237.76,
+      "p50": 54468.0,
+      "p95": 135287.0,
+      "max": 999149.0
+    },
+    "main_output": {
+      "sum": 217163.0,
+      "avg": 1562.32,
+      "p50": 1163.0,
+      "p95": 2827.0,
+      "max": 10410.0
+    },
+    "worker_input": {
+      "sum": 661988.0,
+      "avg": 4762.5,
+      "p50": 0.0,
+      "p95": 0.0,
+      "max": 150476.0
+    },
+    "worker_output": {
+      "sum": 72672.0,
+      "avg": 522.82,
+      "p50": 0.0,
+      "p95": 0.0,
+      "max": 15473.0
+    },
+    "subagent_input": {
+      "sum": 0.0,
+      "avg": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "max": 0.0
+    },
+    "subagent_output": {
+      "sum": 0.0,
+      "avg": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "max": 0.0
+    },
+    "total_tokens": 12799871.0,
+    "missing_main_usage": 0
+  },
+  "runtime_seconds": {
+    "agent": {
+      "sum": 3853.99,
+      "avg": 27.73,
+      "p50": 21.92,
+      "p95": 37.66,
+      "max": 144.26
+    },
+    "judge": {
+      "sum": 28.17,
+      "avg": 0.2,
+      "p50": 0.2,
+      "p95": 0.23,
+      "max": 0.31
+    },
+    "wall_seconds": 1351.15,
+    "wall_start": "2026-10-20T08:48:57.850736+00:00",
+    "wall_end": "2026-10-20T09:11:29.005487+00:00"
+  },
+  "top_token_tasks": [
+    {
+      "case_id": "long/discount_spec",
+      "tokens": 1166607.0,
+      "agent_seconds": 144.26
+    },
+    {
+      "case_id": "long/discount_and_audit",
+      "tokens": 1062533.0,
+      "agent_seconds": 141.39
+    },
+    {
+      "case_id": "long/audit_trail",
+      "tokens": 632404.0,
+      "agent_seconds": 103.06
+    },
+    {
+      "case_id": "long/discount_partial",
+      "tokens": 612052.0,
+      "agent_seconds": 102.56
+    },
+    {
+      "case_id": "long/discount_pipeline",
+      "tokens": 532071.0,
+      "agent_seconds": 96.09
+    },
+    {
+      "case_id": "long/parallel_modules",
+      "tokens": 183014.0,
+      "agent_seconds": 71.18
+    },
+    {
+      "case_id": "debug/circular_import",
+      "tokens": 149434.0,
+      "agent_seconds": 37.5
+    },
+    {
+      "case_id": "full/debug/cache_stale",
+      "tokens": 148705.0,
+      "agent_seconds": 35.37
+    },
+    {
+      "case_id": "replan/stale_todo_list",
+      "tokens": 137531.0,
+      "agent_seconds": 36.27
+    },
+    {
+      "case_id": "cross_file/extract_helper",
+      "tokens": 132261.0,
+      "agent_seconds": 36.8
+    }
+  ],
+  "slowest_tasks": [
+    {
+      "case_id": "long/discount_spec",
+      "agent_seconds": 144.26,
+      "tokens": 1166607.0
+    },
+    {
+      "case_id": "long/discount_and_audit",
+      "agent_seconds": 141.39,
+      "tokens": 1062533.0
+    },
+    {
+      "case_id": "long/audit_trail",
+      "agent_seconds": 103.06,
+      "tokens": 632404.0
+    },
+    {
+      "case_id": "long/discount_partial",
+      "agent_seconds": 102.56,
+      "tokens": 612052.0
+    },
+    {
+      "case_id": "long/discount_pipeline",
+      "agent_seconds": 96.09,
+      "tokens": 532071.0
+    },
+    {
+      "case_id": "long/parallel_modules",
+      "agent_seconds": 71.18,
+      "tokens": 183014.0
+    },
+    {
+      "case_id": "full/debug/import_cycle",
+      "agent_seconds": 39.18,
+      "tokens": 126154.0
+    },
+    {
+      "case_id": "full/spec/error_message",
+      "agent_seconds": 37.66,
+      "tokens": 122373.0
+    },
+    {
+      "case_id": "debug/circular_import",
+      "agent_seconds": 37.5,
+      "tokens": 149434.0
+    },
+    {
+      "case_id": "full/string/truncate",
+      "agent_seconds": 37.25,
+      "tokens": 118709.0
+    }
+  ],
+  "mechanism": {
+    "tool_calls": {
+      "sum": 1159.0,
+      "avg": 8.34,
+      "p50": 7.0,
+      "p95": 16.0,
+      "max": 36.0
+    },
+    "writes": {
+      "sum": 221.0,
+      "avg": 1.59,
+      "p50": 1.0,
+      "p95": 3.0,
+      "max": 15.0
+    },
+    "steps": {
+      "sum": 512.0,
+      "avg": 3.68,
+      "p50": 3.0,
+      "p95": 5.0,
+      "max": 8.0
+    },
+    "replans_total": 48.0,
+    "workers_total": 29.0,
+    "worker_retries_total": 5.0,
+    "worker_merge_conflicts_tasks": 0,
+    "verifications": {
+      "failed": 64,
+      "ok": 150
+    },
+    "worker_statuses": {
+      "failed": 10,
+      "partial": 18,
+      "success": 1
+    }
+  },
+  "failures": [
+    {
+      "case_id": "long/discount_spec",
+      "category": "spec",
+      "passed": false,
+      "verdict": "failed",
+      "detail": "================\nFAIL: test_approval_reads_the_stored_discount (tests.test_discount_hidden.HiddenDiscountTest.test_approval_reads_the_stored_discount)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/home/hong/agent-ws/.agent/eval/long/discount_spec/tests/test_discount_hidden.py\", line 49, in test_approval_reads_the_stored_discount\n    self.assertEqual(result[\"data\"][\"net_cents\"], 3600)\nAssertionError: 4000 != 3600\n\n----------------------------------------------------------------------\nRan 15 tests in 0.001s\n\nFAILED (failures=1)",
+      "error": "",
+      "metrics": {
+        "agent_seconds": 144.2555405000021,
+        "budget": {
+          "max_plan_steps": 8,
+          "max_repair_rounds": 5,
+          "max_replans": 3,
+          "max_tool_rounds": 16
+        },
+        "input_tokens": 999149,
+        "judge_seconds": 0.2323894000001019,
+        "max_delegate_batch": 0,
+        "max_worker_batch": 4,
+        "output_tokens": 10410,
+        "repairs": 0,
+        "replans": 0,
+        "steps": 8,
+        "subagent_input_tokens": 0,
+        "subagent_output_tokens": 0,
+        "subagent_statuses": {},
+        "subagents": 0,
+        "tasks_planned": 4,
+        "tier": "long",
+        "tool_calls": 33,
+        "verifications": {},
+        "worker_conflicts": 0,
+        "worker_input_tokens": 143207,
+        "worker_merge_attempts": 0,
+        "worker_merged": 0,
+        "worker_output_tokens": 13841,
+        "worker_retries": 0,
+        "worker_roles": {
+          "explore": 2,
+          "review": 1,
+          "test": 1
+        },
+        "worker_seconds": 83.377,
+        "worker_statuses": {
+          "partial": 3,
+          "success": 1
+        },
+        "worker_tool_calls": 0,
+        "workers": 4,
+        "workflow": "parallel_readonly",
+        "writes": 10
+      },
+      "start_time": "2026-10-20T09:07:30.530676+00:00",
+      "end_time": "2026-10-20T09:09:56.091765+00:00"
+    }
+  ]
+}

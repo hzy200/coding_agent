@@ -22,6 +22,7 @@ CLI 侧用 stream_mode="messages" 实现逐字流式输出。
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from dataclasses import asdict
 from typing import Any
 
 from langchain_core.language_models import BaseChatModel
@@ -30,7 +31,13 @@ from langchain_core.runnables import RunnableConfig
 
 from coding_agent.graph.plan import EXPLORE, IMPLEMENT, current_step_kind
 from coding_agent.graph.state import AgentState
-from coding_agent.llm.context import ContextBudget, trim_messages
+from coding_agent.llm.context import (
+    ContextBudget,
+    is_context_length_error,
+    summarize_messages,
+    tighter_budget,
+    trim_messages,
+)
 from coding_agent.llm.prompts import (
     DELEGATION_NOTE,
     DELEGATION_NOTE_DISABLED,
@@ -105,6 +112,10 @@ def make_act_node(
             step_kind=current_step_kind(state),
             allow_write=allow_write,
             memories=state.get("memories"),
+            project_instructions=str(
+                state.get("project_instructions") or ""
+            ),
+            stale_paths=state.get("stale_paths"),
             feedback=feedback,
             # 上一步没产生任何改动、被 nudge 打回来重做 —— 把它明说给模型听，
             # 否则它只会把同样的事再做一遍
@@ -112,8 +123,9 @@ def make_act_node(
             # 只有 delegate 工具真的绑定时才提；否则会教模型调用一个不存在的工具
             delegation_note=delegation_note,
             worker_context=str(state.get("worker_context") or ""),
+            context_summary=summarize_messages(state["messages"]),
         )
-        history, _ = trim_messages(state["messages"], trim_budget)
+        history, trim_report = trim_messages(state["messages"], trim_budget)
         messages = [SystemMessage(content=system), *history]
 
         # 实测 deepseek-chat 在 implement 步偶尔会连续返回「无 tool_calls」的
@@ -127,14 +139,67 @@ def make_act_node(
             and int(state.get("tool_rounds", 0)) == 0
         )
         model = forced_llm if force_tool else llm
+        async def _retry_tighter(
+            _exc: BaseException, current: dict[str, Any]
+        ):
+            tighter = tighter_budget(trim_budget)
+            tighter_history, tighter_report = trim_messages(
+                current["messages"], tighter
+            )
+            tighter_messages = [
+                SystemMessage(
+                    content=compose_system_prompt(
+                        plan=current.get("plan"),
+                        plan_kinds=current.get("plan_kinds"),
+                        step_idx=current.get("step_idx", 0),
+                        step_kind=current_step_kind(current),
+                        allow_write=allow_write,
+                        memories=current.get("memories"),
+                        project_instructions=str(
+                            current.get("project_instructions") or ""
+                        ),
+                        stale_paths=current.get("stale_paths"),
+                        feedback=feedback,
+                        empty_step=bool(current.get("empty_step_nudged"))
+                        and not current.get("dirty"),
+                        delegation_note=delegation_note,
+                        worker_context=str(
+                            current.get("worker_context") or ""
+                        ),
+                        context_summary=summarize_messages(
+                            current["messages"]
+                        ),
+                    )
+                ),
+                *tighter_history,
+            ]
+            return await llm.ainvoke(tighter_messages, config), tighter_report
+
         try:
             response = await model.ainvoke(messages, config)
-        except Exception:
-            if not force_tool:
+        except Exception as exc:  # noqa: BLE001
+            if force_tool:
+                # 强制 tool_choice 在个别 provider/模式下可能被拒；退回普通调用，
+                # 不要让一次强制失败把整个运行打断。
+                try:
+                    response = await llm.ainvoke(messages, config)
+                except Exception as fallback_exc:  # noqa: BLE001
+                    if not is_context_length_error(fallback_exc):
+                        raise
+                    response, trim_report = await _retry_tighter(
+                        fallback_exc, state
+                    )
+            elif is_context_length_error(exc):
+                response, trim_report = await _retry_tighter(exc, state)
+            else:
                 raise
-            # 强制 tool_choice 在个别 provider/模式下可能被拒；退回普通调用，
-            # 不要让一次强制失败把整个运行打断。
-            response = await llm.ainvoke(messages, config)
-        return {"messages": [response], "tool_rounds": rounds + 1}
+        return {
+            "messages": [response],
+            "tool_rounds": rounds + 1,
+            "context_trim": {
+                **asdict(trim_report),
+                "node": "act",
+            },
+        }
 
     return act

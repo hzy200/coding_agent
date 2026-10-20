@@ -6,10 +6,23 @@ import asyncio
 import time
 from typing import Any
 
+import pytest
+
 from coding_agent.config import Settings
+from coding_agent.llm.ratelimit import GLOBAL_LIMITER
+from coding_agent.orchestrator import scheduler as scheduler_module
 from coding_agent.orchestrator.contracts import WorkerResult
 from coding_agent.orchestrator.scheduler import make_scheduler_node
 from coding_agent.steering import SteeringController
+
+
+@pytest.fixture(autouse=True)
+def _reset_global_limiter():
+    """scheduler 的 429 会写进程级冷却；不让跨用例污染。"""
+    GLOBAL_LIMITER.configure(None)
+    GLOBAL_LIMITER.reset()
+    yield
+    GLOBAL_LIMITER.reset()
 
 
 def _settings(**overrides: Any) -> Settings:
@@ -198,3 +211,129 @@ def test_checkpoint_boundary_returns_continue_for_remaining_tasks() -> None:
     )
     assert second["scheduler_done"] is True
     assert len(second["worker_results"]) == 3
+
+
+def test_total_token_budget_blocks_tasks_that_do_not_fit() -> None:
+    async def runner(task: dict[str, Any], **_kwargs: Any) -> WorkerResult:
+        result = _result(task)
+        result.input_tokens = 100
+        return result
+
+    node = make_scheduler_node(
+        worker_runner=runner,
+        settings=_settings(
+            orchestrator_total_tokens=2_000,
+            orchestrator_max_concurrent_workers=1,
+        ),
+        steering=SteeringController(),
+    )
+    out = asyncio.run(
+        node(
+            _state([_task("a"), _task("b")]),
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+
+    # 第一个 explore 预留 2000 并跑完（实际 100），第二个已无法再预留 2000。
+    assert out["task_status"]["a"] == "success"
+    assert out["task_status"]["b"] == "blocked"
+    assert out["token_budget_exhausted"] is True
+    assert out["token_budget_limit"] == 2_000
+    assert out["token_budget_spent"] == 100
+    assert out["token_budget_reserved"] == 0
+
+
+def test_token_budget_is_unlimited_by_default() -> None:
+    async def runner(task: dict[str, Any], **_kwargs: Any) -> WorkerResult:
+        return _result(task)
+
+    node = make_scheduler_node(
+        worker_runner=runner,
+        settings=_settings(),
+        steering=SteeringController(),
+    )
+    out = asyncio.run(
+        node(
+            _state([_task("a"), _task("b")]),
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+
+    assert out["task_status"] == {"a": "success", "b": "success"}
+    assert out["token_budget_exhausted"] is False
+
+
+def test_rate_limit_backoff_requeues_the_task() -> None:
+    attempts: dict[str, int] = {}
+
+    async def runner(task: dict[str, Any], **_kwargs: Any) -> WorkerResult:
+        task_id = str(task["id"])
+        attempts[task_id] = attempts.get(task_id, 0) + 1
+        if attempts[task_id] == 1:
+            result = _result(task, status="failed")
+            result.summary = "429 Too Many Requests"
+            return result
+        return _result(task)
+
+    node = make_scheduler_node(
+        worker_runner=runner,
+        settings=_settings(
+            orchestrator_task_retries=1,
+            orchestrator_rate_limit_backoff_s=0.01,
+        ),
+        steering=SteeringController(),
+    )
+    out = asyncio.run(
+        node(
+            _state([_task("a")]),
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+
+    assert attempts["a"] == 2
+    assert out["task_status"]["a"] == "success"
+
+
+def test_deadline_does_not_finish_a_worker_that_never_started(
+    monkeypatch,
+) -> None:
+    """排队等 semaphore 的任务不能只发 finished、不发 started。"""
+    events: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        scheduler_module, "get_stream_writer", lambda: events.append
+    )
+
+    async def runner(task: dict[str, Any], **_kwargs: Any) -> WorkerResult:
+        # 第一个 worker 持住唯一的并发槽，直到 deadline 把它 cancel。
+        await asyncio.sleep(5)
+        return _result(task)
+
+    node = make_scheduler_node(
+        worker_runner=runner,
+        settings=_settings(
+            orchestrator_max_concurrent_workers=1,
+            orchestrator_run_deadline_s=1,
+        ),
+        steering=SteeringController(),
+    )
+    out = asyncio.run(
+        node(
+            _state([_task("a"), _task("b")]),
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+
+    started = {
+        str(event.get("task_id"))
+        for event in events
+        if event.get("type") == "worker_started"
+    }
+    finished = {
+        str(event.get("result", {}).get("task_id"))
+        for event in events
+        if event.get("type") == "worker_finished"
+    }
+    # 关键不变量：finished 必须是 started 的子集，不能出现“只结束没开始”。
+    assert finished <= started
+    assert started == {"a"}
+    assert out["task_status"]["b"] in {"blocked", "failed"}

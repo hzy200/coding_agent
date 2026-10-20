@@ -12,8 +12,13 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from coding_agent.llm.context import (
     HARD_TOOL_CHARS,
     ContextBudget,
+    estimate_tokens,
+    is_context_length_error,
     message_chars,
+    summarize_messages,
+    tighter_budget,
     total_chars,
+    total_tokens,
     trim_messages,
 )
 
@@ -40,6 +45,7 @@ def _history(pairs: int, size: int = 5_000) -> list:
 
 
 # ---------------- 不变量 ----------------
+
 
 def test_never_drops_messages() -> None:
     messages = _history(6)
@@ -77,6 +83,7 @@ def test_does_not_mutate_the_original_list() -> None:
 
 # ---------------- 何时不裁 ----------------
 
+
 def test_disabled_budget_is_a_noop() -> None:
     messages = _history(6)
     trimmed, report = trim_messages(messages, ContextBudget(max_chars=0))
@@ -84,11 +91,25 @@ def test_disabled_budget_is_a_noop() -> None:
     assert not report.changed
 
 
-def test_short_history_is_untouched() -> None:
-    messages = _history(1)
+def test_short_history_is_untouched_when_it_fits() -> None:
+    """短历史装得进总预算时完全不动 —— 但「短」不等于免检，见下面的超预算用例。"""
+    messages = _history(1, size=100)
     trimmed, report = trim_messages(messages, BUDGET)
     assert [m.content for m in trimmed] == [m.content for m in messages]
     assert not report.changed
+
+
+def test_recent_window_is_checked_against_total_budget() -> None:
+    """最近窗口不再免检：总量超预算时它也会被降档。
+
+    旧实现只裁 `keep_recent` 之外的消息，于是「历史很短但每条都很大」时
+    裁剪报告显示没动，请求却照样超过模型上下文上限。
+    """
+    messages = _history(2, size=5_000)
+    trimmed, report = trim_messages(messages, BUDGET)
+    assert report.changed
+    assert report.after_chars <= BUDGET.max_chars + 200
+    assert len(trimmed) == len(messages)
 
 
 def test_small_messages_are_untouched() -> None:
@@ -100,14 +121,17 @@ def test_small_messages_are_untouched() -> None:
 
 # ---------------- 裁剪行为 ----------------
 
+
 def test_recent_window_is_never_trimmed() -> None:
     """最近的消息不参与常规裁剪（tool_chars）—— 那是模型刚拿到的工具结果。
 
-    用装得进预算的消息：单条吃掉整个预算是另一回事，由下面的用例单独守。
+    用装得进**总预算**的消息：常规裁剪（`tool_chars`）不碰最近窗口；
+    只有总量仍超预算时才会降档，那由下面的用例单独守。
     """
     messages = _history(6, size=500)
-    trimmed, _ = trim_messages(messages, BUDGET)
-    recent = BUDGET.keep_recent
+    roomy = ContextBudget(max_chars=100_000, keep_recent=4, tool_chars=100)
+    trimmed, _ = trim_messages(messages, roomy)
+    recent = roomy.keep_recent
     for original, result in zip(messages[-recent:], trimmed[-recent:], strict=True):
         assert original.content == result.content
 
@@ -129,11 +153,12 @@ def test_a_single_message_that_dwarfs_the_budget_is_capped() -> None:
 
 
 def test_a_recent_message_within_the_budget_is_untouched() -> None:
-    """反向守着：装得进预算的最近消息不能被上面的兜底误伤。"""
+    """反向守着：装得进总预算的最近消息不能被上面的兜底误伤。"""
     messages = _history(6, size=500)
-    trimmed, _ = trim_messages(messages, BUDGET)
-    assert [m.content for m in trimmed[-BUDGET.keep_recent :]] == [
-        m.content for m in messages[-BUDGET.keep_recent :]
+    roomy = ContextBudget(max_chars=100_000, keep_recent=4, tool_chars=100)
+    trimmed, _ = trim_messages(messages, roomy)
+    assert [m.content for m in trimmed[-roomy.keep_recent :]] == [
+        m.content for m in messages[-roomy.keep_recent :]
     ]
 
 
@@ -204,6 +229,7 @@ def test_non_string_content_does_not_crash() -> None:
 
 # ---------------- content blocks ----------------
 
+
 def _blocks(*blocks: dict) -> AIMessage:
     return AIMessage(content=list(blocks))
 
@@ -248,3 +274,69 @@ def test_short_block_content_is_untouched() -> None:
     assert trimmed[-2].content == target.content
     assert not report.changed
 
+
+# ---------------- token 预算 ----------------
+
+
+def test_estimate_tokens_is_conservative_for_cjk() -> None:
+    assert estimate_tokens("") == 0
+    # 中文按 1 字/token，英文按 4 字符/token
+    assert estimate_tokens("你好世界") == 4
+    assert estimate_tokens("abcdefgh") == 2
+
+
+def test_token_budget_trims_even_when_chars_fit() -> None:
+    """字符预算放得下、token 预算放不下时也要裁 —— 两个预算各自生效。"""
+    messages = _history(6, size=500)
+    tight = ContextBudget(max_chars=0, max_tokens=200, keep_recent=2, tool_chars=50)
+    trimmed, report = trim_messages(messages, tight)
+    assert report.changed
+    assert total_tokens(trimmed) <= 200
+    assert len(trimmed) == len(messages)
+
+
+def test_report_contains_token_counts() -> None:
+    messages = _history(2)
+    _, report = trim_messages(messages, BUDGET)
+    assert report.before_tokens == total_tokens(messages)
+    assert report.after_tokens > 0
+    assert report.before_tokens >= report.after_tokens
+
+
+# ---------------- 400 降档 ----------------
+
+
+def test_context_length_error_is_detected() -> None:
+    assert is_context_length_error(RuntimeError("Error code: 400 - context_length_exceeded"))
+    assert is_context_length_error(ValueError("prompt is too long"))
+    assert not is_context_length_error(RuntimeError("rate limit exceeded"))
+
+
+def test_tighter_budget_halves_everything() -> None:
+    tight = tighter_budget(
+        ContextBudget(max_chars=10_000, max_tokens=8_000, keep_recent=10, tool_chars=1_000)
+    )
+    assert tight.max_chars == 5_000
+    assert tight.max_tokens == 4_000
+    assert tight.keep_recent == 5
+    assert tight.tool_chars == 500
+
+
+# ---------------- 摘要 ----------------
+
+
+def test_summarize_messages_keeps_goal_and_recent_actions() -> None:
+    messages = [
+        HumanMessage(content="给折扣加一个上限"),
+        _tool_call("c1"),
+        _tool_result("c1", 0),
+        AIMessage(content="已定位 discount.py"),
+    ]
+    summary = summarize_messages(messages)
+    assert "给折扣加一个上限" in summary
+    assert "已定位 discount.py" in summary
+    assert "shell_exec" in summary
+
+
+def test_summarize_messages_is_empty_without_content() -> None:
+    assert summarize_messages([]) == ""

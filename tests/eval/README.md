@@ -13,6 +13,61 @@
 它是**尺子**，不是回归。回归失败要修代码；评测通过率下降只说明能力变了，
 需要人来判断这是不是可接受的。
 
+## 上下文/记忆专项标尺
+
+`context_memory_bench.py` 不调用模型、不依赖 WSL，可直接进 CI：
+
+```bash
+python tests/eval/context_memory_bench.py          # 人读
+python tests/eval/context_memory_bench.py --json   # 机器读 / A/B
+```
+
+- **长会话压缩**：30 轮工具历史按字符 + token 预算裁剪，检查
+  「目标 / 约束 / 最近结论 / 最近改过的文件」是否仍可见，并报告压缩率；
+- **记忆检索**：30 条事实 + 自然语言查询，报告 recall@K、无关查询回退、
+  冲突替换与过期过滤。
+
+门槛由 `tests/unit/test_context_memory_bench.py` 钉住，防止标尺本身退化。
+
+## LangSmith 全功能评测
+
+`langsmith_suite.py` 把能力任务和机制探针放进同一份数据集：
+
+```bash
+# 创建/补齐数据集（139 个 capability + 11 个 mechanism = 150）
+python tests/eval/langsmith_suite.py --upload --kinds all
+
+# 只跑机制探针（安全、路由、持久化、代码索引、账单配置、常驻 shell…）
+python tests/eval/langsmith_suite.py --run --kinds mechanism
+
+# 跑覆盖主要回路的 6 个 capability 抽样
+python tests/eval/langsmith_suite.py --run --smoke
+
+# 只跑单个 case
+python tests/eval/langsmith_suite.py --run --only single_file/off_by_one
+```
+
+- `capability`：复用 `run_task`，真实 WSL + 模型，评估任务完成率；
+  其中新增 `full` 套件 **104 个任务**（字符串/数值/集合/解析/校验/状态/
+  跨文件/排障/spec/长程/并发/重构），种子与参考解均通过 `--verify-seeds`；
+- `mechanism`：不调用模型，断言具体机制（secret 脱敏、写策略、allow rules、
+  steering 持久化、provider cost/capability 路由、import 图、账单配置、
+  shell 分级、LSP 分帧、常驻 shell、跨进程 usage）；
+- 子集运行会创建派生 dataset，不会误跑全量。
+
+最近一次本机实跑（2026-10-20，`coding-agent-full-v1`）：
+
+- `mechanism`：**11/11** 通过（安全、steering、路由、代码索引、账单配置、常驻 shell、成本对账）；
+- `smoke`：**6/6** 通过（direct、跨文件、排障、spec 隐藏测试、并发读、并发写/合并）；
+- `full` 套件：**104/104** 种子未解决且参考解通过（确定性自检）；新任务抽查
+  `full/string/slugify`、`full/cross/plugin_registry`、`full/long/discount_pipeline`
+  均通过 LangSmith 实验；
+- **139 capability 全量真实模型运行：138/139 = 99.3%**；失败任务
+  `long/discount_spec` 隔离复跑通过。该轮默认 `orchestrator_write_enabled=false`、
+  `explore_enabled=false`，implement 与 subagent 路径由生产试跑单独验证；
+- 量化明细见 [docs/LANGSMITH_REPORT.md](../docs/LANGSMITH_REPORT.md)；
+- 另用真实 CLI 跑通 direct 修复与 4 个 implement worker 的并发写编排。
+
 ## 用法
 
 ```bash
@@ -21,6 +76,9 @@ python tests/eval/runner.py --list
 
 # 种子自检：确认 29 个任务在智能体未介入时都"未解决"（不需要 API Key）
 python tests/eval/runner.py --verify-seeds
+
+# 104 个 full 套件任务的双向自检（种子失败 + 参考解通过）
+python tests/eval/runner.py --suite full --verify-seeds
 
 # 跑一个类别 / 一个任务（注意：不会写入 canonical baseline，见下）
 python tests/eval/runner.py --only debug

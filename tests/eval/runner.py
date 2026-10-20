@@ -53,6 +53,7 @@ from harness import (  # noqa: E402
     task_root,
 )
 from tasks import TASKS  # noqa: E402
+from tasks_full import TASKS_FULL  # noqa: E402
 from tasks_long import LONG_TASKS  # noqa: E402
 
 from coding_agent.config import get_settings  # noqa: E402
@@ -68,6 +69,8 @@ from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace  # noqa:
 SUITES: dict[str, tuple[EvalTask, ...]] = {
     "default": TASKS,
     "long": LONG_TASKS,
+    # LangSmith 全功能数据集使用的 104 个任务（与既有 ID 不重复）。
+    "full": tuple(TASKS_FULL),
 }
 
 

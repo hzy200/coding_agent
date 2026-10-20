@@ -16,6 +16,7 @@ from typer.testing import CliRunner
 from coding_agent.audit import AuditLogger, AuditRecord
 from coding_agent.cli import app as cli_app
 from coding_agent.config import Settings
+from coding_agent.steering import SteeringController
 
 runner = CliRunner()
 
@@ -70,7 +71,7 @@ def _write_records(settings: Settings, count: int = 3) -> AuditLogger:
 @pytest.mark.parametrize(
     "command",
     ["doctor", "sandbox-init", "chat", "run", "snapshots", "undo", "diff",
-     "sessions", "memory", "audit", "tui"],
+     "sessions", "checkpoints", "fork", "rewind", "memory", "audit", "tui"],
 )
 def test_every_command_has_help(command: str) -> None:
     result = runner.invoke(cli_app.app, [command, "--help"])
@@ -252,6 +253,36 @@ def test_tui_reports_missing_ui_extra(monkeypatch) -> None:
 
     assert result.exit_code == 2
     assert "ui" in _text()
+
+
+# ---------------- steering ----------------
+
+def test_steer_command_writes_the_persistent_queue(monkeypatch, tmp_path) -> None:
+    settings = _scoped(
+        tmp_path, steering_dir=str(tmp_path / "steering")
+    )
+    _use_settings(monkeypatch, settings)
+
+    result = runner.invoke(
+        cli_app.app,
+        [
+            "steer",
+            "--thread-id",
+            "t1",
+            "add",
+            "--text",
+            "检查边界",
+            "--role",
+            "review",
+        ],
+    )
+
+    assert result.exit_code == 0
+    controller = SteeringController(settings.resolved_steering_dir)
+    commands = controller.peek("t1")
+    assert [item.action for item in commands] == ["add"]
+    assert commands[0].text == "检查边界"
+    assert commands[0].role == "review"
 
 
 # ---------------- main 入口 ----------------

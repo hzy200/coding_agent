@@ -22,7 +22,13 @@ SYSTEM_PROMPT = """\
 检索建议：
 - 找内容用 `search_code`，找文件用 `find_files`。它们返回「文件:行号:内容」，
   比在 shell 里拼 `grep` 更省事，也不会因为管道被安全策略拦下。
-- 先用 `search_code` 定位，再用 `file_read` 读具体位置，不要一上来就整文件读。
+- 知道类/函数名时用 `symbol_search` 直接定位定义（文件:行号），比全文搜索更精确。
+- 配置了 language server 时，用 `code_intel` 查定义/引用/诊断。
+- 先用 `search_code` / `symbol_search` 定位，再用 `file_read` 读具体位置，
+  不要一上来就整文件读。
+- 涉及项目约定、历史决策或用户偏好时，先用 `memory_search` 查跨会话记忆，
+  不要凭猜测。只有用户明确要求长期记住某条**稳定**约定时才用 `memory_save`
+  （仅在 --write 会话中可用）。
 
 文件修改规范：
 - 改已有文件前，先用 `file_read` 看清原文。
@@ -163,10 +169,13 @@ EXPLORE_PROMPT = """\
 
 你的任务：围绕主智能体给出的探索目标，读代码并给出可执行的结论。
 
-允许的工具（仅此三项）：
+允许的工具（仅此六项）：
 - file_read：读取文件
 - search_code：按内容搜索代码
 - find_files：按文件名查找
+- symbol_search：按类/函数名定位定义
+- code_intel：查定义/引用/诊断（需配置 language server）
+- memory_search：检索跨会话的项目记忆（只读）
 
 硬性约束：
 1. 你只能读，不能修改任何文件，也不能执行命令。
@@ -220,10 +229,13 @@ REVIEW_PROMPT = """\
 
 你的任务：审查主智能体指定的文件/区域，找出结构性风险与需求遗漏。
 
-允许的工具（仅此三项）：
+允许的工具（仅此六项）：
 - file_read：读取文件
 - search_code：按内容搜索代码
 - find_files：按文件名查找
+- symbol_search：按类/函数名定位定义
+- code_intel：查定义/引用/诊断（需配置 language server）
+- memory_search：检索跨会话的项目记忆（只读）
 
 审查重点：
 - 逻辑错误、边界条件、异常路径；
@@ -372,16 +384,24 @@ def compose_system_prompt(
     step_kind: str = "",
     allow_write: bool = False,
     memories: list[str] | None = None,
+    project_instructions: str = "",
+    stale_paths: list[str] | None = None,
     feedback: str = "",
     empty_step: bool = False,
     delegation_note: str = "",
     worker_context: str = "",
+    context_summary: str = "",
 ) -> str:
     """把长期记忆、当前计划与所处步骤拼进系统提示。
 
     这些上下文只在系统提示里合成，不写回消息历史 —— 否则每推进一步都会污染对话记录。
     """
     sections = [base]
+
+    # 项目指令只随 run 变化，放在动态段之前 —— 稳定前缀越长，provider 的
+    # prefix cache 越容易命中（见 P1-11）。
+    if project_instructions:
+        sections.append(f"\n{project_instructions}")
 
     # 委派规则放在最前面：它是对「先只读探索」这条基础工作方式的改写，
     # 埋在权限/计划之后时模型容易忽略（实测 deepseek-chat 会继续用一串 file_read）。
@@ -456,6 +476,23 @@ def compose_system_prompt(
     if empty_step:
         sections.append(
             f"\n{IMPLEMENT_NUDGE if step_kind == 'implement' else EMPTY_STEP_NUDGE}"
+        )
+
+    # 最动态的两段放最后：它们每轮都可能变化，放在前面会把后面的所有内容
+    # 一起挤出 provider 的 prefix cache（P1-11）。
+    if stale_paths:
+        listed = "\n".join(f"- {path}" for path in stale_paths[-20:])
+        sections.append(
+            "\n注意：以下文件已在本次运行中被修改。历史消息里对它们的"
+            "读取结果可能已经过期，继续修改前必须重新读取：\n"
+            f"{listed}"
+        )
+
+    if context_summary:
+        sections.append(
+            "\n较早上下文摘要（原始消息可能已裁剪，供保持连续性；"
+            "需要精确内容时请重新读取文件）：\n"
+            f"{context_summary}"
         )
 
     return "\n".join(sections)

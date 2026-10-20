@@ -21,6 +21,23 @@ def looks_like_windows_path(path: str) -> bool:
     return bool(_WIN_DRIVE_RE.match(path))
 
 
+def strip_wsl_scheme(path: str) -> str:
+    """`wsl:/home/u/proj` → `/home/u/proj`。
+
+    Git Bash / MSYS 会把以 `/` 开头的参数自动转换成 Windows 路径
+    （`/home/x` → `D:\\Git\\home\\x`）。加 `wsl:` 前缀可以让参数不以 `/`
+    开头，从而绕过这层转换。
+    """
+    text = str(path)
+    if text.startswith("wsl://"):
+        rest = text[len("wsl://") :]
+    elif text.startswith("wsl:"):
+        rest = text[len("wsl:") :]
+    else:
+        return text
+    return rest if rest.startswith("/") else f"/{rest}"
+
+
 def win_to_wsl(path: str) -> str:
     """`D:\\proj\\a` → `/mnt/d/proj/a`；已是 POSIX 路径则原样返回。"""
     if not path:
@@ -47,8 +64,11 @@ def normalize_wsl(path: str, cwd: str = "/") -> str:
     """返回归一化的绝对 POSIX 路径。
 
     容忍 Windows 形式的输入（`D:\\proj` → `/mnt/d/proj`），因为配置和模型
-    都可能给出盘符路径；相对路径按 cwd 展开。
+    都可能给出盘符路径；相对路径按 cwd 展开。`wsl:/home/...` 用于绕过
+    Git Bash / MSYS 的自动路径转换。
     """
+    path = strip_wsl_scheme(path)
+    cwd = strip_wsl_scheme(cwd)
     if "\x00" in path:
         raise SandboxPathError("路径包含空字节")
     # 不做 ~ 展开：要么是模型笔误，要么是想逃出工作区，两者都应显式失败
@@ -66,6 +86,7 @@ def _to_posix(path: str) -> str:
 
 def normalize_root(root: str) -> str:
     """归一化工作区根目录；必须是绝对路径。"""
+    root = strip_wsl_scheme(root)
     if not root.startswith("/") and not looks_like_windows_path(root):
         raise SandboxPathError(f"工作区必须是绝对路径：{root}")
     return normalize_wsl(root)

@@ -3,9 +3,23 @@
 > **状态**：harness 新架构已落地：**独立 orchestrator 子图 + 事件驱动动态
 > DAG + 并发 worker + 结构化 fan-in**。已实现动态只读任务扩展、写 worker
 > worktree 隔离与串行合并、写时 `write_scope` 校验、运行中干预、artifact
-> store、成本/并发指标、噪声感知对比与干预延迟基准。direct 仍保留为小任务
-> 快速路径。**仍计划中**：按改动文件的测试影响分析、共享文件多 worker 的
-> 3-way 合并、steering 队列持久化、Web/CLI 全量实时控制入口。
+> store、任务级 token 预算、成本/并发指标、噪声感知对比与干预延迟基准。
+> direct 仍保留为小任务快速路径。已有 AST import 图 + 反向依赖闭包的测试
+> 影响分析、轻量 repo map（survey → planner → explore/implement）、
+> AST 符号检索 `symbol_search`、可选 LSP 客户端（initialize /
+> workspace-symbol / definition / references / pull+publish diagnostics）、
+> 批量快照读写、常驻 WSL shell 会话池（opt-in，自动回退）、
+> 共享文件多 worker 的 3-way 合并（临时 index 预演，冲突整批回滚）、
+> steering 队列跨进程持久化、Web/CLI 实时控制入口（SSE 审批 /
+> pause/cancel/add/replan / resume + `agent steer`）、
+> scheduler 全局 token 准入（派发前按角色预留）、fan-in reducer、
+> 429 自适应降并发。
+> 多 provider 路由（429/错误 fallback）与跨进程限流协调已实现
+> （`.agent/rate_limits.json`，文件锁 + 原子替换）。
+> provider 级成本/配额路由、task_type/capabilities 过滤、
+> `CostReport` 成本对账与预算告警已实现。
+> 已支持 provider 账单 API 对账（`openai_costs` / 通用 JSON）。
+> **仍计划中**：多币种/税/折扣的账单归一化。
 > 当前实现见 [ARCHITECTURE.md](ARCHITECTURE.md)，运行工作流见 [WORKFLOW.md](WORKFLOW.md)。
 
 目标是把系统演进成 Claude Code / Codex / Workbuddy / DeepSeek Harness 那类
@@ -65,17 +79,15 @@
 | 验证/修复/停滞检测 | `nodes/verify.py`、`routing.py` | 已实现 |
 | 审批 / 沙箱 / 审计 / 快照 | `sandbox/`、`audit/` | 已实现 |
 | 领域事件 | `events.py`、`runtime.py` | 已实现 |
-| 端到端评测 | `tests/eval/` | 已实现 |
-| Orchestrator 3A | `orchestrator/`：survey / workflow select / TaskGraph / dispatch / synthesize | **已实现**（只读 worker） |
+| 端到端评测 | `tests/eval/`，含 LangSmith 全功能数据集 | 已实现 |
+| Orchestrator 3A | `orchestrator/`：survey / workflow select / TaskGraph / scheduler / fan-in | **已实现**（只读 worker） |
 | Orchestrator 3B | explore/test/**review** worker、任务级重试、fan-in 文件重叠报告 | **已实现** |
 | Orchestrator 3C | **implement** worker、git worktree 隔离、写范围校验、patch 合并/冲突 | **已实现**（默认关闭） |
 
-**仍未实现**：
+**仍未实现 / 后续**：
 
-- 成本预算与模型分层（worker/总 token 只计量，不在运行中硬停）。
-- Web / CLI 的实时控制入口（当前只有 TUI）。
-- 共享文件的多 worker 合并（3-way rebase）。
-- steering 队列持久化：跨进程只恢复 checkpoint，不恢复未消费指令。
+- 多币种/税/折扣的账单归一化。
+- 写计划审批已支持，但默认关闭；TUI 建议开启。
 
 ---
 
@@ -96,13 +108,15 @@
    plan_tasks               ← 生成 TaskSpec DAG，校验/降级
         │
         ▼
-   dispatch                 ← ready 任务并发执行；依赖/失败/预算控制
+   write_gate               ← 可选：并发前一次性确认 implement write_scope
         │
         ▼
-   extend_tasks → steering_dispatch ⇄ dispatch
-        │                   ← worker 提议只读任务；用户 pause/cancel/add/replan
+   scheduler ⇄ steering_dispatch
+        │                   ← ready 任务即时启动；完成即解锁依赖
+        │                   ← 失败短路、重试、动态只读扩展、429 退避
+        │                   ← 每 checkpoint_every 个任务形成一次边界
         ▼
-   synthesize (fan-in)      ← WorkerResult 汇总，压缩成 worker_context
+   fan-in                   ← WorkerResult 排序/预算/可选 reducer + artifact
         │
         ▼
    主 agent 实现            ← 现有 planner/act/verify/review/repair
@@ -177,10 +191,10 @@
 - 失败驱动：验证/审查失败、依赖阻塞、预算耗尽时，orchestrator 可重规划任务图。
 - 用户驱动（Phase 3D）：追加任务、取消任务、改变优先级、要求换模板。
 - **worker 驱动（Phase 4D）**：explore/review worker 可在结构化报告里提议最多
-  2 个**只读**任务；`extend_tasks` 做 host 校验（角色、去重、依赖存在、无环、
-  总任务数上限）后加入 pending。失败/取消的 worker 的提议被忽略。
-- 所有调整都受硬上限约束（`max_rounds`、`max_tasks`、任务级预算）。
-  worker 不能提议 implement —— 写范围必须来自 planner/用户。
+  2 个**只读**任务；scheduler 在完成点做 host 校验（角色、去重、依赖存在、
+  无环、总任务数上限）后立即加入 ready 队列。失败/取消的 worker 的提议被忽略。
+- 所有调整都受硬上限约束（`max_tasks`、`checkpoint_every`、全局 deadline、
+  任务级预算）。worker 不能提议 implement —— 写范围必须来自 planner/用户。
 
 ---
 
@@ -198,7 +212,7 @@ class TaskSpec(TypedDict):
     depends_on: list[str]
     depends_mode: Literal["full", "any"]  # full=必须 success；any=success/partial
     write_scope: list[str]       # Phase 3C 才允许非空
-    budget: dict                 # max_rounds / timeout / tokens
+    max_rounds / timeout / max_tokens / priority   # 任务级预算与调度优先级
 ```
 
 ### 6.2 校验
@@ -223,7 +237,11 @@ class TaskSpec(TypedDict):
 - 动态只读提议在 worker 完成点校验并立即入队；
 - `orchestrator_checkpoint_every` 到达时 drain 在飞任务并返回父图，形成
   checkpoint/steering 边界；pause 只在边界 `interrupt()`；
-- 全局 `orchestrator_run_deadline_s` 与每个 worker 的独立 timeout 共同兜底。
+- 全局 `orchestrator_run_deadline_s` 与每个 worker 的独立 timeout 共同兜底；
+- 429/限流时临时降低并发并按 `orchestrator_rate_limit_backoff_s` 指数退避，
+  成功后逐步恢复；
+- `orchestrator_write_plan_approval=true` 时，scheduler 启动前由 `write_gate`
+  一次性确认整批 `write_scope`；并发区自身不弹审批。
 
 ### 6.4 状态
 
@@ -238,7 +256,9 @@ worker_results: list[dict]
 orchestrator_round: int
 orchestrator_degraded: bool
 orchestrator_summary: str
-worker_context: str
+worker_context: str          # planner/act 使用
+worker_brief: str            # 紧凑副本
+orchestration_artifacts: list[dict]  # .agent/artifacts/ 索引
 ```
 
 生命周期：`planner` 在每次 run 初始化；新节点只写自己的字段；`respond` 只读。
@@ -329,17 +349,18 @@ CLI `agent run` 与 Web 不提供实时控制入口，只透传事件。
 
 ### 10.2 机制
 
-- `steering.SteeringController`：进程内、按 `thread_id` 隔离的指令队列；
+- `steering.SteeringController`：按 `thread_id` 隔离的指令队列；
+  未消费指令与 pause 标记原子落盘到 `.agent/steering/`，跨进程可恢复；
   runtime 通过 `steer()` 入队，图节点在边界消费；
 - 四个消费点：
-  - `steering_plan`（任务图生成后、dispatch 前）；
-  - `steering_dispatch`（每批 worker 之后）；
+  - `steering_plan`（任务图生成后、scheduler 前）；
+  - `steering_dispatch`（每个 scheduler checkpoint 边界之后）；
   - `steering_step`（direct 模式一步之后、replan 前）；
   - `steering_final`（所有进入 respond 之前，覆盖单步任务）；
 - pause 用 `interrupt()` 挂起、checkpoint 保存图状态；恢复重跑节点时，
   先回填同批其它命令，避免丢失；
 - cancel 是**协作式**的：只读/写 worker 在每轮 LLM 与每次工具执行前检查；
-  implement worker 取消后清理 worktree、不生成 patch；dispatch 在合并前
+  implement worker 取消后清理 worktree、不生成 patch；scheduler 在合并前
   再检查一次，取消时丢弃本批未合并 patch；
 - `/add` 只接受只读角色；自由文本无法安全推断 write_scope；
 - `/replan` 保留 success/partial 任务，只让模型生成剩余任务；若已有
@@ -366,12 +387,16 @@ CLI `agent run` 与 Web 不提供实时控制入口，只透传事件。
 - `WorkflowSelected(workflow, reason)`
 - `TaskGraphCreated(tasks, degraded)`
 - `TaskGraphExtended(added, rejected)` —— worker 提议经 host 校验后追加的只读任务
-- `WorkerStarted(worker_id, task_id, role, goal, attempt)` —— **实时**：
-  dispatch 通过 LangGraph `get_stream_writer()` 在拿到并发槽位后立即发出；
+- `WorkerStarted(worker_id, task_id, role, goal, attempt, queue_wait_ms)` ——
+  **实时**：scheduler 在拿到并发槽位后立即通过 `get_stream_writer()` 发出；
 - `WorkerFinished(worker_id, task_id, role, status, summary, tokens, duration_ms,
-  merged, merge_error)` —— 只读 worker 完成即发；implement 等到主工作区合并
-  之后才发，保证 `merged` 准确；
+  merged, merge_error, timed_out, artifact_id, scope_violations)` —— 只读
+  worker 完成即发；implement 等到主工作区合并之后才发，保证 `merged` 准确；
 - `OrchestrationFinished(completed, failed, summary)`
+- `CostReport(run_id, tokens, cost_usd, budget_usd, ratio, alerts,
+  cache_hit_tokens, cache_miss_tokens, providers)`
+- `ContextTrimmed(node, trimmed, before/after_chars, before/after_tokens, escalated)` ——
+  每次 act/respond 裁剪后的实际输入规模；`trimmed=0` 也会发，便于基线对比
 - `SteeringApplied(action, task_id)`
 - `WorkflowRevised(reason, tasks)`
 - `RunFinished` / `RunFailed` 额外带 `worker_input_tokens` /
@@ -388,16 +413,39 @@ runtime 同时消费 `messages` / `updates` / `custom` 三种流，并用
 
 ## 12. 成本与收敛
 
-- 全局预算：墙钟、token、工具调用；
-- 任务级预算：`max_rounds`、`timeout`、token；
+- 全局预算：`orchestrator_run_deadline_s`、任务/worker token、工具轮次；
+- 任务级预算：`max_rounds`、`timeout`、`max_tokens`（explore/implement 已接入）；
 - worker 级预算：独立轮次/超时；
-- 编排轮次上限：`orchestrator_max_rounds`；
-- 委派预算：复用仓库规模分级（已实现）；
-- 停滞检测：同一失败签名跨 repair/replan 累积（已实现）；
-- 递归上限：按图拓扑推导，新增节点必须同步公式。
+- 调度边界：`orchestrator_checkpoint_every`；
+- 限流退避：429 时降并发 + `orchestrator_rate_limit_backoff_s` 指数退避；
+- 委派预算：复用仓库规模分级；
+- 停滞检测：同一失败签名跨 repair/replan 累积；
+- 递归上限：按子图 + checkpoint 边界推导，新增节点必须同步公式。
 
-成本原则：**只有当并行能带来可测量的墙钟/质量收益时才开启**；否则保持
-`direct`。默认关闭编排模式。
+成本原则：**只有当并行能带来可测量的收益时才开启**；小任务仍走 `direct`。
+编排默认开启，但只对达到 `orchestrator_min_files` 的仓库生效。
+
+### 12.1 上下文与记忆
+
+- **双预算**：`context_max_chars` 与 `context_max_tokens`（保守估算）任一超出即降档；
+  最近 `keep_recent` 条也纳入总预算，只有「常规 `tool_chars` 裁剪」不碰它们；
+- **400 自动降档**：`act` / `respond` 遇到 context-length 400 时用 `tighter_budget()`
+  重裁一次并重试（字符/ token 减半、窗口减半），仍失败才抛出；
+- **确定性摘要**：裁剪前从历史提取「用户目标 / 最近结论 / 最近工具动作」注入
+  system prompt，不额外调模型；
+- **记忆检索**：每次运行按请求相关度取 top-K（`memory_top_k`）注入；
+  模型可在运行中用 `memory_search` 按需检索，`--write` 会话另有 `memory_save`；
+  explore/review/implement worker 也按任务目标注入相关记忆；
+- **记忆治理**：写入前扫描密钥；高度相似的事实保留最新版本；来源/时间/过期
+  记录在 `memory.meta.json`；跨进程写入用沙箱内 `mkdir` 锁串行化；
+- **分层指令**：`AGENTS.md` / `CLAUDE.md` 从根目录到 4 层子目录发现并合并，
+  与长期记忆分开管理；
+- **可观测**：`ContextTrimmed` 事件给出裁剪前后字符/ token 与是否降档；
+  `CostReport` 增加 provider prefix cache 命中/未命中 token；
+- **会话时间旅行**：`checkpoints` 列表 + `fork` / `rewind`；回退是在旧
+  checkpoint 上新建分支，历史不删除；checkpoint 按 `checkpoint_keep` 轮转；
+- **专项标尺**：`tests/eval/context_memory_bench.py` 测长会话压缩后的关键信息
+  保持率与记忆 recall@K（确定性、无模型）。
 
 ---
 
@@ -444,12 +492,12 @@ runtime 同时消费 `messages` / `updates` / `custom` 三种流，并用
 - `survey`（复用 RepoProfile + 测试命令探测）；
 - `select_workflow`（规则优先 + LLM 兜底）；
 - `plan_tasks`（2–6 个 explore/test 任务，校验/降级）；
-- `dispatch → extend_tasks → steering_dispatch`（并发、依赖、失败隔离、轮次上限、
-  worker 提议扩展）；
+- `scheduler ⇄ steering_dispatch`（事件驱动并发、依赖即时解锁、失败隔离、
+  checkpoint 边界、动态只读提议）；
 - `synthesize` → 现有 `planner`；`worker_context` 注入 planner/act；
 - `WorkflowSelected` / `TaskGraphCreated` / `WorkerStarted` / `WorkerFinished` /
   `OrchestrationFinished` 事件与审计；
-- `AGENT_ORCHESTRATOR_*` 配置，默认关闭。
+- `AGENT_ORCHESTRATOR_*` 配置；小仓库仍走 `direct`。
 
 **历史烟雾**（`long/discount_and_audit`，单轮、不可比）：通过 1/1，
 `parallel_readonly`，5 任务 / 4 worker（最大同批 4）。当前评测口径与验证记录见
@@ -480,19 +528,21 @@ test worker 失败后重试 1 次，最终自动验证通过。review 任务在�
 - `implement` role；任务图必须给出 `write_scope`，不同 implement 的 scope
   不能重叠，implement 之间不能互相依赖；
 - 每个 implement worker 在独立 `git worktree` 中运行，工具只作用于该 worktree；
-- 完成后导出 binary patch，dispatch 在主工作区**顺序** `git apply`；
+- 完成后导出 binary patch，scheduler 在主工作区**顺序** `git apply`；
   先 `--check`，失败则不改主工作区并标 failed；
 - 写模式前置条件：`AGENT_ORCHESTRATOR_WRITE_ENABLED=true`、会话 `--write`、
   工作区是**git 仓库根**且干净；`.agent/` 与 `__pycache__/` 不计入脏改动；
 - 合并前先 `git apply --check`，再为补丁涉及的主工作区文件留快照；
   `worker_results` 记录 `snapshot_ids`，`agent undo` 可回滚合并；
+- 同一批 implement 补丁作为**一个事务**：全部 check/快照后顺序 apply；
+  任一失败反向撤销已应用补丁，必要时恢复快照，避免半合并状态；
 - worker 内部工具调用逐条写审计（含 `agent_id`/`task_id`），eval 记录
   `worker_tool_calls` / `worker_merged`；
 - 任务图校验失败时，写模式退化为**一个** implement 任务：优先覆盖源码顶层目录，
   扁平仓库退到顶层文件；两者都没有时显式报告降级，不静默消失；
 - worktree/patch 文件名在截断后附加短哈希，避免长任务 id 共用路径；
-- implement 的 git/worktree/快照/补丁操作都走 `asyncio.to_thread`，dispatch 的
-  合并也如此，避免同步 `wsl.exe` 调用阻塞同批其它 worker 与事件流。
+- implement 的 git/worktree/快照/补丁操作都走 `asyncio.to_thread`，scheduler 的
+  合并也如此，避免同步 `wsl.exe` 调用阻塞其它 worker 与事件流。
 
 **烟雾实测 1**（`long/discount_and_audit`，写编排开启）：
 

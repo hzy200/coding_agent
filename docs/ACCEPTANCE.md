@@ -27,8 +27,12 @@
 | 命令分级审批 | `sandbox/policy.py` + `graph/nodes/approve.py` + `interrupt()` | 场景 2 演示 |
 | 审计日志 | `audit/`；由 runtime 写，任何前端绕不过 | `agent audit` |
 | checkpoint 回滚 | checkpoint 负责**会话状态**恢复；快照负责**文件内容**回滚 | `test_checkpointer.py` + `agent undo` |
+| 会话分叉/回退 | `AgentRuntime.fork/rewind`；历史不删除，回退即新建分支 | `agent fork` / `agent rewind`；`test_runtime_checkpoints.py` |
+| 上下文治理 | 字符 + 估算 token 双预算、400 降档重试、确定性摘要、`ContextTrimmed` 指标 | `tests/eval/context_memory_bench.py` |
+| 长期记忆治理 | top-K 相关注入、`memory_search`/`memory_save`、冲突替换、过期、来源、写入锁与密钥扫描 | `test_memory.py` + `context_memory_bench.py` |
+| 分层项目指令 | 发现并合并 `AGENTS.md` / `CLAUDE.md`（根目录到 4 层子目录） | `agent run` 系统提示；`test_instructions.py` |
 | 运行中实时干预 | `steering.py` + `graph/nodes/steering.py` + TUI 斜杠命令 | TUI `/pause` `/resume` `/cancel` `/add` `/replan`；`test_steering.py` |
-| 动态任务图 + 并发 worker | `orchestrator/`（survey/工作流/任务图/dispatch/extend/fan-in） | `test_orchestrator.py`；[tests/eval/README](../tests/eval/README.md) |
+| 动态任务图 + 并发 worker | `orchestrator/`（survey/plan/scheduler/fan-in） | `test_orchestrator.py`；[tests/eval/README](../tests/eval/README.md) |
 | 流式输出 | 事件流 → CLI/TUI 逐字渲染 / Web SSE | `agent chat`；`/api/run` |
 | Web/UI 最小验证 | `web/`（SSE 对话 + 多会话 + 联通测试） | `agent web` |
 | LangSmith 追踪 | `runtime._trace_metadata` + `config.apply_tracing_env` | `agent doctor` + LangSmith 项目 |
@@ -72,7 +76,7 @@ review 的「改动前」**直接复用快照**（不变量 8：所有写操作�
 ruff check .
 
 # 2. 全量测试（含真实 WSL 沙箱）
-pytest -m "not llm"          # 期望 1420 passed
+pytest -m "not llm"          # 期望 1561 passed
 # 另有 3 条 llm 标记用例需要 DEEPSEEK_API_KEY；不要用裸 pytest 代替 ——
 # 不加 -m 时它们会真的调用模型（本机配了 key 就产生费用）。
 
@@ -92,11 +96,12 @@ python scripts/demo.py --only 1
 
 | 项 | 结果 |
 |---|---|
-| 测试 | **1420 passed**（`pytest -m "not llm"`，含真实 WSL），其中 `wsl` 标记 **207**，无失败；另 3 条 `llm` 用例需 API Key |
-| 覆盖率 | **89.1%**（`pytest -m "not llm" --cov`，含真实 WSL）；**CI 子集 81.5%**，门槛 `fail_under=76` |
+| 测试 | **1561 passed**（`pytest -m "not llm"`，含真实 WSL），其中 `wsl` 标记 **211**，无失败；另 3 条 `llm` 用例需 API Key |
+| 覆盖率 | **87.5%**（`pytest -m "not llm" --cov`，含真实 WSL）；**CI 子集 80.7%**，门槛 `fail_under=76` |
 | lint | 干净（`ruff check src tests`） |
-| 快反馈 | `pytest -m "not wsl and not llm"` = **1213 passed**（deselect 210 = 207 个 `wsl` + 3 个 `llm`，两组无交集）；需装齐 `.[dev,ui,web]`，缺 `textual` 时 TUI 整目录 skip（TUI 49 条） |
+| 快反馈 | `pytest -m "not wsl and not llm"` = **1350 passed**（deselect 214 = 211 个 `wsl` + 3 个 `llm`，两组无交集）；需装齐 `.[dev,ui,web]`，缺 `textual` 时 TUI 整目录 skip（TUI 49 条） |
 | 能力评测 | **两个套件，各记各的基线**：`default` 29 个短任务最新两轮 **29/29、29/29（100%，spread 0，无翻转）** —— 该套件已**饱和**，测不出进一步改进；旧基线 12/29 = 41.4% 只能当历史坐标。`long` 原有 5 个长程任务（38 文件 / 近千行仓库，改动跨度 3–8 文件，通过率 **2/5 = 30%**，`spread` 20pp；新增 `parallel_modules` 后共 6 个，旧 5 任务基线只能当历史坐标）。报告带机制指标、worker 成本/并发/冲突与噪声块；对比与干预延迟见 [tests/eval/README](../tests/eval/README.md) |
+| LangSmith | `coding-agent-full-v1` 共 **150** 条（139 capability + 11 mechanism）：**11/11 mechanism、6/6 smoke capability、139 capability 全量 138/139 = 99.3%**；`full` 套件 **104/104** 种子失败且参考解通过；量化报告见 [LANGSMITH_REPORT.md](LANGSMITH_REPORT.md)；真实 CLI direct 修复与 4-worker 并发写编排均通过 |
 | CI | `.github/workflows/ci.yml`：`pip install -e ".[dev,ui,web]"` → ruff → `pytest -m "not wsl and not llm"` |
 
 > **口径提醒**：单次运行的通过率**说明不了任何事**。同一份代码曾跑出 52% 与 83%
@@ -110,9 +115,9 @@ python scripts/demo.py --only 1
 > **口径提醒**：全量一律写 `pytest -m "not llm"`。裸 `pytest` 会把那 3 条 `llm` 用例一起跑、
 > 真的调用模型 —— 本机 `.env` 配了 key 就计费，而它们本意是"需要时手动跑"。
 >
-> **CI 与本地不是一回事**：CI 是 Linux runner、没有 WSL2，只跑快反馈那 1196 个用例，
-> 覆盖率 81.3%。沙箱层与能力层的覆盖（`tools/files.py` 85%、`sandbox/snapshots.py` 88%）
-> 全靠 `-m wsl` 的 207 个用例，它们**只在本地执行**。CI 会以 `::warning::` 显式提示这个缺口 ——
+> **CI 与本地不是一回事**：CI 是 Linux runner、没有 WSL2，只跑快反馈那 1309 个用例，
+> 覆盖率 80.7%。沙箱层与能力层的覆盖（`tools/files.py` 85%、`sandbox/snapshots.py` 88%）
+> 全靠 `-m wsl` 的 211 个用例，它们**只在本地执行**。CI 会以 `::warning::` 显式提示这个缺口 ——
 > 详见 [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md) 的 Q1。
 >
 > 上面每个数字都是量出来的，命令见本节第 2–4 条；改动后请重跑核对，别手抄。
@@ -130,7 +135,9 @@ python scripts/demo.py --only 1
 
 **长期记忆只支持显式增删，不做 LLM 自动提炼。**
 自动记忆容易积累噪声，也难以回答"这条结论是哪来的"。
-在一个主打可审计的系统里，这个交换不划算。
+在一个主打可审计的系统里，这个交换不划算。模型可以在运行中调用
+`memory_search` 检索、在 `--write` 会话调用 `memory_save` 写一条具体事实，
+但宿主不做后台蒸馏；每一条记忆仍是一次明确的、可见的工具调用。
 
 **内存上限默认关闭。**
 `ulimit -v` 默认 0（不限）。JVM / Node / 编译器会索取远超实际使用的
@@ -160,9 +167,11 @@ pause/cancel 不会打断正在跑的 LLM 轮次或同步工具；steering 队�
 沙箱里没装 ripgrep，自动退到 `grep`/`find`。两个后端输出格式一致（grep 分支显式 `-E`），
 但大仓库上 grep 会更慢。`agent doctor` 会显示当前用的是哪个。
 
-**上下文裁剪按字符数，不是 token；用量则按 provider 回报累计。**
-裁剪不引入 tokenizer 依赖（按字符，够用）；每次运行的 token 用量取自模型的
-`usage_metadata`，累计写入 `run_end` 审计（provider 未回报时为 `None`）。
+**上下文裁剪用字符 + 估算 token 双预算，不引入 tokenizer；用量则按 provider 回报累计。**
+`AGENT_CONTEXT_MAX_TOKENS` 默认 0（只按字符），打开后按「CJK 约 1 字/token、
+其余约 4 字符/token」的保守估算再兜一层。遇到 context-length 400 时 act/respond
+会用减半预算重裁并重试一次。每次运行的 token 用量仍取自模型的 `usage_metadata`，
+累计写入 `run_end` 审计（provider 未回报时为 `None`）。
 **成本预算与模型分层未实现**：worker/总 token 只计量与报告，运行中不会因超预算硬停。
 
 **共享文件的并发写未实现。**
@@ -250,7 +259,7 @@ pause/cancel 不会打断正在跑的 LLM 轮次或同步工具；steering 队�
 - [x] `/pause` 在四个节点边界消费，`interrupt()` + checkpoint 挂起；
       `/resume` 通过 `resume_steering()` 继续，恢复次数受 `AGENT_MAX_RESUMES` 限制；
 - [x] `/cancel` 协作式取消：只读/写 worker 在轮次与工具执行前检查；
-      implement worker 取消后不生成 patch；dispatch 合并前再检查一次；
+      implement worker 取消后不生成 patch；scheduler 合并前再检查一次；
 - [x] 已合并的 implement 改动保留（明确策略），未合并 patch 丢弃；
 - [x] `/add` 只追加只读任务（explore/test/review）；direct 模式追加计划步骤；
 - [x] `/replan` 保留 success/partial 任务，只重建剩余任务；已合并写补丁后
@@ -288,7 +297,7 @@ cancel apply **8.6ms**。
 - [x] `RunFinished` / `RunFailed` 增加 `worker_input_tokens` /
       `worker_output_tokens`，TUI 显示；主 agent token 口径不变；
 - [x] eval 的 `max_worker_batch` 改为按活跃 worker 数统计，适配实时交错事件；
-- [x] implement 的 git/worktree/快照/patch 与 dispatch 合并统一
+- [x] implement 的 git/worktree/快照/patch 与 scheduler 合并统一
       `asyncio.to_thread`，避免阻塞事件循环；
 - [x] `ruff`、CI 子集、全量、WSL 集成、TUI 通过。
 
@@ -314,7 +323,7 @@ workflow `orchestrated_implement`；planner 生成 2 个 implement + 1 test + 1 
 ### 5.7 D 批：worker 驱动的动态任务图（已实现）
 
 - [x] explore/review 的结构化报告可带 `proposed_tasks`（每个 worker 最多 2 个）；
-- [x] `extend_tasks` 节点在每批 dispatch 之后消费提议，经 host 校验后加入
+- [x] `scheduler` 在 worker 完成点消费提议，经 host 校验后加入
       pending：仅 explore/test/review、非空 goal、去重、依赖必须已存在、
       总任务数不超过 `orchestrator_max_tasks`、拒绝 write_scope 与环；
 - [x] failed/cancelled worker 的提议不采纳；partial worker 的提议仍可采纳；

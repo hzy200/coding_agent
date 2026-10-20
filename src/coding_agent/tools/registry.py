@@ -16,11 +16,14 @@ from langchain_core.tools import BaseTool
 
 from coding_agent.config import Settings, get_settings
 from coding_agent.sandbox.wsl_exec import WslSandbox
+from coding_agent.tools.code_intel import build_code_intel_tool
 from coding_agent.tools.deps import build_deps_tools
 from coding_agent.tools.files import build_file_tools
 from coding_agent.tools.git import build_git_tools
+from coding_agent.tools.memory import build_memory_tools
 from coding_agent.tools.search import build_search_tools
 from coding_agent.tools.shell import build_shell_tool
+from coding_agent.tools.symbols import build_symbol_tool
 from coding_agent.tools.testrun import build_test_tool
 
 
@@ -43,7 +46,9 @@ def build_tools(
     settings = settings or get_settings()
     sandbox = sandbox or WslSandbox(settings)
 
-    tools: list[BaseTool] = [build_shell_tool(settings, sandbox)]
+    tools: list[BaseTool] = [
+        build_shell_tool(settings, sandbox, read_cache=read_cache)
+    ]
     # 其余工具与 shell 共用同一个 sandbox 实例，工作区边界一致
     tools += build_file_tools(
         settings,
@@ -52,8 +57,16 @@ def build_tools(
         write_scope=write_scope,
         read_cache=read_cache,
     )
+    tools += build_memory_tools(
+        settings,
+        sandbox,
+        allow_write=allow_write,
+        read_cache=read_cache,
+    )
     tools += build_git_tools(settings, sandbox)
     tools += build_deps_tools(settings, sandbox)
     tools += build_search_tools(settings, sandbox)
+    tools.append(build_symbol_tool(settings, sandbox))
+    tools.append(build_code_intel_tool(settings, sandbox))
     tools.append(build_test_tool(settings, sandbox))
     return tools

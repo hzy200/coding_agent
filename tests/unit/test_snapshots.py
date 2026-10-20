@@ -57,6 +57,11 @@ class _FakeFs:
         self.files[path] = content
         return len(content.encode("utf-8"))
 
+    def write_many(self, files: dict[str, str]) -> int:
+        for path, content in files.items():
+            self.write_text(path, content)
+        return sum(len(value.encode("utf-8")) for value in files.values())
+
     def read_text(self, path: str, *, max_bytes: int) -> str:
         if path not in self.files:
             raise SandboxFsError(f"文件不存在：{path}")
@@ -97,6 +102,24 @@ def test_creating_a_file_leaves_a_snapshot() -> None:
     entry = store.latest_for(f"{ROOT}/new.py")
     assert entry is not None
     assert entry.snapshot_id == snapshot_id
+
+
+def test_save_many_writes_all_snapshots_in_one_batch() -> None:
+    store, files = _store()
+
+    ids = store.save_many(
+        [
+            (f"{ROOT}/a.py", "old a", True),
+            (f"{ROOT}/new.py", "", False),
+        ]
+    )
+
+    assert len(ids) == 2
+    assert store.read(store.latest_for(f"{ROOT}/a.py")) == "old a"  # type: ignore[arg-type]
+    absent_markers = [
+        path for path in files if path.endswith(".absent")
+    ]
+    assert absent_markers
 
 
 def test_absent_marker_is_not_a_snapshot_entry() -> None:

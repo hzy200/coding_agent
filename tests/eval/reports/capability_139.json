@@ -1,0 +1,199 @@
+{
+  "project": "coding-agent-capability-139-61440d65",
+  "total": 139,
+  "passed": 138,
+  "pass_rate": 0.9928,
+  "verdicts": {
+    "passed": 138,
+    "failed": 1
+  },
+  "categories": {
+    "cross_file": {
+      "total": 35,
+      "passed": 35,
+      "pass_rate": 1.0
+    },
+    "debug": {
+      "total": 29,
+      "passed": 28,
+      "pass_rate": 0.9655
+    },
+    "single_file": {
+      "total": 63,
+      "passed": 63,
+      "pass_rate": 1.0
+    },
+    "spec": {
+      "total": 12,
+      "passed": 12,
+      "pass_rate": 1.0
+    }
+  },
+  "tiers": {
+    "basic": {
+      "total": 110,
+      "passed": 110,
+      "pass_rate": 1.0
+    },
+    "deep": {
+      "total": 17,
+      "passed": 16,
+      "pass_rate": 0.9412
+    },
+    "long": {
+      "total": 12,
+      "passed": 12,
+      "pass_rate": 1.0
+    }
+  },
+  "workflows": {
+    "direct": 133,
+    "parallel_readonly": 6
+  },
+  "tokens": {
+    "main_input": {
+      "sum": 12069467.0,
+      "avg": 86830.7,
+      "p50": 55589.0,
+      "p95": 139583.0,
+      "max": 799351.0
+    },
+    "main_output": {
+      "sum": 223094.0,
+      "avg": 1604.99,
+      "p50": 1225.0,
+      "p95": 3162.0,
+      "max": 10081.0
+    },
+    "worker_input": {
+      "sum": 0.0,
+      "avg": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "max": 0.0
+    },
+    "worker_output": {
+      "sum": 0.0,
+      "avg": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "max": 0.0
+    },
+    "subagent_input": {
+      "sum": 0.0,
+      "avg": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "max": 0.0
+    },
+    "subagent_output": {
+      "sum": 0.0,
+      "avg": 0.0,
+      "p50": 0.0,
+      "p95": 0.0,
+      "max": 0.0
+    },
+    "total_tokens": 12292561.0,
+    "missing_main_usage": 0
+  },
+  "runtime_seconds": {
+    "agent": {
+      "sum": 4309.29,
+      "avg": 31.0,
+      "p50": 24.64,
+      "p95": 51.28,
+      "max": 188.57
+    },
+    "judge": {
+      "sum": 28.12,
+      "avg": 0.2,
+      "p50": 0.2,
+      "p95": 0.24,
+      "max": 0.33
+    },
+    "wall_span": "2026-10-20T08:24:03.047304+00:00 .. 2026-10-20T07:58:56.828157+00:00"
+  },
+  "mechanism": {
+    "tool_calls": {
+      "sum": 1177.0,
+      "avg": 8.47,
+      "p50": 7.0,
+      "p95": 15.0,
+      "max": 34.0
+    },
+    "writes": {
+      "sum": 217.0,
+      "avg": 1.56,
+      "p50": 1.0,
+      "p95": 3.0,
+      "max": 14.0
+    },
+    "steps": {
+      "sum": 512.0,
+      "avg": 3.68,
+      "p50": 3.0,
+      "p95": 5.0,
+      "max": 8.0
+    },
+    "replans_total": 57.0,
+    "workers_total": 27.0,
+    "worker_retries_total": 5.0,
+    "worker_merge_conflicts_tasks": 0,
+    "verifications": {
+      "ok": 153,
+      "failed": 80
+    },
+    "worker_statuses": {
+      "failed": 10,
+      "partial": 15,
+      "success": 2
+    }
+  },
+  "failures": [
+    {
+      "case_id": "replan/many_symptoms_one_cause",
+      "category": "debug",
+      "passed": false,
+      "verdict": "failed",
+      "detail": "在根因上，这个没被可见测试覆盖的调用方才会跟着对。 ... ok\n\n======================================================================\nFAIL: test_coupon_price (test_shop.ShopTest.test_coupon_price)\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/home/hong/agent-ws/.agent/eval/replan/many_symptoms_one_cause/test_shop.py\", line 14, in test_coupon_price\n    self.assertEqual(coupon.price_with_coupon(49.95, 30), 34.96)\nAssertionError: 34.97 != 34.96\n\n----------------------------------------------------------------------\nRan 5 tests in 0.001s\n\nFAILED (failures=1)",
+      "error": "",
+      "metrics": {
+        "agent_seconds": 59.91273840000213,
+        "budget": null,
+        "input_tokens": 229722,
+        "judge_seconds": 0.21599109999806387,
+        "max_delegate_batch": 0,
+        "max_worker_batch": 0,
+        "output_tokens": 4268,
+        "repairs": 4,
+        "replans": 4,
+        "steps": 5,
+        "subagent_input_tokens": 0,
+        "subagent_output_tokens": 0,
+        "subagent_statuses": {},
+        "subagents": 0,
+        "tasks_planned": 0,
+        "tier": "deep",
+        "tool_calls": 12,
+        "verifications": {
+          "failed": 6
+        },
+        "worker_conflicts": 0,
+        "worker_input_tokens": 0,
+        "worker_merge_attempts": 0,
+        "worker_merged": 0,
+        "worker_output_tokens": 0,
+        "worker_retries": 0,
+        "worker_roles": {},
+        "worker_seconds": 0.0,
+        "worker_statuses": {},
+        "worker_tool_calls": 0,
+        "workers": 0,
+        "workflow": "",
+        "writes": 2
+      },
+      "start_time": "2026-10-20T07:58:56.836157+00:00",
+      "end_time": "2026-10-20T07:59:58.370260+00:00"
+    }
+  ]
+}

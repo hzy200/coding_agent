@@ -33,6 +33,7 @@ from coding_agent.config import Settings, get_settings, shadowed_env_keys
 from coding_agent.events import (
     ApprovalRequested,
     AssistantToken,
+    CostReport,
     Event,
     FileChanged,
     OrchestrationFinished,
@@ -60,6 +61,7 @@ from coding_agent.memory.sessions import SessionIndex, format_table_rows
 from coding_agent.messages import text_of
 from coding_agent.runtime import AgentRuntime
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
+from coding_agent.steering import SteeringCommand, SteeringController
 
 
 def _configure_stdio() -> None:
@@ -286,7 +288,7 @@ def sandbox_init() -> None:
 # --------------------------------------------------------------------------
 
 async def _chat_loop(settings: Settings) -> None:
-    llm = build_llm(settings, streaming=True)
+    llm = build_llm(settings, streaming=True, task_type="chat")
     history: list[Any] = [SystemMessage(content=SYSTEM_PROMPT)]
     console.print("[dim]纯对话模式（无工具）。输入 exit 退出。[/]\n")
 
@@ -498,6 +500,18 @@ def _make_renderer() -> Callable[[Event], None]:
         elif isinstance(event, RunFailed):
             console.print(f"\n[red]运行失败：{escape(event.message)}[/]")
 
+        elif isinstance(event, CostReport):
+            line = f"成本 ${event.cost_usd:.4f}"
+            if event.budget_usd > 0:
+                line += f" / 预算 ${event.budget_usd:.2f}（{event.ratio:.0%}）"
+            if event.billed_usd:
+                line += f" / 账单 ${event.billed_usd:.4f}（差 ${event.billing_delta_usd:+.4f}）"
+            console.print(f"[dim]{escape(line)}[/]")
+            if event.billing_error:
+                console.print(f"[yellow]账单对账失败：{escape(event.billing_error)}[/]")
+            for alert in event.alerts:
+                console.print(f"[yellow]⚠ {escape(alert)}[/]")
+
         elif isinstance(event, RunFinished):
             _emit("\n")
 
@@ -572,7 +586,7 @@ def run(
         "",
         "--workspace",
         "-C",
-        help="工作区，WSL 绝对路径（/mnt/d/proj）或 Windows 路径（D:\\\\proj）均可，默认用配置值",
+        help="工作区：/mnt/d/proj、wsl:/home/u/proj 或 D:\\\\proj；Git Bash 建议用 wsl: 前缀",
     ),
     write: bool = typer.Option(False, "--write", help="放开 L1 低风险写命令与文件工具写入"),
     yes: bool = typer.Option(False, "--yes", "-y", help="对 L2/L3 命令一律自动批准（跳过确认）"),
@@ -591,6 +605,34 @@ def run(
             workspace,
             assume_yes=yes,
         )
+    )
+
+
+@app.command("steer")
+def steer(
+    thread_id: str = typer.Option(..., "--thread-id", help="正在运行的会话 id"),
+    action: str = typer.Argument(..., help="pause / cancel / add / replan"),
+    text: str = typer.Option("", "--text", help="add/replan 的说明文本"),
+    role: str = typer.Option("explore", "--role", help="add 的角色：explore / test / review"),
+) -> None:
+    """向正在运行的会话注入一条实时干预指令。
+
+    指令写入 `.agent/steering/`，运行中的进程会在下一个节点边界消费。
+    跨进程 resume 仍请用 TUI 或 Web。
+    """
+    try:
+        command = SteeringCommand(
+            action=action, text=text, role=role, source="cli"
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(code=2) from exc
+
+    controller = SteeringController(get_settings().resolved_steering_dir)
+    controller.submit(thread_id, command)
+    console.print(
+        f"[green]已提交 steering[/green] {action} → {thread_id}；"
+        "运行中的 agent 会在下一个边界消费。"
     )
 
 
@@ -700,6 +742,102 @@ def sessions(
 
 
 @app.command()
+def checkpoints(
+    thread_id: str = typer.Option(..., "--thread-id", "-t", help="会话 id"),
+    limit: int = typer.Option(20, "--limit", "-n", help="最多列出多少个"),
+    workspace: str = _WORKSPACE_OPTION,
+) -> None:
+    """列出某个会话的 checkpoint（新的在前），供 fork/rewind 选落点。"""
+
+    async def _go() -> list[dict[str, Any]]:
+        runtime = AgentRuntime(get_settings(), workspace=workspace or None)
+        try:
+            return await runtime.checkpoints(thread_id, limit=limit)
+        finally:
+            await runtime.aclose()
+
+    try:
+        items = asyncio.run(_go())
+    except Exception as exc:  # noqa: BLE001 - 会话/checkpoint 不存在要给可读提示
+        console.print(f"[red]{escape(str(exc))}[/]")
+        raise typer.Exit(code=1) from exc
+    if not items:
+        console.print("[dim]没有 checkpoint。[/]")
+        return
+    table = Table(show_header=True, header_style="bold", box=None)
+    for column in ("checkpoint id", "step", "内容"):
+        table.add_column(column)
+    for item in items:
+        table.add_row(
+            item["checkpoint_id"],
+            str(item["step"]),
+            escape(item["preview"]),
+        )
+    console.print(table)
+
+
+@app.command()
+def fork(
+    thread_id: str = typer.Option(..., "--thread-id", "-t", help="源会话 id"),
+    checkpoint_id: str = typer.Option(
+        "", "--checkpoint", "-c", help="从指定 checkpoint 分叉；省略用当前状态"
+    ),
+    new_thread_id: str = typer.Option(
+        "", "--new-thread-id", help="新会话 id；省略自动生成"
+    ),
+    workspace: str = _WORKSPACE_OPTION,
+) -> None:
+    """从当前或指定 checkpoint 分叉出一个新会话。"""
+
+    async def _go() -> str:
+        runtime = AgentRuntime(get_settings(), workspace=workspace or None)
+        try:
+            return await runtime.fork(
+                thread_id,
+                checkpoint_id=checkpoint_id,
+                new_thread_id=new_thread_id,
+            )
+        finally:
+            await runtime.aclose()
+
+    try:
+        target = asyncio.run(_go())
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]{escape(str(exc))}[/]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]已分叉到 {escape(target)}[/]")
+    console.print(f'[dim]继续该会话：agent run --thread-id {escape(target)} "…"[/]')
+
+
+@app.command()
+def rewind(
+    thread_id: str = typer.Option(..., "--thread-id", "-t", help="会话 id"),
+    steps: int = typer.Option(1, "--steps", "-n", help="回退多少个 checkpoint"),
+    checkpoint_id: str = typer.Option(
+        "", "--checkpoint", "-c", help="回退到指定 checkpoint；优先于 --steps"
+    ),
+    workspace: str = _WORKSPACE_OPTION,
+) -> None:
+    """把会话回退到更早的 checkpoint（历史保留，可再次找回）。"""
+
+    async def _go() -> str:
+        runtime = AgentRuntime(get_settings(), workspace=workspace or None)
+        try:
+            return await runtime.rewind(
+                thread_id, checkpoint_id=checkpoint_id, steps=steps
+            )
+        finally:
+            await runtime.aclose()
+
+    try:
+        new_checkpoint = asyncio.run(_go())
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[red]{escape(str(exc))}[/]")
+        raise typer.Exit(code=1) from exc
+    console.print(f"[green]已回退，新 checkpoint：{escape(new_checkpoint)}[/]")
+
+
+@app.command()
 def memory(
     add: str = typer.Option("", "--add", help="新增一条项目记忆"),
     forget: int = typer.Option(0, "--forget", help="删除第 N 条（序号从 1 开始）"),
@@ -715,7 +853,11 @@ def memory(
             console.print("[green]已清空项目记忆[/]")
         elif add:
             runtime.remember(add)
-            console.print("[green]已记住[/]")
+            replaced = getattr(runtime.memory, "last_replaced", [])
+            suffix = (
+                f"（已替换旧版本：{'；'.join(replaced)}）" if replaced else ""
+            )
+            console.print(f"[green]已记住{suffix}[/]")
         elif forget:
             runtime.forget(forget)
             console.print(f"[green]已删除第 {forget} 条[/]")
@@ -836,7 +978,7 @@ def tui(
         "",
         "--workspace",
         "-C",
-        help="工作区，WSL 绝对路径（/mnt/d/proj）或 Windows 路径（D:\\\\proj）均可，默认用配置值",
+        help="工作区：/mnt/d/proj、wsl:/home/u/proj 或 D:\\\\proj；Git Bash 建议用 wsl: 前缀",
     ),
     write: bool = typer.Option(False, "--write", help="放开 L1 低风险写命令（mkdir/cp 等）"),
 ) -> None:

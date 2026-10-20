@@ -261,39 +261,94 @@ def make_readonly_runner(
         goal = str(args.get("goal", "")).strip()
         paths = [str(path).strip() for path in (args.get("paths") or []) if str(path).strip()]
         child_config = _child_config(config, call_id)
-
-        messages: list[Any] = [
-            SystemMessage(
-                content=system_prompt.format(
-                    cwd=cwd or "（未指定）", max_rounds=max_rounds
-                )
+        # 任务级预算优先于全局默认；None 继承全局。轮次/超时至少为 1，
+        # token 预算 0 表示不限制。
+        raw_rounds = args.get("max_rounds")
+        raw_timeout = args.get("timeout")
+        raw_tokens = args.get("max_tokens")
+        task_rounds = max(
+            int(raw_rounds if raw_rounds is not None else max_rounds), 1
+        )
+        task_timeout = max(
+            int(raw_timeout if raw_timeout is not None else timeout), 1
+        )
+        task_tokens = max(
+            int(
+                raw_tokens
+                if raw_tokens is not None
+                else settings.orchestrator_task_tokens or 0
             ),
-            HumanMessage(content=_task_text(parent_request, goal, paths)),
+            0,
+        )
+
+        repo_map = str(args.get("repo_map") or "").strip()
+        task_text = _task_text(parent_request, goal, paths)
+        if repo_map:
+            task_text += (
+                "\n\n仓库结构摘要（AST 生成，供定位；不是完整源码）：\n"
+                f"{repo_map}"
+            )
+
+        system_text = system_prompt.format(
+            cwd=cwd or "（未指定）", max_rounds=task_rounds
+        )
+        # 编排器按任务目标筛过的项目约定；与主 agent 的注入同源
+        memories = [
+            str(fact).strip()
+            for fact in (args.get("memories") or [])
+            if str(fact).strip()
+        ]
+        if memories:
+            system_text += (
+                "\n\n关于这个项目的长期记忆（可信，必须遵守）：\n"
+                + "\n".join(f"- {fact}" for fact in memories)
+            )
+        instructions = str(args.get("instructions") or "").strip()
+        if instructions:
+            system_text += f"\n\n{instructions}"
+        messages: list[Any] = [
+            SystemMessage(content=system_text),
+            HumanMessage(content=task_text),
         ]
         records: list[dict[str, Any]] = []
         input_tokens = 0
         output_tokens = 0
+        llm_ms = 0
+        tool_ms = 0
         rounds = 0
         error = ""
         truncated = False
         responded = False
         cancelled = False
+        budget_exhausted = False
+        timed_out = False
         final_text = ""
 
         async def _loop() -> None:
             nonlocal input_tokens, output_tokens, rounds, truncated, responded
-            nonlocal cancelled, final_text
-            for round_index in range(1, max_rounds + 1):
+            nonlocal cancelled, budget_exhausted, final_text
+            nonlocal llm_ms, tool_ms
+            for round_index in range(1, task_rounds + 1):
                 if cancel is not None and cancel():
                     cancelled = True
                     return
                 rounds = round_index
+                llm_started = time.monotonic()
                 response = await child_llm.ainvoke(messages, child_config)
+                llm_ms += int((time.monotonic() - llm_started) * 1000)
                 responded = True
                 used_in, used_out = _usage(response)
                 input_tokens += used_in
                 output_tokens += used_out
                 messages.append(response)
+                if (
+                    task_tokens > 0
+                    and input_tokens + output_tokens >= task_tokens
+                ):
+                    budget_exhausted = True
+                    truncated = True
+                    final_text = text_of(response).strip()
+                    return
 
                 calls = getattr(response, "tool_calls", None) or []
                 if not calls:
@@ -332,6 +387,7 @@ def make_readonly_runner(
                         except Exception as exc:  # noqa: BLE001 - 子工具失败回灌给子模型
                             content = f"工具执行异常：{type(exc).__name__}: {exc}"
                         duration_ms = int((time.monotonic() - tool_started) * 1000)
+                        tool_ms += duration_ms
                     records.append(
                         {
                             "call_id": tool_call_id,
@@ -353,20 +409,22 @@ def make_readonly_runner(
             truncated = True
 
         try:
-            await asyncio.wait_for(_loop(), timeout=timeout)
+            await asyncio.wait_for(_loop(), timeout=task_timeout)
         except TimeoutError:
-            error = f"探索超时（>{timeout}s）"
+            timed_out = True
+            error = f"探索超时（>{task_timeout}s）"
         except Exception as exc:  # noqa: BLE001 - 子智能体失败不能拖垮主图
             error = f"{type(exc).__name__}: {exc}"
 
         report: ExploreReport | None = None
         if responded and not cancelled:
             report = _parse_report_text(final_text)
-        if report is None and responded and not cancelled:
+        if report is None and responded and not cancelled and not budget_exhausted:
             transcript = _transcript(messages, _MAX_TRANSCRIPT_CHARS)
             # 报告调用也受同一个墙钟预算约束：循环若已用满，只给它剩余时间。
-            remaining = max(timeout - (time.monotonic() - started), 1.0)
+            remaining = max(task_timeout - (time.monotonic() - started), 1.0)
             try:
+                report_started = time.monotonic()
                 payload = await asyncio.wait_for(
                     report_llm.ainvoke(
                         [
@@ -379,6 +437,7 @@ def make_readonly_runner(
                     ),
                     timeout=remaining,
                 )
+                llm_ms += int((time.monotonic() - report_started) * 1000)
                 if isinstance(payload, dict):
                     raw = payload.get("raw")
                     used_in, used_out = _usage(raw)
@@ -442,6 +501,9 @@ def make_readonly_runner(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             duration_ms=int((time.monotonic() - started) * 1000),
+            llm_ms=llm_ms,
+            tool_ms=tool_ms,
+            timed_out=timed_out,
             error=error,
         )
 
