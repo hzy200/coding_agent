@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
+
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
 
@@ -24,6 +26,7 @@ from coding_agent.memory.longterm import (
 )
 from coding_agent.sandbox.fs import SandboxFs
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
+from coding_agent.tools.artifacts import CallArtifact, pack
 
 MEMORY_SEARCH = "memory_search"
 MEMORY_SAVE = "memory_save"
@@ -65,7 +68,7 @@ def build_memory_tools(
     sandbox: WslSandbox,
     *,
     allow_write: bool = False,
-    read_cache: dict[str, bytes] | None = None,
+    read_cache: MutableMapping[str, bytes] | None = None,
 ) -> list[BaseTool]:
     workspace = resolve_workspace(settings, sandbox)
     fs = SandboxFs(sandbox, workspace, cache=read_cache)
@@ -75,22 +78,34 @@ def build_memory_tools(
         del reason
         facts = memory.search(query, limit)
         if not facts:
-            return "当前没有项目记忆。"
+            return pack(
+                "当前没有项目记忆。",
+                CallArtifact(tool=MEMORY_SEARCH, ok=True),
+            )
         total = len(memory.load())
         lines = "\n".join(f"- {fact}" for fact in facts)
-        return f"项目记忆（显示 {len(facts)} / {total} 条）：\n{lines}"
+        return pack(
+            f"项目记忆（显示 {len(facts)} / {total} 条）：\n{lines}",
+            CallArtifact(tool=MEMORY_SEARCH, ok=True),
+        )
 
     def _save(fact: str, reason: str, ttl_days: int | None = None) -> str:
         del reason
         try:
             facts = memory.add(fact, source="model", ttl_days=ttl_days)
         except MemoryError as exc:
-            return f"记忆保存失败：{exc}"
+            return pack(
+                f"记忆保存失败：{exc}",
+                CallArtifact(tool=MEMORY_SAVE, ok=False),
+            )
         note = ""
         if memory.last_replaced:
             note = "\n（已替换旧版本：" + "；".join(memory.last_replaced) + "）"
         expiry = f"（{ttl_days} 天后过期）" if ttl_days else ""
-        return f"已记住（当前 {len(facts)} 条）：{fact}{expiry}{note}"
+        return pack(
+            f"已记住（当前 {len(facts)} 条）：{fact}{expiry}{note}",
+            CallArtifact(tool=MEMORY_SAVE, ok=True),
+        )
 
     tools: list[BaseTool] = [
         StructuredTool.from_function(

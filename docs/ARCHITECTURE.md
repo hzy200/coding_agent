@@ -171,6 +171,11 @@ Web 页面上一个按钮就能跳过命令分级。这条约束是安全属性�
 | `retry` | 当前步骤的修复次数 | planner / advance 清零，repair 递增。**verify 与 review 共用这一份预算** |
 | `same_failure_count` / `last_failure_signature` | 连续同一失败签名的次数与签名 | verify 写入；repair 与 replan 都刻意不清；只有 planner / advance（换步骤）归零 |
 | `repo_profile` / `delegation_allowed` / `delegation_budget` | 仓库画像与本次运行的委派预算 | runtime 在 `run()` 时注入；planner / advance 不动 |
+| `session_brief` | 从 checkpoint 抽取的有界会话约束摘要 | runtime 每次 `run()` 重新生成；不写回 `messages` |
+| `transient_retries` | 节点内瞬时错误重试次数 | runtime 每轮归零；节点写入，runtime 累加后写进 `run_end` 审计 |
+| `run_status` | `running` / `finished` | runtime 每轮置 `running`；`respond` 收尾置 `finished` |
+| `recovery_notice` | 上一轮异常中断时给模型的恢复提示 | runtime 每次 `run()` 根据 prior checkpoint 生成 |
+| `orchestration_handoff` | fan-in 产出的任务级结构化交接（含 artifact 路径） | fan-in 每次覆盖；runtime 每轮清空 |
 | `approvals` | call_id → 审批结果 | approval_gate 写入，tools **消费后清空** |
 | `steering_cancelled` / `steering_replan` / `steering_replans` | 用户干预结果与次数 | runtime 每轮归零；steering 节点写入；plan_tasks 消费 replan |
 | `steering_applied` / `workflow_revised_reason` | runtime 翻译事件用 | steering / plan_tasks 每次写入 |
@@ -223,6 +228,30 @@ checkpoint 保存；未消费指令与 pause 标记由 `SteeringController` 原�
 | 30 | **同一失败签名连续出现就改走 replan，且跨 replan 继续累积** | 24 次相同失败验证说明 repair 只是重复同一类修改。失败签名由失败测试 id + 归一化错误消息组成；连续达到 `max_same_failures` 后不再 repair。replan 会清空 `verification`，所以签名另存 `last_failure_signature`：新做法若仍撞同一个失败，计数继续增长，不会「清零→再修两轮→再 replan」循环。repair 时只重跑上次失败的 pytest 测试，子集通过后自动补跑全量。 | `test_the_same_failure_signature_goes_to_replan`、`test_stagnation_survives_a_replan_that_clears_the_verification`、`test_selected_pass_is_confirmed_by_a_full_run` |
 | 31 | **委派只在 explore 步、且受仓库规模预算约束** | 38 文件的任务实测会拆 3–5 个子智能体，成本 +43%。默认：<30 文件不委派；30–99 最多 2 次；100–299 最多 4 次；≥300 用配置上限。实现/验证步一律拒绝委派 | `test_small_repo_disables_delegation`、`test_delegate_is_rejected_outside_an_explore_step`、`test_delegate_budget_comes_from_the_cost_policy` |
 | 32 | **编排写 worker 只能在隔离 worktree 中并发，且写范围在 I/O 前就被校验** | 多个 implement 同时改主工作区会互相覆盖。每个 worker 一个 worktree；scheduler 串行执行 `git apply --check` → 留快照 → `git apply`；文件工具在写入前拒绝 `write_scope` 外路径，事后 diff 校验保留为第二道防线 | `test_concurrent_implement_workers_ignore_agent_state`、`test_merged_patch_takes_snapshots_so_undo_can_restore`、`test_dispatch_marks_a_conflicting_patch_failed`、`test_write_outside_scope_is_rejected_before_io` |
+| 33 | **执行环境异常不等于代码失败** | WSL 掉线/命令无法启动时，`verify` 记 `error` 并直接收尾，`review` 记 `warned` 且不推进水位线；把这类错误送进 repair 只会让模型徒劳地改代码，或让整轮无谓失败 | `test_environment_failure_is_reported_not_fatal`、`test_an_environment_failure_is_warned_and_does_not_advance_watermark`、`test_verification_environment_error_goes_straight_to_respond` |
+| 34 | **崩溃后必须修复悬空的 tool_calls** | 崩溃可能发生在 act 已提交、tools 未提交之间；同一 thread 重跑时若把新消息追加在未应答的 tool_calls 后，下一轮 API 会因配对不完整直接 400。runtime 为缺失的调用补占位 `ToolMessage`，并明确标注“结果未知” | `test_recover_adds_a_placeholder_for_each_unanswered_call`、`test_dangling_tool_calls_are_repaired_before_the_new_prompt` |
+| 35 | **只重试瞬时/环境错误，且总等待有上限** | 对语义错误重试同一请求没有意义，对致命配置错误重试只是烧钱；无限退避会让一次运行永远挂住。`recovery.classify_error` 把异常压成四类，`retry_async` 只对前两类做指数退避 + 抖动 | `test_retry_async_does_not_retry_a_fatal_error`、`test_retry_async_stops_at_the_total_wait_budget`、`test_act_retries_a_transient_llm_error` |
+| 36 | **写文件必须原子替换，并对瞬时占用做短重试** | 直接 `> file` 在进程被杀/磁盘满时会留下半截文件；`EBUSY/ETXTBSY` 往往只是编辑器/构建工具短暂持有文件，立刻报错会让模型做无意义的“修代码”。同目录临时文件 + `rename` 保证读者看到完整内容 | `test_write_uses_a_temp_file_and_atomic_replace`、`test_write_retries_on_busy_file`、`test_write_does_not_retry_a_semantic_failure` |
+| 37 | **模型读到写之间文件被外部改过时不覆盖** | 否则 `file_write` 会静默丢掉编辑器/另一个进程的改动。只拿模型自己的读取缓存做乐观比较；没有读取记录不猜 | `test_changed_since_read_detects_external_modification`、`test_overwrite_is_rejected_when_file_changed_since_read` |
+| 38 | **checkpoint 要能承受并发，且中断必须可识别** | 多前端共享 SQLite 时，默认 journal 模式容易 `database is locked`；WAL + busy_timeout 降低冲突。`run_status` 留在 checkpoint 里，下一次同 thread 运行才能判断上一轮是否异常中断，并把“可能有未验证改动”交给模型 | `test_sqlite_uses_wal_and_busy_timeout`、`test_interrupted_run_produces_a_recovery_notice`、`test_finished_run_does_not_produce_a_recovery_notice` |
+| 39 | **有副作用的工具必须可检测“结果未知”，不能盲目重放** | 工具已执行、checkpoint 未记录时重放会造成第二次副作用（重复 commit / shell 写入）。日志按 `(thread_id, call_id)` 记录 started/finished；只有 started 时明确回灌“结果未知”并强制验证 | `test_a_side_effect_with_only_started_is_not_replayed`、`test_a_finished_side_effect_is_replayed_without_executing`、`test_a_side_effect_execution_is_recorded` |
+| 40 | **运行与验证各有独立时限** | `recursion_limit` 只管步数，管不住模型长时间卡住；验证命令通常比普通 shell 长，不能共用 60s。总时限跨 resume 累计，验证超时单独配置 | `test_run_deadline_stops_a_stuck_graph`、`test_verification_uses_the_dedicated_timeout` |
+| 41 | **WSL 传输故障要熔断，但不能把命令失败算进去** | WSL 掉线时每个工具调用都拉起一个注定失败的 `wsl.exe`，会把一次运行拖成几分钟；连续传输失败后应 fail fast。命令退出码非零只说明用户命令失败，必须重置/保持闭合。冷却后只放一个半开探测，避免恢复瞬间又打满 | `test_transport_failures_open_the_breaker`、`test_normal_command_failures_do_not_open_the_breaker`、`test_half_open_probe_closes_the_breaker` |
+| 42 | **worker / 工具 / WSL / LLM 并发由同一套资源池治理** | 各层独立限流会让高层在低层饱和时继续准入，优先级也传不下去。统一池让 scheduler、tools、sandbox、router 共享上限，获取槽位必须有超时，避免线程池被拖死 | `test_async_pool_limits_and_times_out`、`test_governor_limits_concurrent_llm_calls`、`test_sync_pool_times_out` |
+| 43 | **调度要工作守恒：边界只管返回时机，预算不足不能全阻塞** | `checkpoint_every` 同时当启动上限会让 6 任务图先跑 4 个再空等；固定角色 token 预留会让大任务把小任务一起拖死。边界只按完成数返回；预算用 EWMA + next-fit 选择可容纳任务 | `test_checkpoint_boundary_does_not_cap_launches`、`test_observed_usage_lets_a_small_task_fit_where_static_reserve_would_not` |
+| 44 | **低优先级任务要被 aging，探针要有保留槽** | 固定角色优先级会让 explore 在 implement 潮水下永久等待；WSL 长命令会把健康探针一起堵死。ready 队列按等待时间提升优先级；WSL 池保留 1 个槽只给 `reserved=True` 的探针 | `test_aging_raises_priority_but_does_not_beat_implement`、`test_reserved_slot_stays_available_for_probes` |
+| 45 | **写批次要有合并背压，且只等待真正在跑的 implement** | 无上限地启动写 worker 会让补丁/快照堆积。在飞 + 待合并超过阈值时暂停新 implement；`has_active_implement` 只认 `in_flight`，否则待启动任务会让合并队列永远不 flush，收尾时还会整批丢弃 | `test_merge_backpressure_limits_concurrent_implement`、`test_merge_queue_only_waits_for_in_flight_implement_workers` |
+| 46 | **同一工作区只能有一个运行中的 runtime** | 两个进程会同时拉起 WSL、同时改文件/合并补丁，快照与 review 水位线互相污染。用审计目录下的工作区哈希锁做进程内 + OS 级互斥 | `test_workspace_lock_blocks_a_second_runtime`、`test_same_workspace_is_exclusive` |
+| 47 | **LLM 自适应并发要跨进程收敛** | 同一台机器上多个 runtime 各调各的，会在 429 恢复时一起打满。AIMD 结果写入现有共享限流文件，其他进程在下一次调用前同步并 clamp 本地池 | `test_concurrency_limit_is_shared_across_processes`、`test_aimd_shrinks_on_429_and_recovers_on_success` |
+| 48 | **WSL 弹性并发只在饱和时依据 p95 延迟调整** | 非饱和时命令本身就慢（构建/测试），据此降并发会把正常负载误判成争用。只有 `in_flight >= limit` 时才按 p95 高/低于目标调整，且不抢占在飞命令 | `test_saturation_with_high_latency_lowers_the_limit`、`test_low_latency_recovers_toward_the_ceiling` |
+| 49 | **常驻 shell 默认开启，但任何会话异常都必须退回一次性执行** | 一次性 `wsl.exe` 每次约 0.2s，是工具延迟的主要来源；常驻会话把读/检索降到约 20ms。会话破裂/超时/未返回结束标记时必须禁用它并回退，不能把稳定性押在一个长连接上 | `test_persistent_shell_reuses_one_process`、`test_persistent_shell_timeout_does_not_poison_the_next_command`、`test_non_wsl_test_cannot_execute_real_sandbox_command` |
+| 50 | **文件写/编辑的读与写各只付一次沙箱往返** | 原先 stat + 读 + 写留底 + 写目标要 4 次进程启动。`read_for_update` 一次拿状态与内容，`write_with_snapshot` 一次写留底与目标；写盘仍是 temp+rename | `test_write_uses_a_temp_file_and_atomic_replace`、`test_overwrite_backs_up_previous_content` |
+| 51 | **移动/复制/删除/建目录必须走受控文件工具，而不是 shell** | shell 的 `mv`/`rm` 是 L2 且不留快照、不过 review，直接破坏“可回滚”。文件工具版本带 write_scope、留底、diff 与审计；删除需要确认 | `test_move_renames_and_keeps_a_source_snapshot`、`test_delete_can_be_restored_from_the_snapshot`、`test_new_file_tool_levels` |
+| 52 | **读缓存必须有字节上限，且只缓存模型可能复用的内容** | 长会话/大仓库里普通 dict 会无限增长。`ReadCache` 按字节做 LRU，超大单值直接不缓存；统计命中率供 run 指标 | `test_read_cache_evicts_least_recently_used_by_bytes`、`test_read_cache_skips_values_larger_than_the_limit` |
+| 53 | **批量编辑必须“全量校验后一次落盘”** | 逐条编辑中途失败会留下半批修改，模型难以恢复。`file_edit_many` 先在内存中应用全部编辑、统一语法/陈旧/scope 校验，再用一次 `write_many` 落盘；任一失败整批不写 | `test_edit_many_applies_to_multiple_files_in_one_call`、`test_edit_many_rejects_the_whole_batch_on_a_bad_match` |
+| 54 | **每个工具调用都要有统一耗时；重复探测要有 TTL** | 只靠 shell 的 duration 无法定位文件/检索工具慢在哪；AST 索引与包管理器探测每次重跑是纯浪费。tools 节点统一测 `duration_ms`，索引/探测按 TTL 缓存 | `test_selected_command_appends_a_safe_pytest_nodeid`、`test_read_cache_clear_and_stats` |
+| 55 | **等待合并的 implement 必须离开 pending** | 一个 implement 完成、另一个还在跑时，前者会停在 merge 队列。若状态仍是 pending，`refresh_ready` 会把它重新排进 ready，导致同一任务被重复启动、同一补丁被重复加入批次，合并时第二次 apply 失败并整批回滚（实测 4 个 worker 全部失败） | `test_completed_implement_is_not_relaunched_while_waiting_for_merge` |
+| 56 | **worktree 内的快照目录被 gitignore 时，`git add` 的 ignored-path 警告不是失败** | 快照写在 worktree 的 `.agent/`，它通常被 `.gitignore` 忽略；`git add -A` 会以 exit=1 报警告，但真实改动已暂存。直接返回“无改动”会让所有 implement worker 失败 | `test_implement_worker_creates_a_clean_patch`（setup 含 `.gitignore`） |
 
 ## 7. 关键取舍
 
@@ -325,7 +354,12 @@ START ─ route_entry ─┬─ direct → planner → act ...
 - `orchestrator/merge.py`：implement 补丁串行合并（check → 解析路径 → 留快照 →
   apply），统一由 `merge.py` 实现；
 - `orchestrator/artifacts.py`：fan-in 完整结果落 `.agent/artifacts/`；
-  `worker_brief` 给 planner/act，完整结果可追溯；
+  `worker_brief` 给 planner/act，`orchestration_handoff` 保留结构化字段与
+  artifact 路径，主 agent 可按需回读；
+- `orchestrator/scheduling.py` / `merge_queue.py`：限流退避、token 预算与
+  补丁合并队列从 scheduler 主循环中拆出，便于单测；
+- `concurrency.py`：worker / 工具 / WSL / LLM 共享的资源池；LLM 按
+  provider + 全局双层限流，并根据成功/429 做 AIMD；
 - `orchestrator/workflow.py`：规则优先；规则不确定时一次结构化调用同时返回
   workflow + 任务图，避免第二次规划往返。
 

@@ -64,9 +64,9 @@ agent sandbox-init                # 创建沙箱工作区
 
 | 开关 | 放开什么 |
 |---|---|
-| （默认） | 只有 L0 只读命令与 `file_read` |
-| `--write` | L1：`mkdir`/`touch`、`file_write`/`file_edit`/`file_restore`、`git_add` |
-| `-y` / `--yes` | L2/L3 不再逐条询问，自动批准 |
+| （默认） | 只有 L0 只读命令与 `file_read` / `file_list` |
+| `--write` | L1：`file_write`/`file_edit`/`file_edit_many`/`file_restore`/`file_move`/`file_copy`/`file_mkdir`、`git_add` |
+| `-y` / `--yes` | L2/L3 不再逐条询问，自动批准（含 `file_delete`） |
 
 L2/L3 默认会**停下来问**。不带 `-y` 时：
 
@@ -107,6 +107,9 @@ agent snapshots              # 看有哪些快照
 agent diff                   # 最近一次改动变成了什么样
 agent undo                   # 回滚最近一次
 agent undo --path src/a.py   # 只回滚某个文件
+agent undo --last-run --dry-run   # 先看最近一次运行改了哪些文件
+agent undo --last-run             # 整体回滚最近一次运行
+agent undo --since 2026-10-21T02:40:18+00:00   # 按时间点回滚
 ```
 
 **回滚本身也可回滚**：恢复前会先给当前内容留底，再执行一次 `undo` 就滚回来了。

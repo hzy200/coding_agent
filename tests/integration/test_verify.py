@@ -160,7 +160,14 @@ def test_not_configured_when_nothing_detected(require_wsl, workdir, settings) ->
 
 
 def test_timeout_is_reported(require_wsl, workdir, settings) -> None:
-    scoped = _settings(settings, workdir, verify_command="sleep 30", shell_timeout=2)
+    # 验证有独立超时：shell_timeout 很大也不影响这里。
+    scoped = _settings(
+        settings,
+        workdir,
+        verify_command="sleep 30",
+        shell_timeout=60,
+        verify_timeout=2,
+    )
     require_wsl.run("true", timeout=60)  # 预热，避免冷启动耗时被算进超时
     result = run_verification(WslSandbox(scoped), workdir)
 

@@ -45,7 +45,14 @@ python tests/eval/langsmith_suite.py --run --smoke
 
 # 只跑单个 case
 python tests/eval/langsmith_suite.py --run --only single_file/off_by_one
+
+# 失败用例隔离重跑（默认 1 次；0 = 不重跑）
+python tests/eval/langsmith_suite.py --run --kinds all --case-retries 1
 ```
+
+能力用例失败后会在独立工作区重跑一次，输出 `attempts` 与
+`recovered_on_retry`。长程/spec 类任务存在模型非确定性，单次失败不足以
+说明能力回归；重跑结果仍会如实标出首次失败。
 
 - `capability`：复用 `run_task`，真实 WSL + 模型，评估任务完成率；
   其中新增 `full` 套件 **104 个任务**（字符串/数值/集合/解析/校验/状态/

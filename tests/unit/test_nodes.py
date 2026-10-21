@@ -10,6 +10,7 @@ from coding_agent.graph.nodes.act import BUDGET_EXHAUSTED_TEMPLATE, make_act_nod
 from coding_agent.graph.nodes.advance import advance
 from coding_agent.graph.nodes.tools import make_tools_node
 from coding_agent.llm.prompts import compose_system_prompt
+from coding_agent.tool_journal import ToolJournal
 from coding_agent.tools.artifacts import FileArtifact, ShellArtifact, pack
 
 
@@ -265,6 +266,72 @@ class _SlowReadTool:
         time.sleep(self.delay)
         self.ended_at = time.perf_counter()
         return pack("done", ShellArtifact(command=self.name, ok=True))
+
+
+def test_a_side_effect_with_only_started_is_not_replayed(tmp_path) -> None:
+    journal = ToolJournal(tmp_path / "journal.jsonl")
+    args = {"path": "a.py", "content": "x", "reason": "r"}
+    journal.begin("t", "call-1", "file_write", args)
+    tool = _FakeTool("file_write")
+    node = make_tools_node([tool], journal=journal)
+
+    out = _tools_run(
+        node,
+        _approved_state(_tool_call("file_write", args)),
+        {"configurable": {"thread_id": "t"}},
+    )
+
+    message = out["messages"][0]
+    assert "结果未知" in message.content
+    assert message.artifact["interrupted"] is True
+    assert tool.seen == {}
+    # 不知道有没有改过文件 —— 强制进入验证。
+    assert out["dirty"] is True
+    assert out["run_dirty"] is True
+
+
+def test_a_finished_side_effect_is_replayed_without_executing(tmp_path) -> None:
+    journal = ToolJournal(tmp_path / "journal.jsonl")
+    args = {"path": "a.py", "content": "x", "reason": "r"}
+    journal.finish(
+        "t",
+        "call-1",
+        "file_write",
+        ok=True,
+        content="已写入",
+        artifact={"ok": True, "path": "a.py", "action": "edit"},
+    )
+    tool = _FakeTool("file_write")
+    node = make_tools_node([tool], journal=journal)
+
+    out = _tools_run(
+        node,
+        _approved_state(_tool_call("file_write", args)),
+        {"configurable": {"thread_id": "t"}},
+    )
+
+    message = out["messages"][0]
+    assert "已写入" in message.content
+    assert message.artifact["replayed"] is True
+    assert tool.seen == {}
+
+
+def test_a_side_effect_execution_is_recorded(tmp_path) -> None:
+    journal = ToolJournal(tmp_path / "journal.jsonl")
+    tool = _FakeTool("file_write")
+    node = make_tools_node([tool], journal=journal)
+    args = {"path": "a.py", "content": "x", "reason": "r"}
+
+    _tools_run(
+        node,
+        _approved_state(_tool_call("file_write", args)),
+        {"configurable": {"thread_id": "t"}},
+    )
+
+    record = journal.lookup("t", "call-1")
+    assert record is not None
+    assert record["event"] == "finished"
+    assert tool.seen == args
 
 
 def test_successful_file_write_marks_path_stale() -> None:

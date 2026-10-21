@@ -33,7 +33,7 @@ from coding_agent.graph.plan import (
 )
 from coding_agent.graph.state import AgentState
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
-from coding_agent.tools.testrun import run_verification
+from coding_agent.tools.testrun import VerifyResult, run_verification
 
 
 def make_verify_node(
@@ -80,7 +80,19 @@ def make_verify_node(
         if int(state.get("retry", 0)) > 0:
             only = tuple(str(t) for t in (previous.get("failed_tests") or ()))
 
-        result = run_verification(sandbox, root, allow_manifest=False, only=only)
+        try:
+            result = run_verification(
+                sandbox, root, allow_manifest=False, only=only
+            )
+        except Exception as exc:  # noqa: BLE001 - 环境异常不能拖垮整轮
+            # 这是图上的一道质量关，不是运行本身。WSL 掉线/命令启动失败
+            # 应当记成「没验证成功」，而不是让整次 RunFailed；更不能进入
+            # repair —— 模型修不了一个坏掉的执行环境。
+            result = VerifyResult(
+                status="error",
+                kind="none",
+                summary=f"{type(exc).__name__}: {exc}",
+            )
 
         # 停滞检测：签名相同说明上一次修复/换做法都没有改变失败本身。
         # repair 与 replan 都不清这个计数；只有换了步骤（planner/advance）才归零。

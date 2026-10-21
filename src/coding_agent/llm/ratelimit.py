@@ -88,6 +88,8 @@ class ProviderState:
     # provider 的 prefix cache：命中/未命中 token（provider 不回报时为 0）
     cache_hit_tokens: int = 0
     cache_miss_tokens: int = 0
+    # 跨进程共享的 LLM 自适应并发上限；0 = 未设置（各进程用自己的默认）。
+    concurrency: int = 0
 
 
 @dataclass
@@ -181,6 +183,9 @@ class RateLimitCoordinator:
                 )
                 state.cache_miss_tokens = int(
                     raw.get("cache_miss_tokens", 0) or 0
+                )
+                state.concurrency = max(
+                    0, int(raw.get("concurrency", 0) or 0)
                 )
                 state.updated_at = updated_at
             else:
@@ -289,6 +294,7 @@ class RateLimitCoordinator:
                     "cost_usd": state.cost_usd,
                     "cache_hit_tokens": state.cache_hit_tokens,
                     "cache_miss_tokens": state.cache_miss_tokens,
+                    "concurrency": state.concurrency,
                 }
                 for key, state in self._providers.items()
             },
@@ -329,6 +335,31 @@ class RateLimitCoordinator:
             return max(0.0, self._global_until - now)
 
     # ---------------- 变更 ----------------
+
+    def concurrency_limit(self, key: str) -> int:
+        """跨进程共享的并发上限；0 表示没有其他进程写过。"""
+        with self._lock:
+            self._sync_from_shared_locked()
+            state = self._providers.get(key)
+            return max(0, int(state.concurrency)) if state is not None else 0
+
+    def record_concurrency(self, key: str, value: int) -> int:
+        """写入共享并发上限（AIMD 的收敛结果），返回最终值。"""
+        with self._lock:
+            lock_path = self.lock_path
+            context = (
+                _FileLock(lock_path) if lock_path is not None else _NoLock()
+            )
+            with context:
+                if self.path is not None:
+                    self._cache_mtime = -1.0
+                    self._cache_size = -1
+                self._sync_from_shared_locked()
+                state = self._providers.setdefault(key, ProviderState())
+                state.concurrency = max(0, int(value))
+                state.updated_at = max(time.time(), state.updated_at + 1e-6)
+                self._write_shared_locked(acquire_lock=False)
+                return state.concurrency
 
     def usage(self, key: str) -> dict[str, float]:
         with self._lock:

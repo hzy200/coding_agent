@@ -80,8 +80,12 @@ class VerifyIssue(BaseModel):
 class VerifyResult(BaseModel):
     """一次验证的结果。字段都是可 JSON 化的，要能进 checkpoint。"""
 
-    # ok / failed / skipped / not_configured
-    status: Literal["ok", "failed", "skipped", "not_configured"] = "skipped"
+    # ok / failed / error / skipped / not_configured
+    # error 表示**验证环境本身不可用**（WSL 掉线、命令无法启动），
+    # 与「测试失败」不同：不能拿它去驱动 repair，也不能当成通过。
+    status: Literal[
+        "ok", "failed", "error", "skipped", "not_configured"
+    ] = "skipped"
     command: str = ""
     exit_code: int | None = None
     duration_ms: int | None = None
@@ -119,6 +123,12 @@ class VerifyResult(BaseModel):
             return "未检测到可用的测试命令，也没有可解析的源码 —— 本次没有做任何验证。"
         if self.status == "skipped":
             return "本次未执行验证。"
+        if self.status == "error":
+            return (
+                "验证环境异常，**本次验证没有跑起来**："
+                f"{self.summary or '未知错误'}。"
+                "这不代表测试通过；需要先恢复执行环境。"
+            )
 
         head = f"验证命令：{self.command}\nexit_code={self.exit_code}"
         if self.summary:
@@ -488,6 +498,7 @@ def run_verification(
     allow_manifest: bool = True,
     only: tuple[str, ...] = (),
     full_after_selected: bool = True,
+    timeout: int | None = None,
 ) -> VerifyResult:
     """执行一次验证并解析结果。
 
@@ -519,13 +530,16 @@ def run_verification(
         effective = selected
         scope = "selected"
 
-    result = sandbox.run(effective, cwd=root)
+    # 测试/构建通常比普通命令长；没显式给超时就用独立的 verify_timeout。
+    if timeout is None:
+        timeout = int(getattr(sandbox.settings, "verify_timeout", 0) or 0)
+    result = sandbox.run(effective, cwd=root, timeout=timeout or None)
 
     # 默认补跑完整套件抓回归；编排 worker 可以把全量留给合并后的主 agent。
     if scope == "selected" and result.ok and full_after_selected:
         effective = resolved
         scope = "full"
-        result = sandbox.run(effective, cwd=root)
+        result = sandbox.run(effective, cwd=root, timeout=timeout or None)
 
     combined = f"{result.stdout}\n{result.stderr}"
     status = "ok" if result.ok else "failed"
@@ -556,6 +570,19 @@ def run_verification(
 
 class RunTestsInput(BaseModel):
     reason: str = Field(description="跑测试的意图，一句话说明")
+    selector: str | None = Field(
+        default=None,
+        description=(
+            "可选：只跑一个 pytest 用例/文件，例如 "
+            "tests/test_x.py::test_y 或 tests/test_x.py"
+        ),
+    )
+    timeout: int | None = Field(
+        default=None,
+        ge=1,
+        le=3600,
+        description="可选：本次命令的超时秒数；省略使用 AGENT_VERIFY_TIMEOUT",
+    )
 
 
 def build_test_tool(settings: Settings, sandbox: WslSandbox):
@@ -567,9 +594,21 @@ def build_test_tool(settings: Settings, sandbox: WslSandbox):
 
     root = resolve_workspace(settings, sandbox)
 
-    def _run(reason: str) -> str:
-        result = run_verification(sandbox, root)
+    def _run(
+        reason: str,
+        selector: str | None = None,
+        timeout: int | None = None,
+    ) -> str:
+        only = (selector,) if selector and selector.strip() else ()
+        result = run_verification(
+            sandbox, root, only=only, timeout=timeout
+        )
         text = f"[验证] {reason}\n{result.render()}"
+        if only and result.scope != "selected":
+            text += (
+                "\n（注意：当前测试命令不支持只跑指定用例，"
+                "已退回运行完整套件。）"
+            )
         artifact = ShellArtifact(
             command=result.command,
             ok=result.ok,
@@ -588,6 +627,7 @@ def build_test_tool(settings: Settings, sandbox: WslSandbox):
             "运行本项目的测试/构建命令并返回结构化结果。"
             f"命令由宿主从项目清单推导（{settings.verify_command or '自动识别'}），"
             "你也可以在 AGENT_VERIFY_COMMAND 里预先指定。"
+            "可选 selector 只跑单个 pytest 用例/文件；可选 timeout 覆盖默认验证超时。"
         ),
         args_schema=RunTestsInput,
     )

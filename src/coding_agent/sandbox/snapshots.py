@@ -113,6 +113,107 @@ class SnapshotStore:
             self._write(snapshot_id, f"{relpath}{ABSENT_SUFFIX}", "")
         return snapshot_id
 
+    def write_with_snapshot(
+        self,
+        path: str,
+        content: str,
+        original: str,
+        *,
+        existed: bool,
+    ) -> str:
+        """一次沙箱调用里同时写留底和目标文件。
+
+        文件工具原先要 4 次 `wsl.exe`（stat、读原文件、写留底、写目标）；
+        把留底与目标合并到 `write_many` 后只剩读、写两次。留底命中「原来不存在」
+        时与 `save` 一样写 `.absent` 标记，回滚才能真的删除新建文件。
+        """
+        snapshot_id = _new_snapshot_id()
+        relpath = _relpath(path, self.root)
+        files: dict[str, str] = {
+            posixpath.join(self.backup_root, snapshot_id, relpath): (
+                original if existed else ""
+            ),
+            path: content,
+        }
+        if not existed:
+            files[
+                posixpath.join(
+                    self.backup_root,
+                    snapshot_id,
+                    f"{relpath}{ABSENT_SUFFIX}",
+                )
+            ] = ""
+        self._fs.write_many(files)
+        return snapshot_id
+
+    def move_with_snapshot(
+        self,
+        source: str,
+        destination: str,
+        content: str,
+        dest_original: str,
+        *,
+        dest_existed: bool,
+    ) -> tuple[str, str]:
+        """移动文件：一次 write_many 完成源留底、目标留底与目标写入。
+
+        返回 `(source_snapshot_id, destination_snapshot_id)`。源文件的实际删除
+        由调用方随后执行。
+        """
+        source_id = _new_snapshot_id()
+        dest_id = _new_snapshot_id()
+        source_rel = _relpath(source, self.root)
+        dest_rel = _relpath(destination, self.root)
+        files: dict[str, str] = {
+            posixpath.join(
+                self.backup_root, source_id, source_rel
+            ): content,
+            posixpath.join(
+                self.backup_root, dest_id, dest_rel
+            ): dest_original if dest_existed else "",
+            destination: content,
+        }
+        if not dest_existed:
+            files[
+                posixpath.join(
+                    self.backup_root, dest_id, f"{dest_rel}{ABSENT_SUFFIX}"
+                )
+            ] = ""
+        self._fs.write_many(files)
+        return source_id, dest_id
+
+    def write_many_with_snapshots(
+        self,
+        entries: list[tuple[str, str, str, bool]],
+    ) -> dict[str, str]:
+        """批量写多个文件并为每个文件留底；一次 write_many 落盘。
+
+        `entries` 是 `(path, content, original, existed)`。返回 path → snapshot_id。
+        所有路径由 `write_many` 先全量校验，任一越界则一个字节都不写。
+        """
+        if not entries:
+            return {}
+        files: dict[str, str] = {}
+        ids: dict[str, str] = {}
+        for path, content, original, existed in entries:
+            snapshot_id = _new_snapshot_id()
+            relpath = _relpath(path, self.root)
+            files[
+                posixpath.join(self.backup_root, snapshot_id, relpath)
+            ] = original if existed else ""
+            if not existed:
+                files[
+                    posixpath.join(
+                        self.backup_root,
+                        snapshot_id,
+                        f"{relpath}{ABSENT_SUFFIX}",
+                    )
+                ] = ""
+            files[path] = content
+            ids[path] = snapshot_id
+        self._fs.write_many(files)
+        return ids
+
     def save_many(
         self, items: list[tuple[str, str, bool]]
     ) -> list[str]:

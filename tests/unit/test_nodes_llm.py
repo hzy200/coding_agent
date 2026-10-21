@@ -123,6 +123,62 @@ def _delegate_state(**extra) -> dict:
     }
 
 
+class _FlakyLLM(_FakeLLM):
+    """第一次调用抛瞬时错误，之后成功。"""
+
+    def __init__(self, failures: int = 1, reply: str = "答复") -> None:
+        super().__init__(reply)
+        self.failures = failures
+        self.calls = 0
+
+    async def ainvoke(self, messages: Any, config: Any = None) -> AIMessage:
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise TimeoutError("timed out")
+        return self.invoke(messages, config)
+
+
+def test_act_retries_a_transient_llm_error() -> None:
+    llm = _FlakyLLM()
+
+    out = _sync(
+        make_act_node(
+            llm,
+            max_tool_rounds=5,
+            retry_attempts=3,
+            retry_base_delay=0,
+        )
+    )(_delegate_state(), None)
+
+    assert llm.calls == 2
+    assert out["transient_retries"] == 1
+    assert out["messages"][-1].content == "答复"
+
+
+def test_act_stops_retrying_at_the_attempt_limit() -> None:
+    llm = _FlakyLLM(failures=99)
+
+    with pytest.raises(TimeoutError):
+        _sync(
+            make_act_node(
+                llm,
+                max_tool_rounds=5,
+                retry_attempts=1,
+                retry_base_delay=0,
+            )
+        )(_delegate_state(), None)
+
+    assert llm.calls == 1
+
+
+def test_respond_marks_the_run_as_finished() -> None:
+    out = _sync(make_respond_node(_FakeLLM()))(
+        {"messages": [HumanMessage(content="hi")], "plan": ["一步"]},
+        None,
+    )
+    assert out["run_status"] == "finished"
+
+
 def test_act_injects_the_delegation_budget() -> None:
     llm = _FakeLLM()
     _sync(make_act_node(llm, max_tool_rounds=5, delegate_enabled=True))(

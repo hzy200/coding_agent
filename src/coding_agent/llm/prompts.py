@@ -390,6 +390,7 @@ def compose_system_prompt(
     empty_step: bool = False,
     delegation_note: str = "",
     worker_context: str = "",
+    recovery_notice: str = "",
     context_summary: str = "",
 ) -> str:
     """把长期记忆、当前计划与所处步骤拼进系统提示。
@@ -420,6 +421,9 @@ def compose_system_prompt(
             "\n编排器 worker 汇总（只读事实，供你规划/实现时参考）：\n"
             f"{worker_context}"
         )
+
+    if recovery_notice:
+        sections.append(f"\n上次运行中断的恢复提示：\n{recovery_notice}")
 
     # 措辞必须与 `SessionPolicy` 的实际行为一致（A6）：原先只读会话写的是
     # 「变更类命令会被宿主拒绝」，而默认 `ask` 模式下 L2/L3 返回的是 **ASK** ——

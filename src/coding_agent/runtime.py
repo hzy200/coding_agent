@@ -11,10 +11,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import posixpath
 import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -29,7 +31,14 @@ from coding_agent.agents.policy import (
 )
 from coding_agent.audit import AuditLogger, AuditRecord
 from coding_agent.audit import models as audit_models
-from coding_agent.audit.logger import now_iso, sanitize_args, truncate
+from coding_agent.audit.logger import (
+    audit_files_by_day,
+    now_iso,
+    read_records_many,
+    sanitize_args,
+    truncate,
+)
+from coding_agent.concurrency import ConcurrencyGovernor
 from coding_agent.config import Settings, get_settings
 from coding_agent.diffing import unified_diff
 from coding_agent.events import (
@@ -69,7 +78,7 @@ from coding_agent.llm.ratelimit import GLOBAL_LIMITER
 from coding_agent.memory.checkpointer import CheckpointStore
 from coding_agent.memory.longterm import LongTermMemory
 from coding_agent.memory.sessions import SessionIndex
-from coding_agent.messages import text_of
+from coding_agent.messages import recover_dangling_tool_calls, text_of
 from coding_agent.sandbox.fs import SandboxFs
 from coding_agent.sandbox.pathguard import normalize_root
 from coding_agent.sandbox.policy import (
@@ -86,6 +95,7 @@ from coding_agent.sandbox.snapshots import (
     SnapshotStore,
 )
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
+from coding_agent.session_brief import build_session_brief
 from coding_agent.steering import SteeringCommand, SteeringController
 from coding_agent.tools.artifacts import (
     CallArtifact,
@@ -96,9 +106,21 @@ from coding_agent.tools.artifacts import (
 )
 from coding_agent.tools.delegate import DELEGATE_EXPLORE
 from coding_agent.tools.shell import SHELL_TOOL_NAME
+from coding_agent.workspace_lock import WorkspaceLock
 
 # 只有这几个 action 才真正改动了文件，read 与空回滚不发 FileChanged
-MUTATING_FILE_ACTIONS = frozenset({"create", "overwrite", "edit", ACTION_RESTORE})
+MUTATING_FILE_ACTIONS = frozenset(
+    {
+        "create",
+        "overwrite",
+        "edit",
+        "move",
+        "copy",
+        "delete",
+        "mkdir",
+        ACTION_RESTORE,
+    }
+)
 
 # 只有这两个节点的模型输出是给用户看的文本；planner 的结构化调用不流式渲染
 STREAMING_NODES = frozenset({"act", "respond"})
@@ -132,7 +154,8 @@ def _verification_verdict(raw: dict[str, Any]) -> bool | None:
         return False
     if status == "ok":
         return True
-    return None  # not_configured / skipped：没做，不是通过
+    # error / not_configured / skipped：没验证成功，既不是通过也不是测试失败
+    return None
 
 
 # 审查是否「拦下了这一步」的唯一口径。与路由同源：只有 blocked 才改控制流，
@@ -206,13 +229,17 @@ class AgentRuntime:
     ) -> None:
         self.settings = settings or get_settings()
         GLOBAL_LIMITER.configure(self.settings.resolved_rate_limit_state_path)
+        # 一次运行共享一套资源池：worker / 主 agent 工具 / WSL / LLM。
+        self.concurrency = ConcurrencyGovernor(self.settings)
         self.allow_write = allow_write
         self.policy = SessionPolicy(
             allow_write=allow_write,
             approval_mode=approval_mode or self.settings.approval_mode,
             allow_rules=parse_allow_rules(self.settings.allow_rules),
         )
-        self._sandbox = WslSandbox(self.settings)
+        self._sandbox = WslSandbox(
+            self.settings, slots=self.concurrency.wsl
+        )
         self._workspace = normalize_root(workspace) if workspace else None
         self._graph: Any = None
         # Phase 3D：用户干预队列。图节点与 runtime 共用同一实例；
@@ -234,6 +261,7 @@ class AgentRuntime:
         self._progress: dict[str, dict[str, Any]] = {}
         # thread_id -> 已 resume 次数（fresh run 归零），用于封顶挂起-恢复循环
         self._resume_counts: dict[str, int] = {}
+        self._workspace_lock: WorkspaceLock | None = None
 
         # 显式传入的 checkpointer 由调用方负责生命周期；否则按配置自行管理
         self._external_checkpointer = checkpointer
@@ -360,6 +388,51 @@ class AgentRuntime:
         if limit is not None:
             history = history[: max(0, int(limit))]
         return history
+
+    async def _prior_state(self, thread_id: str) -> dict[str, Any]:
+        """读取该 thread 上一次 checkpoint 的状态值。
+
+        与 `history()` 一样直读 checkpoint，不建图。读取失败只是少了一段
+        上下文与一次悬空调用修复的机会，不能阻断本次运行。
+        """
+        try:
+            saver = await self._checkpointer()
+            fetch = getattr(saver, "aget_tuple", None)
+            if fetch is None:
+                return {}
+            tuple_ = await fetch({"configurable": {"thread_id": thread_id}})
+            if tuple_ is None:
+                return {}
+            checkpoint = getattr(tuple_, "checkpoint", None) or {}
+            return dict(checkpoint.get("channel_values") or {})
+        except Exception:  # noqa: BLE001 - 读取失败不阻断运行
+            return {}
+
+    @staticmethod
+    def _recovery_notice(prior: dict[str, Any]) -> str:
+        """上一轮是否中断，以及工作区可能残留什么。
+
+        不自动回滚、也不自动重跑：只把事实交给模型和用户。自动回滚会在用户
+        已经手工改过文件时造成二次破坏；自动重跑则可能重复非幂等副作用。
+        """
+        if str(prior.get("run_status") or "") != "running":
+            return ""
+        verification = prior.get("last_verification") or {}
+        status = str(verification.get("status") or "未验证")
+        paths = [
+            str(item) for item in (prior.get("stale_paths") or []) if str(item)
+        ]
+        notice = (
+            "上一次运行没有正常收尾（可能因网络、沙箱或进程中断）。"
+            f"工作区可能有未完成的改动，最后一次验证状态：{status}。"
+            "继续之前先确认文件当前内容；涉及实现时先跑验证，"
+            "不要把上一步当作已完成。"
+        )
+        if paths:
+            notice += " 上次运行修改过的文件：" + "、".join(paths[:10])
+            if len(paths) > 10:
+                notice += f" 等 {len(paths)} 个"
+        return notice
 
     async def checkpoints(
         self, thread_id: str, *, limit: int = 20
@@ -496,6 +569,7 @@ class AgentRuntime:
 
         前端可以不调用：每次写入都已 commit，进程退出不会丢已落盘的 checkpoint。
         """
+        self._release_workspace_lock()
         if self._store is not None:
             await self._store.aclose()
             self._graph = None
@@ -548,6 +622,7 @@ class AgentRuntime:
                 # 与 runtime 共用一份沙箱：探测缓存挂在实例上，各建一份就各探一遍
                 sandbox=self._sandbox,
                 steering=self.steering,
+                governor=self.concurrency,
             )
         return self._graph
 
@@ -555,12 +630,55 @@ class AgentRuntime:
     # 事件流
     # ------------------------------------------------------------------
 
+    def _acquire_workspace_lock(self) -> bool:
+        if not self.settings.workspace_lock_enabled:
+            return True
+        if self._workspace_lock is not None:
+            return True
+        try:
+            lock = WorkspaceLock(self.audit.directory, self.workspace)
+            acquired = lock.acquire()
+        except Exception:  # noqa: BLE001
+            # 锁文件放不下（审计目录不可写）或工作区解析失败时，不应伪装成
+            # “工作区被占用”。继续运行，让真正的错误以它本来的面貌报出来。
+            return True
+        if not acquired:
+            return False
+        self._workspace_lock = lock
+        return True
+
+    def _release_workspace_lock(self) -> None:
+        if self._workspace_lock is not None:
+            self._workspace_lock.release()
+            self._workspace_lock = None
+
+    @property
+    def _workspace_lock_busy(self) -> str:
+        return (
+            "该工作区已有另一个运行中的会话（工作区单写者锁）。"
+            "请等待它结束，或在另一个工作区运行。"
+        )
+
     async def run(self, prompt: str, *, thread_id: str) -> AsyncIterator[Event]:
-        """跑一轮任务。
+        """跑一轮任务（持有工作区单写者锁）。
 
         事件流以 `RunFinished` / `RunFailed` 收尾；若以 `ApprovalRequested` 收尾，
         说明图已挂起等待人工确认，前端应收集答复后调用 `resume()`。
         """
+        if not self._acquire_workspace_lock():
+            yield RunFailed(message=self._workspace_lock_busy)
+            return
+        try:
+            async for event in self._run_unlocked(
+                prompt, thread_id=thread_id
+            ):
+                yield event
+        finally:
+            self._release_workspace_lock()
+
+    async def _run_unlocked(
+        self, prompt: str, *, thread_id: str
+    ) -> AsyncIterator[Event]:
         # 读记忆（工作区 `.agent/memory.md`）需要沙箱；失败也必须以事件收尾，
         # 否则异常会在生成器第一步裸抛给前端（CLI 会以 traceback 收场）。
         try:
@@ -609,12 +727,47 @@ class AgentRuntime:
         ):
             execution_mode = "orchestrated"
 
+        # 上一次 checkpoint 的消息有两个用途：
+        # 1) 补上崩溃前没有返回的 tool_calls，否则同一 thread 重跑时
+        #    悬空的 assistant(tool_calls) 会让下一轮 API 直接 400；
+        # 2) 给独立 orchestrator 子图生成有界会话约束摘要（它不复制 messages）。
+        prior = await self._prior_state(thread_id)
+        prior_messages = list(prior.get("messages") or [])
+        recovered_tool_messages = recover_dangling_tool_calls(prior_messages)
+        brief_limit = int(self.settings.session_brief_chars or 0)
+        session_brief = (
+            build_session_brief(prior_messages, limit=brief_limit)
+            if execution_mode == "orchestrated" and brief_limit > 0
+            else ""
+        )
+        recovery_notice = self._recovery_notice(prior)
+        if recovery_notice:
+            self._audit(
+                AuditRecord(
+                    ts=now_iso(),
+                    kind=audit_models.RECOVERY,
+                    thread_id=thread_id,
+                    workspace=self.workspace,
+                    detail=truncate(recovery_notice),
+                )
+            )
+
         inputs = {
-            "messages": [HumanMessage(content=prompt)],
+            # 占位 ToolMessage 必须排在新用户消息之前，配对才不会错位。
+            "messages": [
+                *recovered_tool_messages,
+                HumanMessage(content=prompt),
+            ],
             # 独立 orchestrator 子图只读这一项，避免把整段消息历史复制进子图。
             "request": prompt,
+            # 上一轮及更早的会话约束（有界摘要）；checkpoint 尚未写入本轮 prompt。
+            "session_brief": session_brief,
+            # 上一轮未正常收尾时的恢复提示；正常情况为空。
+            "recovery_notice": recovery_notice,
+            "run_status": "running",
             "cwd": self.workspace,
             "tool_rounds": 0,
+            "transient_retries": 0,
             "budget_exhausted": False,
             "dirty": False,
             "run_dirty": False,
@@ -645,6 +798,7 @@ class AgentRuntime:
             "orchestrator_completed": 0,
             "orchestrator_failed": 0,
             "worker_context": "",
+            "orchestration_handoff": {},
             "task_extensions_seen": 0,
             "task_extensions_applied": [],
             "task_extension_errors": [],
@@ -692,6 +846,19 @@ class AgentRuntime:
         self._forget_thread(thread_id)
 
     async def resume(self, thread_id: str, decisions: dict[str, bool]) -> AsyncIterator[Event]:
+        """带着审批结果继续被挂起的图（持有工作区单写者锁）。"""
+        if not self._acquire_workspace_lock():
+            yield RunFailed(message=self._workspace_lock_busy)
+            return
+        try:
+            async for event in self._resume_unlocked(thread_id, decisions):
+                yield event
+        finally:
+            self._release_workspace_lock()
+
+    async def _resume_unlocked(
+        self, thread_id: str, decisions: dict[str, bool]
+    ) -> AsyncIterator[Event]:
         """带着审批结果继续被挂起的图。
 
         decisions: call_id -> 是否批准。缺失的按拒绝处理（fail closed）。
@@ -744,6 +911,19 @@ class AgentRuntime:
         return self.steering.is_paused(thread_id)
 
     async def resume_steering(self, thread_id: str) -> AsyncIterator[Event]:
+        """从 steering pause 恢复（持有工作区单写者锁）。"""
+        if not self._acquire_workspace_lock():
+            yield RunFailed(message=self._workspace_lock_busy)
+            return
+        try:
+            async for event in self._resume_steering_unlocked(thread_id):
+                yield event
+        finally:
+            self._release_workspace_lock()
+
+    async def _resume_steering_unlocked(
+        self, thread_id: str
+    ) -> AsyncIterator[Event]:
         """从 steering pause 恢复。审批恢复请走 `resume()`。"""
         detail = self._resume_limit_error(thread_id)
         if detail:
@@ -811,6 +991,33 @@ class AgentRuntime:
         # _stream，存局部会丢掉「上一段还开着一步」这件事，收尾时就不补发了。
         step_open: bool = progress.get("step_open", False)
 
+        # 总墙钟时限：跨 resume 累计，不能用“每次 _stream 重新计时”。
+        deadline_seconds = int(settings.run_deadline_s or 0)
+        if fresh_run:
+            progress["deadline_at"] = (
+                time.monotonic() + deadline_seconds
+                if deadline_seconds > 0
+                else 0.0
+            )
+        deadline_at = float(progress.get("deadline_at") or 0.0)
+
+        def _remaining_seconds() -> float | None:
+            if deadline_at <= 0:
+                return None
+            return max(0.0, deadline_at - time.monotonic())
+
+        async def _timed_chunks(graph: Any):
+            """把图的 astream 包进总时限；超时抛 TimeoutError。"""
+            async with asyncio.timeout(_remaining_seconds()):
+                async for item in graph.astream(
+                    payload,
+                    config,
+                    stream_mode=["messages", "updates", "custom"],
+                    # 独立子图的内层节点更新/自定义事件只有打开它才可见。
+                    subgraphs=True,
+                ):
+                    yield item
+
         def _open_step(index: int, total: int, text: str) -> Iterator[Event]:
             """发 StepStarted。上一步若还开着，先补一个收口再开新的。"""
             nonlocal step_open
@@ -850,13 +1057,7 @@ class AgentRuntime:
             # 只在一个 stream 调用内去重：子图中断会同时在带 namespace 的
             # 更新和父图更新里出现一次，但跨 resume 的重复暂停不能被吞掉。
             seen_interrupts: set[str] = set()
-            async for chunk in graph.astream(
-                payload,
-                config,
-                stream_mode=["messages", "updates", "custom"],
-                # 独立子图的内层节点更新/自定义事件只有打开它才可见。
-                subgraphs=True,
-            ):
+            async for chunk in _timed_chunks(graph):
                 if len(chunk) == 3:
                     _namespace, mode, data = chunk
                 else:
@@ -931,6 +1132,13 @@ class AgentRuntime:
                 for node, update in data.items():
                     if not isinstance(update, dict):
                         continue
+
+                    retries = int(update.get("transient_retries") or 0)
+                    if retries:
+                        progress["transient_retries"] = (
+                            int(progress.get("transient_retries", 0))
+                            + retries
+                        )
 
                     trim = update.get("context_trim")
                     if isinstance(trim, dict):
@@ -1348,6 +1556,17 @@ class AgentRuntime:
                         answer = text_of(last)
 
         except Exception as exc:  # noqa: BLE001 - 编排层异常也要以事件形式报给前端
+            deadline_hit = (
+                isinstance(exc, TimeoutError)
+                and deadline_at > 0
+                and time.monotonic() >= deadline_at - 1.0
+            )
+            detail = (
+                f"运行超过总时限 {deadline_seconds}s，已停止。"
+                "已完成的状态在 checkpoint 里，可用同一 thread 继续。"
+                if deadline_hit
+                else f"{type(exc).__name__}: {exc}"
+            )
             # 尽力记一笔，但**不能让它顶掉真正的错误**：审计本身坏了的时候
             # （比如磁盘满、目录被占），这里再抛一次就把原因盖掉了。
             try:
@@ -1356,7 +1575,7 @@ class AgentRuntime:
                         ts=now_iso(),
                         kind=audit_models.RUN_ERROR,
                         thread_id=thread_id,
-                        detail=f"{type(exc).__name__}: {exc}",
+                        detail=detail,
                     )
                 )
             except Exception:  # noqa: BLE001, S110 - 已在错误路径上，不再二次抛出
@@ -1378,7 +1597,7 @@ class AgentRuntime:
             await self._prune_checkpoints(thread_id)
             self._forget_thread(thread_id)
             yield RunFailed(
-                message=f"{type(exc).__name__}: {exc}",
+                message=detail,
                 input_tokens=input_tokens or None,
                 output_tokens=output_tokens or None,
                 worker_input_tokens=worker_in,
@@ -1430,12 +1649,27 @@ class AgentRuntime:
             0.01, float(usage["cost_usd"]) * 0.2
         ):
             alerts.append("provider 账单金额明显高于本地估算")
+        retry_count = int(progress.get("transient_retries", 0))
+        run_detail = final
+        if retry_count:
+            run_detail += f"\n（本次运行因瞬时错误重试 {retry_count} 次）"
+        concurrency = self.concurrency.snapshot()
+        self._audit(
+            AuditRecord(
+                ts=now_iso(),
+                kind=audit_models.CONCURRENCY,
+                thread_id=thread_id,
+                detail=truncate(
+                    json.dumps(concurrency, ensure_ascii=False)
+                ),
+            )
+        )
         self._audit(
             AuditRecord(
                 ts=now_iso(),
                 kind=audit_models.RUN_END,
                 thread_id=thread_id,
-                detail=truncate(final),
+                detail=truncate(run_detail),
                 # provider 未回报用量时保持 None（exclude_none 会省略该字段）
                 input_tokens=input_tokens or None,
                 output_tokens=output_tokens or None,
@@ -1497,6 +1731,7 @@ class AgentRuntime:
             output_tokens=output_tokens or None,
             worker_input_tokens=worker_in,
             worker_output_tokens=worker_out,
+            concurrency=concurrency,
         )
 
     # ------------------------------------------------------------------
@@ -1536,6 +1771,64 @@ class AgentRuntime:
         result = store.restore(entry)
         self._audit_rollback(result, snapshot_id or "")
         return result
+
+    @staticmethod
+    def _snapshot_prefix(ts: str) -> str:
+        """把审计里的 ISO 时间转成快照 id 的可比较前缀。"""
+        try:
+            moment = datetime.fromisoformat(ts)
+        except ValueError:
+            return ""
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        return moment.astimezone(UTC).strftime("%Y%m%dT%H%M%S%f")
+
+    def last_run_started_at(self, thread_id: str | None = None) -> str:
+        """最近一次 `run_start` 的时间戳（优先按 thread 过滤）。"""
+        groups = audit_files_by_day(self.audit.directory)
+        for _day, paths in sorted(groups.items(), reverse=True):
+            records = read_records_many(paths, thread_id=thread_id, limit=0)
+            for record in reversed(records):
+                if record.kind != audit_models.RUN_START:
+                    continue
+                if (
+                    not thread_id
+                    and record.workspace
+                    and record.workspace != self.workspace
+                ):
+                    continue
+                return record.ts
+        return ""
+
+    def restore_since(
+        self, prefix: str, *, dry_run: bool = False
+    ) -> list[RestoreResult]:
+        """回滚某个时间点之后产生的所有快照（按新→旧）。
+
+        `dry_run` 只列出将被回滚的文件，不写盘。真正回滚时每个文件仍走
+        `SnapshotStore.restore`：先给当前内容留底，所以整次回滚也可再次撤销。
+        """
+        if not prefix:
+            return []
+        entries = [
+            entry for entry in self.snapshots.list() if entry.snapshot_id > prefix
+        ]
+        results: list[RestoreResult] = []
+        for entry in entries:
+            if dry_run:
+                results.append(
+                    RestoreResult(
+                        ok=True,
+                        path=entry.path,
+                        snapshot_id=entry.snapshot_id,
+                        message="dry-run：未修改",
+                    )
+                )
+                continue
+            result = self.snapshots.restore(entry)
+            self._audit_rollback(result, entry.snapshot_id)
+            results.append(result)
+        return results
 
     def _audit_rollback(self, result: RestoreResult, requested_id: str) -> None:
         self._audit(
@@ -1599,6 +1892,13 @@ class AgentRuntime:
         写失败会抛 AuditError 并被上层转成 RunFailed —— 审计有缺口是这个项目
         不能接受的失败模式，宁可让运行显式失败，也不静默丢记录。
         """
+        if not record.workspace:
+            # run_end / tool_call 等记录默认没带 workspace；补齐后多工作区
+            # 的对账才不会靠猜。解析失败不阻断审计本身。
+            try:
+                record.workspace = self.workspace
+            except Exception:  # noqa: BLE001
+                pass
         self.audit.write(record)
 
     def _audit_tool_call(
@@ -1794,6 +2094,11 @@ class AgentRuntime:
                         else ""
                     )
                     + (
+                        f" | merge_error={result.get('merge_error')}"
+                        if result.get("merge_error")
+                        else ""
+                    )
+                    + (
                         " | snapshots="
                         + ",".join(
                             str(item)
@@ -1872,6 +2177,7 @@ class AgentRuntime:
                 ok=artifact.ok,
                 rejected=artifact.rejected,
                 decision=artifact.decision,
+                duration_ms=artifact.duration_ms,
                 level="文件工具",
                 preview=preview,
             )
@@ -1884,7 +2190,9 @@ class AgentRuntime:
                 name=name,
                 ok=artifact.ok,
                 rejected=artifact.rejected,
+                skipped=artifact.skipped,
                 decision=artifact.decision,
+                duration_ms=artifact.duration_ms,
                 level=artifact.level_label or None,
                 preview=preview,
             )

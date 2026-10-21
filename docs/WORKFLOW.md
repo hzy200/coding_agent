@@ -64,6 +64,10 @@ direct 路径的失败分支：verify/review 没过且还有预算 → repair �
 | `retry` | 本步修复次数 | planner / advance 清零、repair 递增 |
 | `same_failure_count` / `last_failure_signature` | 连续同一失败签名的次数与签名 | verify 写入；repair / replan 不清；只有 planner / advance 归零 |
 | `repo_profile` / `delegation_allowed` / `delegation_budget` | 仓库画像与委派预算 | runtime 注入 |
+| `session_brief` | 从 checkpoint 抽取的有界会话约束摘要（独立子图不复制 messages） | runtime 每轮注入；`AGENT_SESSION_BRIEF_CHARS=0` 关闭 |
+| `transient_retries` | 节点内瞬时错误重试次数 | runtime 每轮归零；节点写入，runtime 累加进审计 |
+| `run_status` | `running` / `finished`，用于识别上一轮是否异常中断 | runtime 每轮置 `running`；`respond` 置 `finished` |
+| `recovery_notice` | 上一轮中断时给模型的恢复提示 | runtime 每轮根据 prior checkpoint 生成 |
 | `budget_exhausted` | 本步是否撞上工具轮次上限 | planner / advance / repair 复位 |
 | `approvals` | **逐次调用**，用后即清 | approval_gate 写入、tools 清空 |
 
@@ -119,11 +123,65 @@ direct 路径的失败分支：verify/review 没过且还有预算 → repair �
 | `max_repair_rounds` | 3/步 | 修复次数硬上限 |
 | `max_replans` | 2/任务 | 重建剩余计划的次数上限（到顶后不再问模型） |
 | `recursion_limit` | 由 `estimate_recursion_limit()` 推导 | 图超步防跑飞；公式覆盖 repair/replan/nudge/steering/orchestrator/任务扩展，改拓扑必须同步 |
+| `run_deadline_s` | 1800s | 一次运行（跨 resume）的总墙钟上限；0 = 不限 |
+| `verify_timeout` | 300s | 自动验证的独立超时，不再与普通 shell 命令共用 60s |
+| `wsl_breaker_failures` / `..._cooldown_s` | 3 / 15s | WSL 传输连续失败后熔断；冷却后半开探测，成功即恢复 |
 | 沙箱资源 | CPU 600s / 文件 512MB / 进程 1024 / 墙钟 60s | 单条命令层面 |
 
 ### 2.7 错误处理与降级
 
 - **工具异常回灌模型**（`tools` 节点捕获），不中断图——这是"失败驱动修复"的基础。
+- **瞬时错误有界重试**：超时、连接重置、5xx、429、环境抖动按
+  `AGENT_RETRY_ATTEMPTS` 做指数退避 + 抖动；上下文超长/配置错误等语义或
+  致命错误不重试。重试次数累计进 `run_end` 审计。
+- **验证/审查环境异常不拖垮整轮**：`verify` 返回 `status=error` 并直接收尾
+  （不进入 repair——模型修不了坏掉的执行环境）；`review` 返回 `warned`
+  且不推进水位线。
+- **崩溃后的悬空 tool_calls**：同一 thread 重跑时，runtime 会为上次中断前
+  没有结果的调用补占位 `ToolMessage`，恢复合法的消息配对。
+- **中断运行识别**：`run_status` 随 checkpoint 落盘；上一轮没有走到 `respond`
+  时保持 `running`，下一轮会生成 `recovery_notice`，提醒模型先确认工作区、
+  不要假设上一步已完成。
+- **文件写入韧性**：同目录临时文件 + rename 原子替换；`EBUSY/ETXTBSY` 短退避
+  重试；模型读取后文件被外部修改时拒绝覆盖。
+- **checkpoint 并发**：SQLite 开启 WAL 与 `busy_timeout`，多前端共用时等待
+  写锁而不是立刻失败。
+- **工具幂等日志**：有副作用的工具记录 `started/finished`；崩溃后只有
+  `started` 的调用不自动重放，而是返回“结果未知”并强制验证。
+- **双时限**：`run_deadline_s` 管整轮墙钟，`verify_timeout` 管验证命令，
+  避免模型或测试卡死时无限占用。
+- **WSL 熔断**：连续传输失败后短时间 fail fast，不再为每个工具调用启动
+  注定失败的 `wsl.exe`；冷却后放一个半开探测，成功即恢复。命令自身退出码
+  非零不算传输失败。
+- **统一并发池**：worker / 工具 / WSL / LLM 共享 `ConcurrencyGovernor`；
+  worker 按任务优先级获取槽位，所有等待都有超时。
+- **调度工作守恒**：`checkpoint_every` 只决定何时返回父图，不再限制每边界
+  启动数；token 预留用同角色 EWMA，预算不足时 next-fit 选择能放下的任务。
+- **LLM AIMD**：每个 provider 与全局各有并发上限；成功 +1，429 减半，
+  瞬时错误 -1，范围由 `AGENT_LLM_AIMD_MIN/MAX` 约束。
+- **aging 与保留槽**：ready 队列按等待时间提升优先级；WSL 池保留 1 个槽
+  给健康探针，长命令不能把它一起堵死。
+- **合并背压**：在飞 implement + 待合并补丁超过
+  `orchestrator_max_pending_merges` 时暂停启动新的写任务，先让合并队列排空。
+- **工作区单写者锁**：同一工作区第二个 runtime 会直接收到 `RunFailed`，
+  避免多进程同时改文件/合并补丁。
+- **并发快照**：`run_end` 审计与 `RunFinished.concurrency` 记录各池的
+  limit / in_flight / 排队 / 等待时间。
+- **跨进程 LLM AIMD**：自适应并发上限写入共享限流文件，其他进程在下一次
+  调用前同步，避免多个 runtime 在 429 恢复时一起打满。
+- **WSL 弹性并发**：池子饱和时按命令 p95 延迟降/升上限；非饱和时不调整，
+  避免把本来就很慢的构建命令误判成争用。
+- **常驻 shell 默认开启**：读/检索从约 170ms 降到约 20ms；会话异常自动退回
+  一次性 `wsl.exe`。
+- **文件读写合并往返**：`read_for_update` 一次拿状态与内容，
+  `write_with_snapshot` 一次写留底与目标；写盘仍是 temp+rename。
+- **受控文件生命周期**：`file_move` / `file_copy` / `file_mkdir` /
+  `file_delete` / `file_list` 覆盖移动、复制、建目录、删除与列目录；
+  删除走 L2 确认，移动/复制/删除前留底。
+- **批量编辑**：`file_edit_many` 先在内存中应用全部编辑并统一校验，
+  再用一次 `write_many` 落盘；任一编辑失败整批不写。
+- **缓存与指标**：读缓存按字节 LRU；AST 索引/包管理器探测按 TTL 缓存；
+  每个工具调用统一记录 `duration_ms`。
 - **编排异常 → `RunFailed` 事件**；**启动即失败**（如读记忆需要 WSL 而不可用）同样以 `RunFailed`
   收尾并记 `run_error`，不让异常裸抛给前端。
 - **审计写失败显式报出**——宁可运行失败，也不静默丢记录。
@@ -219,8 +277,11 @@ START → route_entry
 - 写 worker：需要 `AGENT_ORCHESTRATOR_WRITE_ENABLED=true`、`--write`、
   git 仓库根 + 干净工作区；每个 implement 在独立 worktree 中修改，
   `write_scope` 在 I/O 前强制校验，完成后由宿主串行合并 patch 并留快照；
-- fan-in：按失败/阻塞优先、任务级预算输出 `worker_brief`，完整结果落
-  `.agent/artifacts/`；
+- **会话约束摘要**：子图不复制 `messages`，但 runtime 会从 checkpoint 抽最近
+  若干轮的对话，压成 `session_brief` 注入 select/plan 与每个 worker；
+- fan-in：按失败/阻塞优先、任务级预算输出 `worker_brief`，同时产出结构化
+  `orchestration_handoff`；完整结果落 `.agent/artifacts/`，路径写进汇总，
+  主 agent 可按需回读；
 - 实时干预（TUI）：`/pause` `/resume` `/cancel` `/add` `/replan`；
   scheduler 在 `checkpoint_every` 边界 drain 后消费，pause 走 checkpoint；
 - worker 的启动/结束通过 custom stream 实时发出；

@@ -40,6 +40,16 @@ def _state(messages, plan=None, step_idx=0, *, dirty=True, plan_kinds=None):
     }
 
 
+def test_verification_environment_error_goes_straight_to_respond() -> None:
+    """环境异常不是语义失败：不 repair，也不假装通过。"""
+    state = {
+        **_state([HumanMessage(content="hi"), AIMessage(content="done")]),
+        "verification": {"status": "error", "summary": "wsl 不可用"},
+        "retry": 0,
+    }
+    assert route_after_verify(state) == RESPOND
+
+
 # ---------------- act 之后 ----------------
 
 def test_step_done_goes_to_verify() -> None:

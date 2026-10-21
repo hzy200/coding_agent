@@ -231,12 +231,15 @@ class TaskSpec(TypedDict):
 
 - 事件驱动：ready 最小堆 + `asyncio.wait(FIRST_COMPLETED)`；任务完成立即解锁
   依赖方，不再等整批；
-- `asyncio.Semaphore(orchestrator_max_concurrent_workers)` 控制真正并发；
+- `ConcurrencyGovernor.worker` 资源池控制真正并发（按任务优先级、带获取超时）；
 - 依赖 failed/blocked → 该任务标 `blocked`；同类失败立即短路；
 - 失败任务在额度内带上次失败上下文重试（`retry_context`），额度用尽才阻塞下游；
 - 动态只读提议在 worker 完成点校验并立即入队；
-- `orchestrator_checkpoint_every` 到达时 drain 在飞任务并返回父图，形成
-  checkpoint/steering 边界；pause 只在边界 `interrupt()`；
+- `orchestrator_checkpoint_every` **只按完成数**形成 checkpoint/steering 边界
+  （drain 在飞任务后返回父图），不再限制每个边界能启动几个；pause 只在边界
+  `interrupt()`；
+- token 预留优先用同角色历史实际用量的 EWMA；预算不足时 next-fit 选择可容纳
+  的任务，而不是把所有 pending 一起标 blocked；
 - 全局 `orchestrator_run_deadline_s` 与每个 worker 的独立 timeout 共同兜底；
 - 429/限流时临时降低并发并按 `orchestrator_rate_limit_backoff_s` 指数退避，
   成功后逐步恢复；
@@ -247,18 +250,21 @@ class TaskSpec(TypedDict):
 
 ```python
 execution_mode: str          # direct | orchestrated
+request: str                 # 本轮请求（子图只读这一项，不复制 messages）
+session_brief: str           # 从 checkpoint 抽取的有界会话约束摘要
 workflow: str
 workflow_reason: str
 repo_summary: dict
 tasks: list[dict]
-task_status: dict[str, str]  # pending | success | partial | failed | blocked
+task_status: dict[str, str]  # pending | merging | success | partial | failed | blocked
 worker_results: list[dict]
 orchestrator_round: int
 orchestrator_degraded: bool
 orchestrator_summary: str
-worker_context: str          # planner/act 使用
+worker_context: str          # planner/act 使用（文本，含 artifact 路径）
 worker_brief: str            # 紧凑副本
 orchestration_artifacts: list[dict]  # .agent/artifacts/ 索引
+orchestration_handoff: dict  # 任务级结构化交接（状态/文件/发现/artifact）
 ```
 
 生命周期：`planner` 在每次 run 初始化；新节点只写自己的字段；`respond` 只读。
@@ -279,6 +285,9 @@ orchestration_artifacts: list[dict]  # .agent/artifacts/ 索引
 ### 7.2 隔离
 
 - 独立 `messages`，不继承主 agent 历史；
+- 唯一的显式例外是 `session_brief`：宿主从 checkpoint 抽最近若干轮的
+  人/助手文本，压成有界摘要（`AGENT_SESSION_BRIEF_CHARS`，默认 4000，0 关闭），
+  作为「之前轮次的会话约束」注入 select/plan 与每个 worker；
 - 独立工具子集与预算；
 - 独立 trace 元数据（`agent_id`/`task_id`/`role`）；
 - 深度固定为 1，worker 不能再派生 worker；
@@ -325,6 +334,9 @@ class WorkerResult(TypedDict):
 2. **冲突检测**：同一文件被多个 worker 修改、验证结果互相矛盾时显式标注。
 3. **LLM 综合**：只把压缩后的 `WorkerResult` 交给主 agent，不塞原始工具输出。
 4. **部分失败**：failed/blocked 的任务必须在 `worker_context` 与最终答复中如实出现。
+5. **结构化交接**：`orchestration_handoff` 保存任务级字段（状态、文件、发现、
+   验证摘要、合并结果、token、artifact 路径）；`worker_context` 是它的有界文本
+   投影，并在头部列出 artifact 路径，主 agent 可用 `file_read` 回读完整结果。
 5. **引用**：汇总尽量带文件/符号位置，便于主 agent 直接实现。
 
 `synthesize` 不生成最终答复；它把 `worker_context` 交给现有 `planner`，

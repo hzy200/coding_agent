@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
@@ -14,8 +15,8 @@ from coding_agent.codeintel.lsp import (
 from coding_agent.codeintel.python_index import collect_python_sources
 from coding_agent.codeintel.symbols import (
     Symbol,
+    extract_symbols,
     render_symbols,
-    search_symbols,
 )
 from coding_agent.config import Settings
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
@@ -64,11 +65,38 @@ def build_symbol_tool(settings: Settings, sandbox: WslSandbox) -> BaseTool:
                     lsp_client = None
                 return None
 
+    cached_symbols: list[Symbol] | None = None
+    cached_at = 0.0
+
+    def _ast_symbols(query: str, limit: int) -> list[Symbol]:
+        nonlocal cached_symbols, cached_at
+        ttl = float(getattr(settings, "symbol_index_ttl_s", 10.0) or 0.0)
+        now = time.monotonic()
+        if (
+            cached_symbols is None
+            or ttl <= 0
+            or now - cached_at > ttl
+        ):
+            cached_symbols = extract_symbols(
+                collect_python_sources(sandbox, root)
+            )
+            cached_at = now
+        needle = str(query or "").strip().lower()
+        if not needle:
+            return []
+        matches = [
+            symbol
+            for symbol in cached_symbols
+            if needle in symbol.name.lower()
+            or needle in symbol.qualified.lower()
+        ]
+        matches.sort(key=lambda item: (item.path, item.line, item.qualified))
+        return matches[: max(1, int(limit))]
+
     def _run(query: str, limit: int = 20, reason: str = "") -> str:
         symbols = _lsp_symbols(query, limit)
         if not symbols:
-            sources = collect_python_sources(sandbox, root)
-            symbols = search_symbols(sources, query, limit=limit)
+            symbols = _ast_symbols(query, limit)
         text = f"[符号检索] {reason}\n{render_symbols(symbols)}"
         if len(text) > settings.max_output_chars:
             text = text[: settings.max_output_chars] + "\n…（输出已截断）"

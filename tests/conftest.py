@@ -24,7 +24,10 @@ def _forbid_real_wsl_unless_marked(request: pytest.FixtureRequest, monkeypatch) 
             "或为该用例加 @pytest.mark.wsl（真实沙箱）/ @pytest.mark.wsl_env（探测宿主）。"
         )
 
+    # 常驻 shell 默认开启后，命令可能走 `_run_in_session` 而不是 `_exec`；
+    # 两条执行入口都要挡住，否则漏标的用例会悄悄跑真实沙箱。
     monkeypatch.setattr(WslSandbox, "_exec", _boom)
+    monkeypatch.setattr(WslSandbox, "_run_in_session", _boom)
 
 
 @pytest.fixture

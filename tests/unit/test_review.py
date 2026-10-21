@@ -314,6 +314,22 @@ def test_review_disabled_short_circuits() -> None:
     assert sandbox.runs == 0
 
 
+def test_an_environment_failure_is_warned_and_does_not_advance_watermark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("wsl.exe 不可用")
+
+    monkeypatch.setattr("coding_agent.graph.nodes.review.run_review", _boom)
+    out = make_review_node(_FakeSandbox(), "/ws")(
+        {"dirty": True, "review_watermark": SID_OLD}, None  # type: ignore[arg-type]
+    )
+
+    assert out["review"]["status"] == "warned"
+    assert "审查未执行" in out["review"]["findings"][0]["message"]
+    assert out["review_watermark"] == SID_OLD
+
+
 def test_node_passes_the_watermark_through(monkeypatch: pytest.MonkeyPatch) -> None:
     """水位线从 state 读、推进后写回 —— 这是跨步骤不重复告警的传递链。"""
     captured: dict[str, object] = {}

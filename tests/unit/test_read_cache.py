@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 from coding_agent.config import Settings
+from coding_agent.read_cache import ReadCache
 from coding_agent.sandbox.wsl_exec import ExecResult
 from coding_agent.tools.shell import build_shell_tool
 
@@ -51,3 +52,40 @@ def test_mutating_shell_clears_cache() -> None:
     tool.invoke({"command": "sed -i 's/old/new/' a.py", "reason": "修改文件"})
 
     assert cache == {}
+
+
+# ---------------- 有界 LRU ----------------
+
+def test_read_cache_evicts_least_recently_used_by_bytes() -> None:
+    cache = ReadCache(max_bytes=10)
+    cache["a"] = b"12345"
+    cache["b"] = b"67890"
+
+    cache.get("a")  # a 变成最近使用
+    cache["c"] = b"abc"  # 需要腾出 3 字节，应淘汰 b
+
+    assert "a" in cache
+    assert "b" not in cache
+    assert cache["c"] == b"abc"
+    assert cache.evictions == 1
+    assert cache.size_bytes <= 10
+
+
+def test_read_cache_skips_values_larger_than_the_limit() -> None:
+    cache = ReadCache(max_bytes=4)
+    cache["big"] = b"12345"
+    assert "big" not in cache
+    assert cache.size_bytes == 0
+
+
+def test_read_cache_clear_and_stats() -> None:
+    cache = ReadCache(max_bytes=100)
+    cache["a"] = b"1"
+    cache.get("a")
+    cache.get("missing")
+    stats = cache.snapshot()
+    assert stats["hits"] == 1
+    assert stats["misses"] == 1
+    cache.clear()
+    assert cache.size_bytes == 0
+    assert len(cache) == 0

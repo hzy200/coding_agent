@@ -55,6 +55,23 @@ def test_path_is_persistent(tmp_path) -> None:
 
 # ---------------- 真实落盘 ----------------
 
+def test_sqlite_uses_wal_and_busy_timeout(tmp_path) -> None:
+    async def scenario() -> tuple[str, int]:
+        store = CheckpointStore(str(tmp_path / "c.sqlite"))
+        await store.aopen()
+        assert store._connection is not None
+        cursor = await store._connection.execute("PRAGMA journal_mode")
+        (mode,) = await cursor.fetchone()
+        cursor = await store._connection.execute("PRAGMA busy_timeout")
+        (busy,) = await cursor.fetchone()
+        await store.aclose()
+        return str(mode).lower(), int(busy)
+
+    mode, busy = asyncio.run(scenario())
+    assert mode == "wal"
+    assert busy >= 5000
+
+
 def test_sqlite_file_and_schema_created(tmp_path) -> None:
     async def scenario() -> None:
         path = tmp_path / "nested" / "checkpoints.sqlite"

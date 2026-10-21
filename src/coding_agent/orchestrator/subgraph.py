@@ -15,6 +15,7 @@ from __future__ import annotations
 from langchain_core.language_models import BaseChatModel
 from langgraph.graph import END, START, StateGraph
 
+from coding_agent.concurrency import ConcurrencyGovernor
 from coding_agent.config import Settings
 
 # 与 graph/nodes/steering.py 的节点工厂同名，避免两套 steering 语义。
@@ -66,6 +67,7 @@ def build_orchestrator_subgraph(
     worker_runner: WorkerRunner,
     steering: SteeringController,
     allow_write: bool = False,
+    governor: ConcurrencyGovernor | None = None,
 ):
     """组装并编译独立子图。checkpointer 由父图持有。"""
     graph = StateGraph(OrchestratorState)
@@ -96,6 +98,7 @@ def build_orchestrator_subgraph(
             sandbox=sandbox,
             root=root,
             steering=steering,
+            governor=governor,
         ),
     )
     graph.add_node(

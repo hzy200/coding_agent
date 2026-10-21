@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import TypeVar, cast
 from uuid import uuid4
 
+from coding_agent.concurrency import ResourceTimeout, SyncLeasePool
 from coding_agent.config import Settings, get_settings
 from coding_agent.sandbox.limits import (
     TIMEOUT_EXIT_CODE,
@@ -33,6 +34,27 @@ _T = TypeVar("_T")
 
 class WslUnavailableError(RuntimeError):
     """本机找不到可用的 WSL 发行版。"""
+
+
+# wsl.exe 自己的错误（不是工作区命令的输出）。只认这些前缀/短语，
+# 避免把用户命令 stderr 里出现的同名文本误判成 WSL 故障。
+_WSL_TRANSPORT_MARKERS = (
+    "wsl_e_",
+    "wslregisterdistribution failed",
+    "the windows subsystem for linux has not been properly configured",
+    "there is no distribution with the supplied name",
+    "the system cannot find the file specified",
+    "catastrophic failure",
+    "error code: wsl/",
+    "wsl.exe:",
+)
+
+
+def _is_wsl_transport_failure(result: ExecResult) -> bool:
+    if result.timed_out or result.ok:
+        return False
+    text = (result.stderr or "").lower()
+    return any(marker in text for marker in _WSL_TRANSPORT_MARKERS)
 
 
 @dataclass(slots=True)
@@ -151,6 +173,20 @@ class _ShellSession:
             self._proc.wait(timeout=KILL_GRACE)
         except (subprocess.TimeoutExpired, OSError):
             pass
+        # 句柄可能已经被 wait 关闭；阻止 Popen.__del__ 再去 poll 一个失效句柄。
+        if self._proc.returncode is None:
+            self._proc.returncode = -1
+        # 显式关闭管道，避免 Windows 上 Popen.__del__ 在句柄失效后再 poll。
+        for pipe in (
+            self._proc.stdin,
+            self._proc.stdout,
+            self._proc.stderr,
+        ):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except OSError:
+                pass
 
     def run(self, script: str, *, wall: int, command: str) -> ExecResult:
         token = uuid4().hex
@@ -329,7 +365,12 @@ def build_bwrap_script(
 class WslSandbox:
     """在指定 WSL 发行版内执行 bash 命令。"""
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        slots: SyncLeasePool | None = None,
+    ) -> None:
         self.settings = settings or get_settings()
         self._bwrap_ok: bool | None = None
         # 探测类结果的缓存。每探测一次就要启动一次 wsl.exe（约 0.3s），而这些值
@@ -339,13 +380,41 @@ class WslSandbox:
         self._probe_lock = threading.Lock()
         # 并发 worker 会各自调沙箱；没有这层背压时 4 个 worker 的一次工具
         # 轮次就能同时拉起十几个 wsl.exe。0 表示不限制。
-        limit = int(getattr(self.settings, "sandbox_max_concurrent_commands", 0) or 0)
-        self._command_slots = (
-            threading.BoundedSemaphore(limit) if limit > 0 else None
+        # 默认自建一个池；runtime 会传入共享的 governor.wsl，让主 agent、
+        # worker 与探测共用同一组槽位。
+        self._slots = slots or SyncLeasePool(
+            "wsl",
+            int(getattr(self.settings, "sandbox_max_concurrent_commands", 0) or 0),
+            reserve=int(
+                getattr(self.settings, "concurrency_wsl_reserve", 1) or 0
+            ),
         )
+        # 基于命令 p95 延迟的弹性并发。只在池子饱和时调整 —— 否则一条本来
+        # 就慢的构建命令会让并发被无谓压低。
+        self._latencies: list[int] = []
+        self._latency_steps = 0
+        self._wsl_limit_floor = max(
+            1, int(getattr(settings, "concurrency_wsl_min", 2) or 2)
+        )
+        self._wsl_limit_ceiling = int(
+            getattr(settings, "concurrency_wsl_max", 0)
+            or self._slots.limit
+            or 0
+        )
+        if self._wsl_limit_ceiling:
+            self._wsl_limit_floor = min(
+                self._wsl_limit_floor, self._wsl_limit_ceiling
+            )
         self._command_count = 0
         self._session_pool: _ShellSessionPool | None = None
         self._session_disabled = False
+        # 健康检查与熔断状态。所有跨线程访问都走 `_breaker_lock`。
+        self._breaker_lock = threading.Lock()
+        self._breaker_failures = 0
+        self._breaker_open_until = 0.0
+        self._breaker_half_open = False
+        self._health_ok: bool | None = None
+        self._health_checked_at = 0.0
 
     @property
     def command_count(self) -> int:
@@ -360,6 +429,103 @@ class WslSandbox:
         if self._session_pool is not None:
             self._session_pool.close()
             self._session_pool = None
+
+    def __del__(self) -> None:  # pragma: no cover - 解释器退出时的兜底清理
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001 - 析构阶段不能再抛异常
+            pass
+
+    # ---------------- 健康检查 / 熔断 ----------------
+
+    def circuit_state(self) -> str:
+        """closed / open / half-open，供日志与 doctor 使用。"""
+        with self._breaker_lock:
+            if self._breaker_failures < self._breaker_threshold:
+                return "closed"
+            if time.monotonic() < self._breaker_open_until:
+                return "open"
+            return "half-open"
+
+    @property
+    def _breaker_threshold(self) -> int:
+        return max(1, int(self.settings.wsl_breaker_failures or 1))
+
+    def _breaker_allow(self) -> None:
+        """熔断打开时 fail fast；冷却到期只放一个半开探测请求。"""
+        with self._breaker_lock:
+            if self._breaker_failures < self._breaker_threshold:
+                return
+            now = time.monotonic()
+            if now < self._breaker_open_until:
+                remaining = max(0.0, self._breaker_open_until - now)
+                raise WslUnavailableError(
+                    f"WSL 连续失败 {self._breaker_failures} 次，已熔断"
+                    f"（约 {remaining:.0f}s 后重试）。请检查 WSL 或运行 agent doctor。"
+                )
+            if self._breaker_half_open:
+                raise WslUnavailableError(
+                    "WSL 恢复探测正在进行，请稍后重试。"
+                )
+            self._breaker_half_open = True
+
+    def _breaker_success(self) -> None:
+        with self._breaker_lock:
+            self._breaker_failures = 0
+            self._breaker_open_until = 0.0
+            self._breaker_half_open = False
+            self._health_ok = True
+            self._health_checked_at = time.monotonic()
+
+    def _breaker_failure(self) -> None:
+        with self._breaker_lock:
+            self._breaker_failures += 1
+            self._breaker_half_open = False
+            if self._breaker_failures < self._breaker_threshold:
+                return
+            base = max(0.1, float(self.settings.wsl_breaker_cooldown_s or 0.1))
+            cap = max(base, float(self.settings.wsl_breaker_max_cooldown_s or base))
+            exponent = self._breaker_failures - self._breaker_threshold
+            cooldown = min(base * (2**exponent), cap)
+            self._breaker_open_until = time.monotonic() + cooldown
+            self._health_ok = False
+            self._health_checked_at = time.monotonic()
+
+    def health(self, *, force: bool = False) -> bool:
+        """轻量健康探针：不经过 bwrap/常驻会话，也不受熔断拦截。
+
+        `force=False` 时结果在 TTL 内复用，避免每个工具调用都启动 wsl.exe。
+        """
+        if not self.settings.wsl_health_check_enabled:
+            return True
+        now = time.monotonic()
+        ttl = max(0.0, float(self.settings.wsl_health_ttl_s or 0.0))
+        if (
+            not force
+            and self._health_ok is not None
+            and now - self._health_checked_at <= ttl
+        ):
+            return bool(self._health_ok)
+
+        timeout = max(1, int(self.settings.wsl_health_timeout_s or 1))
+        try:
+            result = self._exec(
+                "echo __AGENT_HEALTH_OK__",
+                wall=timeout,
+                reserved=True,
+            )
+        except ResourceTimeout:
+            # 本地槽位都在忙，不代表 WSL 坏了。
+            return False
+        except Exception:  # noqa: BLE001 - 健康检查失败只返回 False
+            self._breaker_failure()
+            return False
+        ok = result.ok and "__AGENT_HEALTH_OK__" in (result.stdout or "")
+        if ok:
+            self._breaker_success()
+        else:
+            self._breaker_failure()
+        return ok
 
     # ---------------- 探测缓存 ----------------
 
@@ -481,15 +647,82 @@ class WslSandbox:
         # 沙箱内再套一层 timeout：外层的 proc.kill() 只能杀掉 wsl.exe，
         # Linux 侧的子进程要靠这一层才能确定性清理。
         script = wrap_with_limits(body, limits=self.limits, wall_seconds=wall)
-        if self.settings.persistent_shell and not self._session_disabled:
-            try:
-                return self._run_in_session(
-                    script, wall=wall, command=command
-                )
-            except Exception:  # noqa: BLE001 - 会话失败退回一次性执行
-                self._session_disabled = True
-                self.close()
-        return self._exec(script, wall=wall, command=command)
+
+        # 配置类错误（bwrap 不可用）在到达这里之前就已经抛出了，不计入熔断。
+        self._breaker_allow()
+        try:
+            if self.settings.persistent_shell and not self._session_disabled:
+                try:
+                    result = self._run_in_session(
+                        script, wall=wall, command=command
+                    )
+                except Exception:  # noqa: BLE001 - 会话失败退回一次性执行
+                    self._session_disabled = True
+                    self.close()
+                else:
+                    self._finish_run(result)
+                    return result
+            result = self._exec(script, wall=wall, command=command)
+        except ResourceTimeout:
+            # 本地槽位饱和不是 WSL 故障，不能计入熔断。
+            raise
+        except Exception:
+            # 到这里说明连一次性 wsl.exe 都没跑起来（或会话/进程层故障）。
+            self._breaker_failure()
+            raise
+        self._finish_run(result)
+        return result
+
+    def _observe_latency(self, result: ExecResult) -> None:
+        """在池子饱和时按命令 p95 延迟微调并发上限。
+
+        饱和 + 高延迟 = 争用，降一个槽；饱和 + 低延迟 = 还有余量，升一个。
+        非饱和时命令本身就慢，不能据此惩罚并发。
+        """
+        settings = self.settings
+        if (
+            not getattr(settings, "concurrency_wsl_adaptive", True)
+            or result.timed_out
+            or self._slots.limit <= 0
+        ):
+            return
+        window = max(
+            5, int(getattr(settings, "concurrency_wsl_latency_window", 20) or 20)
+        )
+        self._latencies.append(int(result.duration_ms or 0))
+        del self._latencies[:-window]
+        if len(self._latencies) < window:
+            return
+        self._latency_steps += 1
+        # 每半个窗口评估一次，避免刚调完又立刻反向调。
+        if self._latency_steps < max(1, window // 2):
+            return
+        self._latency_steps = 0
+
+        ordered = sorted(self._latencies)
+        p95 = ordered[int(0.95 * (len(ordered) - 1))]
+        target = max(
+            100, int(getattr(settings, "concurrency_wsl_target_ms", 1500) or 1500)
+        )
+        floor = self._wsl_limit_floor
+        ceiling = self._wsl_limit_ceiling
+        if ceiling <= 0:
+            return
+        saturated = self._slots.in_flight >= self._slots.limit
+        if not saturated:
+            return
+        if p95 > target * 1.5 and self._slots.limit > floor:
+            self._slots.set_limit(self._slots.limit - 1)
+        elif p95 < target * 0.5 and self._slots.limit < ceiling:
+            self._slots.set_limit(self._slots.limit + 1)
+
+    def _finish_run(self, result: ExecResult) -> None:
+        """一次真实执行结束后更新熔断状态：有结果 = WSL 活着。"""
+        self._observe_latency(result)
+        if _is_wsl_transport_failure(result):
+            self._breaker_failure()
+        else:
+            self._breaker_success()
 
     def _run_in_session(
         self, script: str, *, wall: int, command: str
@@ -501,18 +734,25 @@ class WslSandbox:
                 size,
                 on_start=self._bump_command_count,
             )
-        slots = self._command_slots
-        if slots is None:
-            return self._session_pool.run(script, wall=wall, command=command)
-        with slots:
+        timeout = float(
+            getattr(self.settings, "concurrency_wsl_timeout_s", 30.0) or 30.0
+        )
+        with self._slots.lease(timeout=timeout):
             return self._session_pool.run(script, wall=wall, command=command)
 
-    def _exec(self, script: str, *, wall: int, command: str = "") -> ExecResult:
-        """按实例并发上限执行；具体逻辑见 `_exec_locked`。"""
-        slots = self._command_slots
-        if slots is None:
-            return self._exec_locked(script, wall=wall, command=command)
-        with slots:
+    def _exec(
+        self,
+        script: str,
+        *,
+        wall: int,
+        command: str = "",
+        reserved: bool = False,
+    ) -> ExecResult:
+        """按统一 WSL 资源池执行；具体逻辑见 `_exec_locked`。"""
+        timeout = float(
+            getattr(self.settings, "concurrency_wsl_timeout_s", 30.0) or 30.0
+        )
+        with self._slots.lease(timeout=timeout, reserved=reserved):
             return self._exec_locked(script, wall=wall, command=command)
 
     def _exec_locked(

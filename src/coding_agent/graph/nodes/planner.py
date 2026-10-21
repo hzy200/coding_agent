@@ -32,6 +32,7 @@ from coding_agent.llm.prompts import (
     PLANNER_PROMPT,
 )
 from coding_agent.messages import last_human_text
+from coding_agent.recovery import retry_async
 
 
 class TaskPlan(BaseModel):
@@ -49,6 +50,10 @@ def make_planner_node(
     max_steps: int,
     allow_write: bool,
     delegate_enabled: bool = False,
+    retry_attempts: int = 3,
+    retry_base_delay: float = 1.0,
+    retry_max_delay: float = 30.0,
+    retry_max_total_wait: float = 60.0,
 ) -> Callable[[AgentState, RunnableConfig], Awaitable[dict[str, Any]]]:
     structured = with_json_output(llm, TaskPlan).with_retry(stop_after_attempt=3)
     permission_note = (
@@ -61,6 +66,7 @@ def make_planner_node(
         if worker_context:
             request = f"{request}\n\n{worker_context}"
         degraded = False
+        retry_events: list[dict[str, Any]] = []
         # 委派提示依赖本次运行的仓库规模策略，所以按调用时组装。
         delegation_note = (
             PLANNER_DELEGATION_NOTE
@@ -72,10 +78,24 @@ def make_planner_node(
             permission_note=permission_note,
             delegation_note=delegation_note,
         )
+        recovery_notice = str(state.get("recovery_notice") or "").strip()
+        if recovery_notice:
+            prompt += f"\n\n上次运行中断的恢复提示：\n{recovery_notice}"
         try:
-            result = await structured.ainvoke(
-                [SystemMessage(content=prompt), HumanMessage(content=request)],
-                config,
+            result = await retry_async(
+                lambda: structured.ainvoke(
+                    [
+                        SystemMessage(content=prompt),
+                        HumanMessage(content=request),
+                    ],
+                    config,
+                ),
+                attempts=retry_attempts,
+                base_delay=retry_base_delay,
+                max_delay=retry_max_delay,
+                max_total_wait=retry_max_total_wait,
+                on_retry=retry_events.append,
+                label="planner",
             )
             parsed = [
                 (step.text.strip(), step.kind)
@@ -102,6 +122,7 @@ def make_planner_node(
             "plan": steps,
             "plan_kinds": align_kinds(steps, kinds),
             "plan_degraded": degraded,
+            "transient_retries": len(retry_events),
             "step_idx": 0,
             # 两个重规划额度都是整个任务的，开局归零
             "replan_count": 0,

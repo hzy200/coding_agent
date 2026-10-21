@@ -23,6 +23,10 @@ from coding_agent.messages import last_human_text
 class OrchestratorState(TypedDict, total=False):
     # ---- 父图输入 ----
     request: str
+    # 上一轮及更早的会话约束摘要（有界文本），供 select/plan/worker 使用。
+    session_brief: str
+    # 上一轮未正常收尾时的恢复提示。
+    recovery_notice: str
     cwd: str
     thread_id: str
     repo_profile: dict[str, int]
@@ -39,6 +43,8 @@ class OrchestratorState(TypedDict, total=False):
     task_attempts: dict[str, int]
     orchestrator_degraded: bool
     orchestrator_round: int
+    # 瞬时错误重试次数；与父图同名，runtime 统一累加。
+    transient_retries: int
     workflow_revised_reason: str
 
     # ---- dispatch / 动态扩展 ----
@@ -54,6 +60,8 @@ class OrchestratorState(TypedDict, total=False):
     worker_context: str
     worker_brief: str
     orchestration_artifacts: list[dict[str, Any]]
+    # 任务级结构化交接，含 artifact 路径；文本版之外的稳定契约。
+    orchestration_handoff: dict[str, Any]
     orchestrator_summary: str
     orchestrator_completed: int
     orchestrator_failed: int

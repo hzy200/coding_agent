@@ -33,7 +33,12 @@ from langchain_core.runnables import RunnableConfig
 
 from coding_agent.graph.state import AgentState
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
-from coding_agent.tools.review import run_review
+from coding_agent.tools.review import (
+    WARNING,
+    ReviewFinding,
+    ReviewResult,
+    run_review,
+)
 
 
 def make_review_node(
@@ -51,11 +56,30 @@ def make_review_node(
         if not sandbox.settings.review_enabled or not state.get("dirty"):
             return {"review": {}}
 
-        result = run_review(
-            sandbox,
-            root,
-            watermark=str(state.get("review_watermark") or ""),
-        )
+        watermark = str(state.get("review_watermark") or "")
+        try:
+            result = run_review(
+                sandbox,
+                root,
+                watermark=watermark,
+            )
+        except Exception as exc:  # noqa: BLE001 - 审查环境异常不拖垮整轮
+            # 不推进水位线：下次还能重审这批文件。用 warned 而不是 clean，
+            # 与「审查没跑起来 ≠ 审查通过」保持一致。
+            result = ReviewResult(
+                status="warned",
+                findings=[
+                    ReviewFinding(
+                        severity=WARNING,
+                        rule="review-environment",
+                        message=(
+                            f"审查未执行：{type(exc).__name__}: {exc}"
+                        ),
+                    )
+                ],
+                watermark=watermark,
+                summary="审查环境异常，本次没有完成代码审查。",
+            )
         return {"review": result.model_dump(), "review_watermark": result.watermark}
 
     return review

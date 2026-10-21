@@ -43,6 +43,7 @@ from coding_agent.llm.prompts import (
     REVIEW_REPORT_PROMPT,
 )
 from coding_agent.messages import text_of
+from coding_agent.recovery import retry_async
 from coding_agent.tools.artifacts import SubAgentArtifact, unpack
 from coding_agent.tools.delegate import EXPLORE_TOOL_NAMES
 
@@ -113,10 +114,21 @@ def _child_config(config: RunnableConfig | None, call_id: str) -> dict[str, Any]
     }
 
 
-def _task_text(parent_request: str, goal: str, paths: list[str]) -> str:
+def _task_text(
+    parent_request: str,
+    goal: str,
+    paths: list[str],
+    session_brief: str = "",
+) -> str:
     path_text = "\n".join(f"- {path}" for path in paths) if paths else "（未指定，自行定位）"
+    brief = (
+        f"之前轮次的会话约束（继续遵守）：\n{session_brief}\n\n"
+        if session_brief.strip()
+        else ""
+    )
     return (
-        f"用户请求：{parent_request or '（未提供）'}\n\n"
+        f"{brief}"
+        f"当前用户请求：{parent_request or '（未提供）'}\n\n"
         f"探索目标：{goal or '（未提供）'}\n\n"
         f"优先查看的路径：\n{path_text}"
     )
@@ -282,7 +294,10 @@ def make_readonly_runner(
         )
 
         repo_map = str(args.get("repo_map") or "").strip()
-        task_text = _task_text(parent_request, goal, paths)
+        session_brief = str(args.get("session_brief") or "").strip()
+        task_text = _task_text(
+            parent_request, goal, paths, session_brief=session_brief
+        )
         if repo_map:
             task_text += (
                 "\n\n仓库结构摘要（AST 生成，供定位；不是完整源码）：\n"
@@ -334,7 +349,14 @@ def make_readonly_runner(
                     return
                 rounds = round_index
                 llm_started = time.monotonic()
-                response = await child_llm.ainvoke(messages, child_config)
+                response = await retry_async(
+                    lambda: child_llm.ainvoke(messages, child_config),
+                    attempts=settings.retry_attempts,
+                    base_delay=settings.retry_base_delay_s,
+                    max_delay=settings.retry_max_delay_s,
+                    max_total_wait=settings.retry_max_total_wait_s,
+                    label=f"{role}:llm",
+                )
                 llm_ms += int((time.monotonic() - llm_started) * 1000)
                 responded = True
                 used_in, used_out = _usage(response)
@@ -426,14 +448,22 @@ def make_readonly_runner(
             try:
                 report_started = time.monotonic()
                 payload = await asyncio.wait_for(
-                    report_llm.ainvoke(
-                        [
-                            SystemMessage(content=report_prompt),
-                            HumanMessage(
-                                content=transcript or "（没有可用的探索记录）"
-                            ),
-                        ],
-                        child_config,
+                    retry_async(
+                        lambda: report_llm.ainvoke(
+                            [
+                                SystemMessage(content=report_prompt),
+                                HumanMessage(
+                                    content=transcript
+                                    or "（没有可用的探索记录）"
+                                ),
+                            ],
+                            child_config,
+                        ),
+                        attempts=settings.retry_attempts,
+                        base_delay=settings.retry_base_delay_s,
+                        max_delay=settings.retry_max_delay_s,
+                        max_total_wait=settings.retry_max_total_wait_s,
+                        label=f"{role}:report",
                     ),
                     timeout=remaining,
                 )

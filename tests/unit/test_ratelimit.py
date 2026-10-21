@@ -17,6 +17,17 @@ def _pair(tmp_path) -> tuple[RateLimitCoordinator, RateLimitCoordinator]:
     )
 
 
+def test_concurrency_limit_is_shared_across_processes(tmp_path) -> None:
+    first, second = _pair(tmp_path)
+
+    assert first.record_concurrency("provider-a", 2) == 2
+    assert second.concurrency_limit("provider-a") == 2
+
+    # 另一个进程进一步降并发，第一个进程也能看到。
+    second.record_concurrency("provider-a", 1)
+    assert first.concurrency_limit("provider-a") == 1
+
+
 def test_provider_cooldown_is_visible_across_processes(tmp_path) -> None:
     first, second = _pair(tmp_path)
 

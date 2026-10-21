@@ -85,6 +85,7 @@ def test_implement_worker_creates_a_clean_patch(require_wsl) -> None:  # noqa: A
             git config user.name eval
             mkdir -p app
             printf 'VALUE = 1\\n' > app/sample.py
+            printf '.agent/\\n__pycache__/\\n' > .gitignore
             git add -A
             git commit -qm init
             """,
@@ -470,6 +471,7 @@ def test_cancelled_implement_worker_discards_the_worktree(require_wsl) -> None: 
             git config user.name eval
             mkdir -p app
             printf 'VALUE = 1\\n' > app/sample.py
+            printf '.agent/\\n__pycache__/\\n' > .gitignore
             git add -A
             git commit -qm init
             """,
@@ -530,6 +532,7 @@ def test_host_cancellation_still_removes_the_worktree(require_wsl) -> None:  # n
             git config user.name eval
             mkdir -p app
             printf 'VALUE = 1\\n' > app/sample.py
+            printf '.agent/\\n__pycache__/\\n' > .gitignore
             git add -A
             git commit -qm init
             """,

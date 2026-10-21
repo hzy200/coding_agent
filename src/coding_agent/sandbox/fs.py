@@ -17,6 +17,8 @@ from __future__ import annotations
 import base64
 import json
 import shlex
+import time
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 
 from coding_agent.sandbox.pathguard import (
@@ -62,6 +64,30 @@ def _parse_kv(output: str) -> dict[str, str]:
     return result
 
 
+# 写盘时抢占文件失败的典型 errno 文案。这些是**瞬时**的：别的进程
+# （编辑器、构建工具）短暂持有文件。值得短退避重试，而不是直接报给模型。
+_WRITE_RETRY_HINTS = (
+    "text file busy",
+    "device or resource busy",
+    "resource temporarily unavailable",
+    "temporarily unavailable",
+    "interrupted system call",
+    "ebusy",
+    "etxtbsy",
+    "eagain",
+    "eintr",
+)
+
+# 重试次数与退避（秒）。总等待不超过 1s，避免把一次工具调用拖长。
+_WRITE_RETRY_ATTEMPTS = 3
+_WRITE_RETRY_DELAYS = (0.05, 0.15)
+
+
+def _is_retryable_write_failure(stderr: str) -> bool:
+    text = (stderr or "").lower()
+    return any(hint in text for hint in _WRITE_RETRY_HINTS)
+
+
 class SandboxFs:
     """工作区内的文件读写。"""
 
@@ -70,7 +96,7 @@ class SandboxFs:
         sandbox: WslSandbox,
         root: str,
         *,
-        cache: dict[str, bytes] | None = None,
+        cache: MutableMapping[str, bytes] | None = None,
     ) -> None:
         self._sandbox = sandbox
         self.root = root
@@ -207,13 +233,43 @@ fi
     # 读写
     # ------------------------------------------------------------------
 
-    def read_bytes(self, path: str, *, max_bytes: int) -> bytes:
+    def invalidate(self, path: str) -> None:
+        """丢掉某个路径的读取缓存，让下一次读取真正回到磁盘。"""
+        if self._cache is None:
+            return
+        try:
+            lexical = ensure_inside(path, self.root, cwd=self.root)
+        except SandboxPathError:
+            return
+        self._cache.pop(lexical, None)
+
+    def cached_bytes(self, path: str) -> bytes | None:
+        """返回模型最近一次读取到的内容（没有缓存则 None）。
+
+        写路径用它做乐观并发检查：模型读到写之间，文件可能被外部进程改过。
+        """
+        if self._cache is None:
+            return None
+        try:
+            lexical = ensure_inside(path, self.root, cwd=self.root)
+        except SandboxPathError:
+            return None
+        return self._cache.get(lexical)
+
+    def read_bytes(
+        self, path: str, *, max_bytes: int, use_cache: bool = True
+    ) -> bytes:
         """读文件内容：**一次**进程启动里完成路径校验 + 状态 + 读取。
 
         `max_bytes` 会传进脚本，超限时脚本根本不读内容（见 `_stat_script`）。
+        `use_cache=False` 用于写前复核：必须拿到磁盘上的当前内容，不能吃缓存。
         """
         lexical = ensure_inside(path, self.root, cwd=self.root)
-        cached = self._cache.get(lexical) if self._cache is not None else None
+        cached = (
+            self._cache.get(lexical)
+            if use_cache and self._cache is not None
+            else None
+        )
         if cached is not None:
             if len(cached) > max_bytes:
                 raise SandboxFsTooLarge(
@@ -242,19 +298,66 @@ fi
             )
         if data is None:
             raise SandboxFsError(f"读取失败：没有取到内容（{lexical}）")
-        if self._cache is not None:
+        # `use_cache=False` 是写前复核：不能把“模型没读过的当前内容”写回缓存，
+        # 否则陈旧读取检查会被悄悄绕过。
+        if self._cache is not None and use_cache:
             self._cache[lexical] = data
         return data
 
-    def read_text(self, path: str, *, max_bytes: int) -> str:
+    def read_text(
+        self, path: str, *, max_bytes: int, use_cache: bool = True
+    ) -> str:
         """读取文本；非 UTF-8 或含 NUL 视为二进制并拒绝。"""
-        data = self.read_bytes(path, max_bytes=max_bytes)
+        data = self.read_bytes(
+            path, max_bytes=max_bytes, use_cache=use_cache
+        )
         if b"\x00" in data:
             raise SandboxFsError(f"二进制文件（含 NUL 字节），不支持读取：{path}")
         try:
             return data.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise SandboxFsError(f"非 UTF-8 文本，不支持读取：{path}（{exc.reason}）") from exc
+
+    def read_for_update(
+        self, path: str, *, max_bytes: int
+    ) -> tuple[str, FileStat, str | None]:
+        """写前读取：一次进程启动拿到 realpath / 类型 / 大小 / 当前内容。
+
+        与 `read_text` 的区别：文件不存在不是异常，而是返回 `(path, info, None)`，
+        让调用方决定“新建”还是“报错”。`use_cache=False` 语义：读的是磁盘当前
+        内容，不会把模型没读过的版本写回缓存。
+        """
+        lexical = ensure_inside(path, self.root, cwd=self.root)
+        result = self._sandbox.run(
+            self._stat_script(
+                lexical, include_data=True, max_bytes=max_bytes
+            )
+        )
+        if not result.ok:
+            raise SandboxFsError(f"读取失败：{result.render(500)}")
+        info, data = self._parse_stat(result.stdout)
+        self._check_real_path(lexical, info)
+        if not info.exists:
+            return lexical, info, None
+        if not info.is_file:
+            raise SandboxFsError(f"不是普通文件：{lexical}")
+        if info.size > max_bytes:
+            raise SandboxFsTooLarge(
+                f"文件过大：{info.size} 字节（本次操作上限 {max_bytes} 字节）"
+            )
+        if data is None:
+            raise SandboxFsError(f"读取失败：没有取到内容（{lexical}）")
+        if b"\x00" in data:
+            raise SandboxFsError(
+                f"二进制文件（含 NUL 字节），不支持读取：{path}"
+            )
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SandboxFsError(
+                f"非 UTF-8 文本，不支持读取：{path}（{exc.reason}）"
+            ) from exc
+        return lexical, info, text
 
     def write_text(self, path: str, content: str) -> int:
         """写入文本（覆盖或新建），自动创建父目录。返回写入字节数。
@@ -270,32 +373,61 @@ fi
         if self._cache is not None:
             self._cache.pop(lexical, None)
         payload = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        # 原子写：先写同目录临时文件，再 `mv` 覆盖目标。
+        # 直接 `> "$p"` 会在进程被杀/磁盘满时留下半截文件；临时文件 + rename
+        # 保证读者看到的要么是旧内容，要么是完整的新内容。
+        # 目标本身是符号链接时写到 realpath，保留“跟随链接”的既有语义。
         script = f"""\
 p={_quote(lexical)}
 root={_quote(self.real_root)}
-dir=$(dirname -- "$p")
-real_dir=$(realpath -m -- "$dir")
-case "$real_dir" in
-  "$root"|"$root"/*) ;;
-  *) echo "ESCAPED=$real_dir" >&2; exit 9 ;;
-esac
+target="$p"
 if [ -e "$p" ] || [ -L "$p" ]; then
   real_p=$(realpath -m -- "$p")
   case "$real_p" in
     "$root"|"$root"/*) ;;
     *) echo "ESCAPED=$real_p" >&2; exit 9 ;;
   esac
+  target="$real_p"
+else
+  real_dir=$(realpath -m -- "$(dirname -- "$p")")
+  case "$real_dir" in
+    "$root"|"$root"/*) ;;
+    *) echo "ESCAPED=$real_dir" >&2; exit 9 ;;
+  esac
 fi
-mkdir -p -- "$real_dir" && base64 -d > "$p" <<'__AGENT_PAYLOAD__'
+real_dir=$(dirname -- "$target")
+mkdir -p -- "$real_dir" || exit 10
+tmp="$target.agent-tmp.$$"
+trap 'rm -f -- "$tmp"' EXIT HUP INT TERM
+base64 -d > "$tmp" <<'__AGENT_PAYLOAD__'
 {_wrap(payload)}
 __AGENT_PAYLOAD__
+if [ $? -ne 0 ]; then exit 11; fi
+# 覆盖已有文件时沿用原权限位（原子 replace 不会自动保留）。
+if [ -e "$target" ]; then chmod --reference="$target" "$tmp" 2>/dev/null || true; fi
+mv -f -- "$tmp" "$target" || exit 12
+trap - EXIT HUP INT TERM
 """
         result = self._sandbox.run(script)
+        attempt = 0
+        while (
+            not result.ok
+            and _is_retryable_write_failure(result.stderr or "")
+            and attempt < len(_WRITE_RETRY_DELAYS)
+        ):
+            time.sleep(_WRITE_RETRY_DELAYS[attempt])
+            attempt += 1
+            result = self._sandbox.run(script)
         if not result.ok:
             if "ESCAPED=" in (result.stderr or ""):
                 raise SandboxPathError(
                     f"路径经符号链接逃出工作区，已拒绝写入：{lexical}"
                     f"（{result.stderr.strip()}）"
+                )
+            if _is_retryable_write_failure(result.stderr or ""):
+                raise SandboxFsError(
+                    f"写入失败：文件可能被其他进程占用（已重试 "
+                    f"{_WRITE_RETRY_ATTEMPTS} 次）：{result.render(500)}"
                 )
             raise SandboxFsError(f"写入失败：{result.render(500)}")
         return len(content.encode("utf-8"))
@@ -333,7 +465,7 @@ __AGENT_PAYLOAD__
         script = f"""\
 root={_quote(self.real_root)}
 python3 - "$root" <<'__AGENT_WRITE_MANY__'
-import base64, json, os, sys
+import base64, json, os, stat, sys, tempfile
 
 root = os.path.realpath(sys.argv[1])
 files = json.loads(base64.b64decode("__AGENT_PAYLOAD__").decode("utf-8"))
@@ -354,16 +486,31 @@ for path, content in files.items():
     # 只判父目录挡不住"目标本身是指向工作区外的符号链接"。
     if not inside(os.path.realpath(os.path.dirname(path))):
         escaped(os.path.realpath(os.path.dirname(path)))
+    target = path
     if os.path.exists(path) or os.path.islink(path):
         if not inside(os.path.realpath(path)):
             escaped(os.path.realpath(path))
-    checked.append((path, content))
+        target = os.path.realpath(path)
+    checked.append((target, content))
 
 written = 0
-for path, content in checked:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(content)
+for target, content in checked:
+    directory = os.path.dirname(target)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".agent-tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        if os.path.exists(target):
+            # 原子 replace 不保留原权限位（可执行脚本会丢 +x）。
+            os.chmod(tmp, stat.S_IMODE(os.stat(target).st_mode))
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     written += len(content.encode("utf-8"))
 print("WROTE=%d" % written)
 __AGENT_WRITE_MANY__
@@ -373,16 +520,33 @@ __AGENT_WRITE_MANY__
         # 没有命令行长度上限，一整行再长也无妨。
         script = script.replace("__AGENT_PAYLOAD__", payload)
         result = self._sandbox.run(script)
+        attempt = 0
+        while (
+            not result.ok
+            and _is_retryable_write_failure(result.stderr or "")
+            and attempt < len(_WRITE_RETRY_DELAYS)
+        ):
+            time.sleep(_WRITE_RETRY_DELAYS[attempt])
+            attempt += 1
+            result = self._sandbox.run(script)
         if not result.ok:
             if "ESCAPED=" in (result.stderr or ""):
                 raise SandboxPathError(
                     f"路径经符号链接逃出工作区，已拒绝写入（批量）：{result.stderr.strip()}"
                 )
+            if _is_retryable_write_failure(result.stderr or ""):
+                raise SandboxFsError(
+                    f"批量写入失败：文件可能被其他进程占用（已重试 "
+                    f"{_WRITE_RETRY_ATTEMPTS} 次）：{result.render(500)}"
+                )
             raise SandboxFsError(f"批量写入失败：{result.render(500)}")
         return sum(len(content.encode("utf-8")) for content in files.values())
 
-    def remove(self, path: str) -> bool:
+    def remove(self, path: str, *, known_file: bool = False) -> bool:
         """删除工作区内的**普通文件**，返回它此前是否存在。
+
+        `known_file=True` 表示调用方刚刚读过并确认它是普通文件（例如 move/
+        delete 工具），省掉一次 `stat` 往返；realpath 校验仍由脚本执行。
 
         唯一用途是「回滚一次新建」——留底时那个文件还不存在，把它还原成空文件
         等于留下一堆垃圾，还原成「不存在」才是真的回到原状。因此这里只删文件：
@@ -391,13 +555,14 @@ __AGENT_WRITE_MANY__
         lexical = ensure_inside(path, self.root, cwd=self.root)
         if self._cache is not None:
             self._cache.pop(lexical, None)
-        # 先探一次：既拿到状态（存在吗、是文件吗），也完成 realpath 校验
-        info = self.stat(lexical)
-        self._check_real_path(lexical, info)
-        if not info.exists:
-            return False
-        if not info.is_file:
-            raise SandboxFsError(f"不是普通文件，拒绝删除：{lexical}")
+        if not known_file:
+            # 先探一次：既拿到状态（存在吗、是文件吗），也完成 realpath 校验
+            info = self.stat(lexical)
+            self._check_real_path(lexical, info)
+            if not info.exists:
+                return False
+            if not info.is_file:
+                raise SandboxFsError(f"不是普通文件，拒绝删除：{lexical}")
 
         script = f"""\
 p={_quote(lexical)}
@@ -420,6 +585,83 @@ rm -f -- "$p"
                 )
             raise SandboxFsError(f"删除失败：{result.render(500)}")
         return True
+
+    def mkdir(self, path: str) -> str:
+        """创建目录（含父目录），返回 realpath；目标是文件时拒绝。"""
+        lexical = ensure_inside(path, self.root, cwd=self.root)
+        script = f"""\
+p={_quote(lexical)}
+root={_quote(self.real_root)}
+parent=$(dirname -- "$p")
+real_parent=$(realpath -m -- "$parent")
+case "$real_parent" in
+  "$root"|"$root"/*) ;;
+  *) echo "ESCAPED=$real_parent" >&2; exit 9 ;;
+esac
+if [ -e "$p" ] || [ -L "$p" ]; then
+  real_p=$(realpath -m -- "$p")
+  case "$real_p" in
+    "$root"|"$root"/*) ;;
+    *) echo "ESCAPED=$real_p" >&2; exit 9 ;;
+  esac
+  if [ ! -d "$real_p" ]; then echo "NOTDIR=$real_p" >&2; exit 10; fi
+else
+  mkdir -p -- "$p" || exit 11
+  real_p=$(realpath -m -- "$p")
+fi
+echo "REAL=$real_p"
+"""
+        result = self._sandbox.run(script)
+        if not result.ok:
+            if "ESCAPED=" in (result.stderr or ""):
+                raise SandboxPathError(
+                    f"路径经符号链接逃出工作区，已拒绝创建目录：{lexical}"
+                )
+            if "NOTDIR=" in (result.stderr or ""):
+                raise SandboxFsError(f"目标已存在且不是目录：{lexical}")
+            raise SandboxFsError(f"创建目录失败：{result.render(500)}")
+        if self._cache is not None:
+            self._cache.clear()
+        return result.stdout.strip().splitlines()[-1].removeprefix("REAL=")
+
+    def list_dir(
+        self, path: str, *, max_depth: int = 1, limit: int = 200
+    ) -> list[tuple[str, str]]:
+        """列出目录内容，返回 `(type, relative_path)` 列表（不跟随符号链接）。"""
+        lexical = ensure_inside(path, self.root, cwd=self.root)
+        depth = max(1, int(max_depth))
+        cap = max(1, int(limit))
+        script = f"""\
+p={_quote(lexical)}
+root={_quote(self.real_root)}
+if [ ! -e "$p" ] && [ ! -L "$p" ]; then echo "MISSING=1" >&2; exit 12; fi
+real_p=$(realpath -m -- "$p")
+case "$real_p" in
+  "$root"|"$root"/*) ;;
+  *) echo "ESCAPED=$real_p" >&2; exit 9 ;;
+esac
+if [ ! -d "$real_p" ]; then echo "NOTDIR=$real_p" >&2; exit 10; fi
+find "$real_p" -mindepth 1 -maxdepth {depth} -printf '%y\\t%P\\n' 2>/dev/null \\
+  | LC_ALL=C sort | head -n {cap}
+"""
+        result = self._sandbox.run(script)
+        if not result.ok:
+            if "ESCAPED=" in (result.stderr or ""):
+                raise SandboxPathError(
+                    f"路径经符号链接逃出工作区，已拒绝列出：{lexical}"
+                )
+            if "MISSING=" in (result.stderr or ""):
+                raise SandboxFsError(f"目录不存在：{lexical}")
+            if "NOTDIR=" in (result.stderr or ""):
+                raise SandboxFsError(f"不是目录：{lexical}")
+            raise SandboxFsError(f"列目录失败：{result.render(500)}")
+        entries: list[tuple[str, str]] = []
+        for line in result.stdout.splitlines():
+            kind, sep, rel = line.partition("\t")
+            if not sep or not rel:
+                continue
+            entries.append((kind, rel))
+        return entries
 
 
 def _wrap(payload: str, width: int = 76) -> str:

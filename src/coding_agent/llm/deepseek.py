@@ -131,6 +131,7 @@ def build_llm(
     model_override: str = "",
     task_type: str = "agent",
     required_capabilities: tuple[str, ...] = (),
+    governor: Any | None = None,
 ) -> Any:
     GLOBAL_LIMITER.configure(settings.resolved_rate_limit_state_path)
     specs = _provider_specs(settings)
@@ -195,7 +196,8 @@ def build_llm(
         task_types.append(set(spec.get("task_types") or []))
         if any(costs[-1]) or any(quotas[-1].values()):
             needs_router = True
-    if len(models) == 1 and not needs_router:
+    # 有 governor 时即使只有一个 provider 也走 Router：并发租约挂在那里。
+    if len(models) == 1 and not needs_router and governor is None:
         return models[0]
     return ProviderRouter(
         models,
@@ -210,4 +212,8 @@ def build_llm(
         required_capabilities=required_capabilities,
         capabilities=capabilities,
         task_types=task_types,
+        governor=governor,
+        acquire_timeout_s=settings.concurrency_llm_timeout_s,
+        aimd_min=settings.llm_aimd_min,
+        aimd_max=settings.llm_aimd_max,
     )

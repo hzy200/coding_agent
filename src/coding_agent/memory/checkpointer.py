@@ -48,7 +48,21 @@ class CheckpointStore:
 
         target = Path(self.path).expanduser()
         target.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = await aiosqlite.connect(str(target))
+        # timeout 是 aiosqlite/sqlite3 的 busy timeout（秒）。多个前端
+        # 共享同一个 checkpoint 文件时，写锁冲突应等待而不是立刻抛
+        # `database is locked`。
+        self._connection = await aiosqlite.connect(
+            str(target), timeout=10.0
+        )
+        # WAL 让读写并发更友好，busy_timeout 兜住短时写冲突。
+        # 某些网络文件系统不支持 WAL：失败时退回默认 journal，不能阻断启动。
+        try:
+            await self._connection.execute("PRAGMA journal_mode=WAL")
+            await self._connection.execute("PRAGMA synchronous=NORMAL")
+            await self._connection.execute("PRAGMA busy_timeout=10000")
+            await self._connection.commit()
+        except Exception:  # noqa: BLE001 - 非本地 FS 可能不支持 WAL
+            pass
         self.saver = AsyncSqliteSaver(self._connection)
         await self.saver.setup()
         return self.saver

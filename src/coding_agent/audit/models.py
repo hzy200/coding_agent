@@ -29,6 +29,8 @@ ORCHESTRATION = "orchestration"
 STEERING = "steering"
 RUN_END = "run_end"
 RUN_ERROR = "run_error"
+RECOVERY = "recovery"
+CONCURRENCY = "concurrency"
 
 # decision 取值
 DECISION_AUTO = "auto"          # 策略判定为自动放行并已执行

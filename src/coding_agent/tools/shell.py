@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+from collections.abc import MutableMapping
+
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
 
@@ -47,7 +49,7 @@ def build_shell_tool(
     settings: Settings,
     sandbox: WslSandbox,
     *,
-    read_cache: dict[str, bytes] | None = None,
+    read_cache: MutableMapping[str, bytes] | None = None,
 ) -> BaseTool:
     workspace = resolve_workspace(settings, sandbox)
 

@@ -70,7 +70,7 @@ def build_code_intel_tool(settings: Settings, sandbox: WslSandbox) -> BaseTool:
         if not settings.lsp_command:
             return pack(
                 "未配置 AGENT_LSP_COMMAND；symbol_search 仍可用 AST 索引。",
-                CallArtifact(tool=CODE_INTEL, ok=False),
+                CallArtifact(tool=CODE_INTEL, ok=False, skipped=True),
             )
         fs = SandboxFs(sandbox, root)
         try:
@@ -114,7 +114,8 @@ def build_code_intel_tool(settings: Settings, sandbox: WslSandbox) -> BaseTool:
                     client = None
                 body = f"LSP 查询失败：{type(exc).__name__}: {exc}"
                 return pack(
-                    body, CallArtifact(tool=CODE_INTEL, ok=False)
+                    body,
+                    CallArtifact(tool=CODE_INTEL, ok=False, skipped=True),
                 )
         text_out = f"[{action}] {reason}\n{body}"
         if len(text_out) > settings.max_output_chars:

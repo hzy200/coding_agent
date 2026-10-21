@@ -23,7 +23,13 @@ from coding_agent.tools.code_intel import CODE_INTEL
 from coding_agent.tools.delegate import DELEGATE_EXPLORE
 from coding_agent.tools.deps import DEPS_INSTALL, DEPS_LIST
 from coding_agent.tools.files import (
+    COPY_TOOL_NAME,
+    DELETE_TOOL_NAME,
+    EDIT_MANY_TOOL_NAME,
     EDIT_TOOL_NAME,
+    LIST_TOOL_NAME,
+    MKDIR_TOOL_NAME,
+    MOVE_TOOL_NAME,
     READ_TOOL_NAME,
     RESTORE_TOOL_NAME,
     WRITE_TOOL_NAME,
@@ -51,6 +57,7 @@ _READ_TOOLS = frozenset(
         CODE_INTEL,
         DELEGATE_EXPLORE,
         MEMORY_SEARCH,
+        LIST_TOOL_NAME,
     }
 )
 
@@ -58,13 +65,25 @@ _READ_TOOLS = frozenset(
 # 文件工具是受控路径（有 diff、有备份）；git add 只动索引，可 restore 撤销。
 # memory_save 只改 `.agent/memory.md`，与 CLI `/remember` 同一份文件。
 _WRITE_TOOLS = frozenset(
-    {WRITE_TOOL_NAME, EDIT_TOOL_NAME, RESTORE_TOOL_NAME, GIT_ADD, MEMORY_SAVE}
+    {
+        WRITE_TOOL_NAME,
+        EDIT_TOOL_NAME,
+        EDIT_MANY_TOOL_NAME,
+        RESTORE_TOOL_NAME,
+        MOVE_TOOL_NAME,
+        COPY_TOOL_NAME,
+        MKDIR_TOOL_NAME,
+        GIT_ADD,
+        MEMORY_SAVE,
+    }
 )
 
 # 变更性：产生提交、改动依赖环境、执行项目代码，一律逐条询问。
 # 注意自动 verify 不走这里 —— 它只跑命令文本由宿主写死的命令（见 nodes/verify.py）；
 # manifest 派生出来的 `make test` / `npm test` 只留给走审批的 run_tests。
-_MUTATE_TOOLS = frozenset({GIT_COMMIT, DEPS_INSTALL, RUN_TESTS_TOOL})
+_MUTATE_TOOLS = frozenset(
+    {GIT_COMMIT, DEPS_INSTALL, RUN_TESTS_TOOL, DELETE_TOOL_NAME}
+)
 
 
 def tool_level(name: str, args: dict[str, Any]) -> _Level:

@@ -18,6 +18,14 @@ class AgentState(TypedDict, total=False):
     # 本轮用户请求的纯文本副本。独立子图不复制整段 messages，只读这一项；
     # direct 路径仍以 messages 为准（此字段不参与规划）。
     request: str
+    # 从 checkpoint 抽取的上一轮及更早对话摘要。独立子图拿不到完整 messages，
+    # 用它携带「不要改测试」「沿用上次接口」这类持久约束；0 字符时为空。
+    session_brief: str
+    # 上一轮没有正常收尾时给模型的恢复提示（工作区可能有未验证改动）。
+    recovery_notice: str
+    # running / finished。respond 收尾时置 finished；异常/崩溃会把它留在
+    # running，下次同一 thread 的新 run 据此触发恢复提示。
+    run_status: str
     # 沙箱内的工作目录
     cwd: str
     # 跨会话的项目事实，每次 run 从记忆文件刷新后注入系统提示
@@ -51,6 +59,9 @@ class AgentState(TypedDict, total=False):
     # 当前步骤的用量与结果 —— 全部由 planner / advance / repair 按步重置
     tool_rounds: int
     budget_exhausted: bool
+    # 本次节点内因瞬时错误触发的重试次数（runtime 累加后写进 run_end 审计）。
+    # 不是页面上的进度，但事后要能回答「这一轮是不是一直在抖动」。
+    transient_retries: int
     # 本步是否改过文件/依赖：没改动就不必跑验证
     dirty: bool
     # 整个任务是否产生过任何改动。与 `dirty` 的区别：后者每步重置，
@@ -126,6 +137,10 @@ class AgentState(TypedDict, total=False):
     # fan-in 的结构化产物索引；完整结果在 .agent/artifacts/ 下。
     worker_brief: str
     orchestration_artifacts: list[dict[str, Any]]
+    # fan-in 的结构化交接（任务级状态、文件、发现、artifact 路径、预算）。
+    # 与 `worker_context` 的区别：后者是给模型读的压缩文本，这里是供宿主/
+    # 工具/前端按字段消费的稳定结构。
+    orchestration_handoff: dict[str, Any]
     # Phase 4D：worker 提议的只读任务扩展
     # 已扫描到 worker_results 的哪个位置（避免重复采纳同一批提议）
     task_extensions_seen: int

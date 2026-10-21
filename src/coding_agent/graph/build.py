@@ -25,11 +25,13 @@ advance 步进，respond 收尾。
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from coding_agent.agents.explore import make_explore_runner, make_review_runner
+from coding_agent.concurrency import ConcurrencyGovernor
 from coding_agent.config import Settings, get_settings
 from coding_agent.graph.nodes import (
     advance,
@@ -71,9 +73,11 @@ from coding_agent.llm.deepseek import build_llm
 from coding_agent.orchestrator import make_worker_runner, route_entry
 from coding_agent.orchestrator.implement import make_implement_runner
 from coding_agent.orchestrator.subgraph import build_orchestrator_subgraph
+from coding_agent.read_cache import ReadCache
 from coding_agent.sandbox.policy import SessionPolicy, parse_allow_rules
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
 from coding_agent.steering import SteeringController
+from coding_agent.tool_journal import ToolJournal
 from coding_agent.tools.delegate import EXPLORE_TOOL_NAMES, build_delegate_tool
 from coding_agent.tools.registry import build_tools
 
@@ -157,6 +161,7 @@ def build_graph(
     policy: SessionPolicy | None = None,
     sandbox: WslSandbox | None = None,
     steering: SteeringController | None = None,
+    governor: ConcurrencyGovernor | None = None,
 ):
     # 一次运行只该有一份沙箱：环境探测（$HOME、bwrap、rg）的结果缓存在**实例**上，
     # 各建一份就等于各探一遍 —— 曾经这里是 runtime / build_tools / verify 三份，
@@ -166,7 +171,8 @@ def build_graph(
         allow_write=allow_write,
         allow_rules=parse_allow_rules(settings.allow_rules),
     )
-    sandbox = sandbox or WslSandbox(settings)
+    governor = governor or ConcurrencyGovernor(settings)
+    sandbox = sandbox or WslSandbox(settings, slots=governor.wsl)
     # runtime 会把自己的 controller 传进来；直接 build_graph 的调用方
     # （测试、脚本）拿一个空队列即可。
     steering = steering or SteeringController()
@@ -174,12 +180,17 @@ def build_graph(
     # `--workspace` 覆盖，让它自己推会退回 $HOME。
     root = resolve_workspace(settings, sandbox)
     # 同一次运行内只读 worker 共享内容缓存；写路径会主动失效。
-    read_cache: dict[str, bytes] = {}
+    read_cache = ReadCache(settings.read_cache_max_bytes)
     tools = build_tools(
         settings,
         allow_write=allow_write,
         sandbox=sandbox,
         read_cache=read_cache,
+    )
+    # 有副作用工具的执行日志放在宿主审计目录，不依赖沙箱。
+    journal = ToolJournal(
+        Path(settings.resolved_audit_dir) / "tool_journal.jsonl",
+        enabled=settings.tool_journal_enabled,
     )
 
     # 不绑定工具的实例留给 planner / respond，避免它们在规划或收尾阶段发起动作
@@ -188,17 +199,19 @@ def build_graph(
         streaming=True,
         task_type="agent",
         required_capabilities=("tools", "chat"),
+        governor=governor,
     )
     # 模型分层：explore/review/implement worker 可独立使用更便宜的模型；
     # 空串表示沿用主模型。
     worker_llm = llm
     if settings.orchestrator_worker_model:
-        worker_llm = build_llm(
-            settings,
-            streaming=True,
-            model_override=settings.orchestrator_worker_model,
-            task_type="worker",
-        )
+            worker_llm = build_llm(
+                settings,
+                streaming=True,
+                model_override=settings.orchestrator_worker_model,
+                task_type="worker",
+                governor=governor,
+            )
 
     # 子智能体/编排 worker 共用同一份只读 Explore runner。
     # delegate 工具只在 explore_enabled 时绑定；orchestrator 只使用 runner。
@@ -235,6 +248,10 @@ def build_graph(
             max_steps=settings.max_plan_steps,
             allow_write=allow_write,
             delegate_enabled=settings.explore_enabled,
+            retry_attempts=settings.retry_attempts,
+            retry_base_delay=settings.retry_base_delay_s,
+            retry_max_delay=settings.retry_max_delay_s,
+            retry_max_total_wait=settings.retry_max_total_wait_s,
         ),
     )
     graph.add_node(
@@ -247,6 +264,10 @@ def build_graph(
             budget=settings.context_budget,
             delegate_enabled=settings.explore_enabled,
             forced_llm=llm_forced,
+            retry_attempts=settings.retry_attempts,
+            retry_base_delay=settings.retry_base_delay_s,
+            retry_max_delay=settings.retry_max_delay_s,
+            retry_max_total_wait=settings.retry_max_total_wait_s,
         ),
     )
     graph.add_node(APPROVE, make_approval_gate_node(policy))
@@ -258,6 +279,8 @@ def build_graph(
             max_delegate_calls=settings.max_delegate_calls,
             max_concurrent_agents=settings.max_concurrent_agents,
             max_concurrent_tools=settings.max_concurrent_tools,
+            journal=journal,
+            governor=governor,
         ),
     )
     graph.add_node(VERIFY, make_verify_node(sandbox, root))
@@ -279,6 +302,10 @@ def build_graph(
             llm,
             max_repair_rounds=settings.max_repair_rounds,
             budget=settings.context_budget,
+            retry_attempts=settings.retry_attempts,
+            retry_base_delay=settings.retry_base_delay_s,
+            retry_max_delay=settings.retry_max_delay_s,
+            retry_max_total_wait=settings.retry_max_total_wait_s,
         ),
     )
 
@@ -303,6 +330,7 @@ def build_graph(
             worker_runner=worker_runner,
             steering=steering,
             allow_write=allow_write,
+            governor=governor,
         ),
     )
     graph.add_node(STEERING_STEP, make_steering_step_node(steering, settings))

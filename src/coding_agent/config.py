@@ -89,6 +89,19 @@ class Settings(BaseSettings):
     llm_provider_max_wait_s: float = Field(
         default=30.0, alias="AGENT_LLM_PROVIDER_MAX_WAIT_S"
     )
+    # 节点级瞬时错误重试（超时/连接重置/5xx/429/环境抖动）。
+    # attempts 是**总尝试次数**；1 表示不重试。退避为指数 + 抖动，
+    # 且整次重试累计等待不超过 max_total_wait，避免长时间卡住。
+    retry_attempts: int = Field(default=3, alias="AGENT_RETRY_ATTEMPTS")
+    retry_base_delay_s: float = Field(
+        default=1.0, alias="AGENT_RETRY_BASE_DELAY_S"
+    )
+    retry_max_delay_s: float = Field(
+        default=30.0, alias="AGENT_RETRY_MAX_DELAY_S"
+    )
+    retry_max_total_wait_s: float = Field(
+        default=60.0, alias="AGENT_RETRY_MAX_TOTAL_WAIT_S"
+    )
     # cost（按 provider 单价排序）| priority（按配置顺序）
     llm_routing_strategy: str = Field(
         default="cost", alias="AGENT_LLM_ROUTING_STRATEGY"
@@ -122,12 +135,36 @@ class Settings(BaseSettings):
     # 仅 bwrap 模式生效：false 时加 --unshare-net，命令完全无网络。
     # off 模式没有内核级隔离，词法策略无法禁止 curl/wget 出网。
     shell_network: bool = Field(default=True, alias="AGENT_SHELL_NETWORK")
-    # 常驻 WSL bash 会话池；默认关闭（出问题时可退回逐命令 wsl.exe）。
-    persistent_shell: bool = Field(default=False, alias="AGENT_PERSISTENT_SHELL")
+    # 常驻 WSL bash 会话池。默认开启：实测读/检索从 ~170ms 降到 ~20ms。
+    # 会话异常时会自动退回逐命令 wsl.exe，因此可安全地作为默认值。
+    persistent_shell: bool = Field(default=True, alias="AGENT_PERSISTENT_SHELL")
     persistent_shell_pool: int = Field(
         default=4, alias="AGENT_PERSISTENT_SHELL_POOL"
     )
     shell_timeout: int = Field(default=60, alias="AGENT_SHELL_TIMEOUT")
+    # WSL 健康检查与熔断。连续失败达到阈值后，短时间内直接 fail fast，
+    # 避免每个工具调用都去拉起一个注定失败的 wsl.exe；冷却后放一个探测请求。
+    wsl_health_check_enabled: bool = Field(
+        default=True, alias="AGENT_WSL_HEALTH_CHECK"
+    )
+    wsl_health_ttl_s: float = Field(
+        default=30.0, alias="AGENT_WSL_HEALTH_TTL_S"
+    )
+    wsl_health_timeout_s: int = Field(
+        default=10, alias="AGENT_WSL_HEALTH_TIMEOUT_S"
+    )
+    wsl_breaker_failures: int = Field(
+        default=3, alias="AGENT_WSL_BREAKER_FAILURES"
+    )
+    wsl_breaker_cooldown_s: float = Field(
+        default=15.0, alias="AGENT_WSL_BREAKER_COOLDOWN_S"
+    )
+    wsl_breaker_max_cooldown_s: float = Field(
+        default=60.0, alias="AGENT_WSL_BREAKER_MAX_COOLDOWN_S"
+    )
+    # 自动验证的独立超时。测试/构建通常比普通 shell 命令长，不能共用 60s；
+    # 0 表示回退到 shell_timeout。
+    verify_timeout: int = Field(default=300, alias="AGENT_VERIFY_TIMEOUT")
     # 追加的内容级写保护 glob（逗号分隔）；默认规则始终生效。
     write_deny_globs: str = Field(default="", alias="AGENT_WRITE_DENY_GLOBS")
     # repo map 注入 planner 的字符预算（0 = 关闭）。
@@ -152,18 +189,84 @@ class Settings(BaseSettings):
         default=8, alias="AGENT_SANDBOX_MAX_CONCURRENT_COMMANDS"
     )
 
+    # ---------- 统一并发治理 ----------
+    # 0 = 回退到旧的单项配置（orchestrator_max_concurrent_workers /
+    # sandbox_max_concurrent_commands / max_concurrent_tools）。
+    concurrency_workers: int = Field(
+        default=0, alias="AGENT_CONCURRENCY_WORKERS"
+    )
+    concurrency_tools: int = Field(
+        default=0, alias="AGENT_CONCURRENCY_TOOLS"
+    )
+    concurrency_wsl: int = Field(default=0, alias="AGENT_CONCURRENCY_WSL")
+    # 给健康探针/短探测保留的 WSL 槽位；普通命令不能用。
+    concurrency_wsl_reserve: int = Field(
+        default=1, alias="AGENT_CONCURRENCY_WSL_RESERVE"
+    )
+    # 基于命令 p95 延迟的弹性并发：高延迟降并发，低延迟逐步恢复。
+    concurrency_wsl_adaptive: bool = Field(
+        default=True, alias="AGENT_CONCURRENCY_WSL_ADAPTIVE"
+    )
+    concurrency_wsl_min: int = Field(
+        default=2, alias="AGENT_CONCURRENCY_WSL_MIN"
+    )
+    concurrency_wsl_max: int = Field(
+        default=0, alias="AGENT_CONCURRENCY_WSL_MAX"
+    )
+    concurrency_wsl_target_ms: int = Field(
+        default=1500, alias="AGENT_CONCURRENCY_WSL_TARGET_MS"
+    )
+    concurrency_wsl_latency_window: int = Field(
+        default=20, alias="AGENT_CONCURRENCY_WSL_LATENCY_WINDOW"
+    )
+    concurrency_llm_per_provider: int = Field(
+        default=4, alias="AGENT_CONCURRENCY_LLM_PER_PROVIDER"
+    )
+    concurrency_llm_global: int = Field(
+        default=6, alias="AGENT_CONCURRENCY_LLM_GLOBAL"
+    )
+    concurrency_worker_timeout_s: float = Field(
+        default=60.0, alias="AGENT_CONCURRENCY_WORKER_TIMEOUT_S"
+    )
+    concurrency_llm_timeout_s: float = Field(
+        default=30.0, alias="AGENT_CONCURRENCY_LLM_TIMEOUT_S"
+    )
+    concurrency_wsl_timeout_s: float = Field(
+        default=30.0, alias="AGENT_CONCURRENCY_WSL_TIMEOUT_S"
+    )
+    # LLM 每个 provider 的自适应并发范围。
+    llm_aimd_min: int = Field(default=1, alias="AGENT_LLM_AIMD_MIN")
+    llm_aimd_max: int = Field(default=8, alias="AGENT_LLM_AIMD_MAX")
+
     # ---------- 上下文裁剪 ----------
     # 0 表示不裁剪；这些值作用于发给模型的历史，不改写会话状态
     context_max_chars: int = Field(default=60_000, alias="AGENT_CONTEXT_MAX_CHARS")
     context_max_tokens: int = Field(default=0, alias="AGENT_CONTEXT_MAX_TOKENS")
     context_keep_recent: int = Field(default=12, alias="AGENT_CONTEXT_KEEP_RECENT")
     context_tool_chars: int = Field(default=1_500, alias="AGENT_CONTEXT_TOOL_CHARS")
+    # run 级文件内容缓存的字节上限（LRU）。0 = 关闭缓存。
+    read_cache_max_bytes: int = Field(
+        default=64 * 1024 * 1024, alias="AGENT_READ_CACHE_MAX_BYTES"
+    )
+    # AST 符号索引缓存时间；写操作不会主动失效，过期后自动重建。
+    symbol_index_ttl_s: float = Field(
+        default=10.0, alias="AGENT_SYMBOL_INDEX_TTL_S"
+    )
+    # 包管理器探测缓存时间；安装后会主动失效。
+    deps_detect_ttl_s: float = Field(
+        default=30.0, alias="AGENT_DEPS_DETECT_TTL_S"
+    )
     # 每次运行注入系统提示的长期记忆条数（按与请求的相关度取前 K 条）。
     # 0 表示不限制，整份注入 —— 记忆上限 50 条，但每条都会进入每一轮 system prompt。
     memory_top_k: int = Field(default=8, alias="AGENT_MEMORY_TOP_K")
     # 是否发现并注入仓库内的 AGENTS.md / CLAUDE.md（分层项目指令）。
     instructions_enabled: bool = Field(
         default=True, alias="AGENT_INSTRUCTIONS_ENABLED"
+    )
+    # 编排子图/worker 的会话约束摘要上限（字符）。独立子图不复制 messages，
+    # 这里从 checkpoint 抽最近若干轮压缩后注入；0 表示关闭。
+    session_brief_chars: int = Field(
+        default=4_000, alias="AGENT_SESSION_BRIEF_CHARS"
     )
 
     # ---------- 验证 ----------
@@ -284,6 +387,11 @@ class Settings(BaseSettings):
     orchestrator_total_tokens: int = Field(
         default=0, alias="AGENT_ORCHESTRATOR_TOTAL_TOKENS"
     )
+    # 在飞 implement + 待合并补丁的上限；超过后暂停启动新的 implement，
+    # 先让合并队列排空，避免补丁/快照堆积。
+    orchestrator_max_pending_merges: int = Field(
+        default=8, alias="AGENT_ORCHESTRATOR_MAX_PENDING_MERGES"
+    )
     # 遇到 429/限流时 scheduler 的首次退避秒数；之后指数增长，上限 30s。
     orchestrator_rate_limit_backoff_s: float = Field(
         default=2.0, alias="AGENT_ORCHESTRATOR_RATE_LIMIT_BACKOFF_S"
@@ -316,6 +424,14 @@ class Settings(BaseSettings):
     # 每个 thread/命名空间保留的 checkpoint 数；0 = 不轮转。
     # 每轮工具调用都会落一个 checkpoint，长期使用需要上限。
     checkpoint_keep: int = Field(default=200, alias="AGENT_CHECKPOINT_KEEP")
+    # 有副作用工具的执行日志：崩溃后同一 call_id 不自动重放。
+    tool_journal_enabled: bool = Field(
+        default=True, alias="AGENT_TOOL_JOURNAL_ENABLED"
+    )
+    # 同一工作区只允许一个 runtime 运行；锁文件在审计目录下。
+    workspace_lock_enabled: bool = Field(
+        default=True, alias="AGENT_WORKSPACE_LOCK"
+    )
     audit_enabled: bool = Field(default=True, alias="AGENT_AUDIT_ENABLED")
     # 留空表示自动用 <当前目录>/.agent/audit
     audit_dir: str = Field(default="", alias="AGENT_AUDIT_DIR")
@@ -340,6 +456,9 @@ class Settings(BaseSettings):
     max_plan_steps: int = Field(default=5, alias="AGENT_MAX_PLAN_STEPS")
     # 同一会话内「挂起→恢复」的总次数上限，防前端反复 resume 绕开 recursion_limit
     max_resumes: int = Field(default=50, alias="AGENT_MAX_RESUMES")
+    # 一次完整运行（含审批/暂停后的 resume）的总墙钟上限，0 表示不限制。
+    # 与 recursion_limit 互补：后者管步数，这里管时间（例如模型长时间卡住）。
+    run_deadline_s: int = Field(default=1800, alias="AGENT_RUN_DEADLINE_S")
     # ask（逐条询问）| approve（一律放行）| deny（一律拒绝）
     approval_mode: str = Field(default="ask", alias="AGENT_APPROVAL_MODE")
     # 持久放行规则，逗号分隔的 `tool:glob`，例如

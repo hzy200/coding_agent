@@ -46,6 +46,7 @@ from coding_agent.llm.prompts import (
     format_review_feedback,
     format_verification_feedback,
 )
+from coding_agent.recovery import retry_async
 
 BUDGET_EXHAUSTED_TEMPLATE = "（本步骤已达到工具调用上限 {limit} 轮，停止继续尝试。）"
 
@@ -59,12 +60,28 @@ def make_act_node(
     budget: ContextBudget | None = None,
     delegate_enabled: bool = False,
     forced_llm: BaseChatModel | None = None,
+    retry_attempts: int = 3,
+    retry_base_delay: float = 1.0,
+    retry_max_delay: float = 30.0,
+    retry_max_total_wait: float = 60.0,
 ) -> Callable[[AgentState, RunnableConfig], Awaitable[dict[str, Any]]]:
     # 裁剪只影响发给模型的内容，不改动写回 state 的历史
     trim_budget = budget or ContextBudget()
 
     async def act(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         rounds = state.get("tool_rounds", 0)
+        retry_events: list[dict[str, Any]] = []
+
+        async def _invoke(model: BaseChatModel, messages: list[Any]) -> Any:
+            return await retry_async(
+                lambda: model.ainvoke(messages, config),
+                attempts=retry_attempts,
+                base_delay=retry_base_delay,
+                max_delay=retry_max_delay,
+                max_total_wait=retry_max_total_wait,
+                on_retry=retry_events.append,
+                label="act",
+            )
 
         if rounds >= max_tool_rounds:
             return {
@@ -123,6 +140,7 @@ def make_act_node(
             # 只有 delegate 工具真的绑定时才提；否则会教模型调用一个不存在的工具
             delegation_note=delegation_note,
             worker_context=str(state.get("worker_context") or ""),
+            recovery_notice=str(state.get("recovery_notice") or ""),
             context_summary=summarize_messages(state["messages"]),
         )
         history, trim_report = trim_messages(state["messages"], trim_budget)
@@ -166,6 +184,9 @@ def make_act_node(
                         worker_context=str(
                             current.get("worker_context") or ""
                         ),
+                        recovery_notice=str(
+                            current.get("recovery_notice") or ""
+                        ),
                         context_summary=summarize_messages(
                             current["messages"]
                         ),
@@ -173,16 +194,16 @@ def make_act_node(
                 ),
                 *tighter_history,
             ]
-            return await llm.ainvoke(tighter_messages, config), tighter_report
+            return await _invoke(llm, tighter_messages), tighter_report
 
         try:
-            response = await model.ainvoke(messages, config)
+            response = await _invoke(model, messages)
         except Exception as exc:  # noqa: BLE001
             if force_tool:
                 # 强制 tool_choice 在个别 provider/模式下可能被拒；退回普通调用，
                 # 不要让一次强制失败把整个运行打断。
                 try:
-                    response = await llm.ainvoke(messages, config)
+                    response = await _invoke(llm, messages)
                 except Exception as fallback_exc:  # noqa: BLE001
                     if not is_context_length_error(fallback_exc):
                         raise
@@ -196,6 +217,7 @@ def make_act_node(
         return {
             "messages": [response],
             "tool_rounds": rounds + 1,
+            "transient_retries": len(retry_events),
             "context_trim": {
                 **asdict(trim_report),
                 "node": "act",

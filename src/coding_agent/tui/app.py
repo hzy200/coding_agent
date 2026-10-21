@@ -369,6 +369,8 @@ class AgentTuiApp(App[None]):
                 self._write("← 已被用户拒绝", "red")
             elif event.rejected:
                 self._write("← 已被安全策略拒绝", "red")
+            elif event.skipped:
+                self._write("← 已跳过（环境未配置）", "dim")
             elif event.ok:
                 elapsed = f" {event.duration_ms / 1000:.2f}s" if event.duration_ms else ""
                 self._write(f"← ✓{elapsed}", "dim")

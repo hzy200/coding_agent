@@ -16,8 +16,15 @@ from coding_agent.sandbox.fs import SandboxFs
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
 from coding_agent.tools.artifacts import FileArtifact, unpack
 from coding_agent.tools.files import (
+    COPY_TOOL_NAME,
+    DELETE_TOOL_NAME,
+    EDIT_MANY_TOOL_NAME,
     EDIT_TOOL_NAME,
+    LIST_TOOL_NAME,
+    MKDIR_TOOL_NAME,
+    MOVE_TOOL_NAME,
     READ_TOOL_NAME,
+    RESTORE_TOOL_NAME,
     WRITE_TOOL_NAME,
     build_file_tools,
 )
@@ -47,6 +54,12 @@ def _invoke(tool, **args) -> tuple[str, FileArtifact]:
     return text, FileArtifact.model_validate(artifact)
 
 
+def _invoke_any(tool, **args) -> tuple[str, dict]:
+    text, artifact = unpack(tool.invoke(args))
+    assert isinstance(artifact, dict), "工具必须返回 artifact"
+    return text, artifact
+
+
 def _read_raw(require_wsl: WslSandbox, path: str) -> str:
     result = require_wsl.run(f"cat -- {shlex.quote(path)}")
     assert result.ok, result.render(500)
@@ -68,6 +81,191 @@ def test_write_creates_file_with_exact_bytes(require_wsl, tools, workspace) -> N
     assert artifact.snapshot_id
     assert _read_raw(require_wsl, f"{workspace}/src/pkg/mod.py") == "# 注释带中文\nvalue = 1\n"
     assert "已创建" in text
+
+
+def test_overwrite_is_rejected_when_file_changed_since_read(
+    require_wsl: WslSandbox, workspace: str, settings
+) -> None:
+    """模型读过之后、写之前被外部进程改过 → 拒绝覆盖，避免丢更新。"""
+    scoped = settings.model_copy(update={"wsl_workspace": workspace})
+    tools = {
+        tool.name: tool
+        for tool in build_file_tools(
+            scoped, require_wsl, allow_write=True, read_cache={}
+        )
+    }
+    _invoke(
+        tools[WRITE_TOOL_NAME],
+        path="a.txt",
+        content="original\n",
+        reason="准备",
+    )
+    _invoke(tools[READ_TOOL_NAME], path="a.txt", reason="读取")
+    # 模拟编辑器/另一个进程在模型读到写之间改了文件。
+    require_wsl.run(
+        f"printf 'external\\n' > {shlex.quote(workspace)}/a.txt"
+    )
+
+    text, artifact = _invoke(
+        tools[WRITE_TOOL_NAME],
+        path="a.txt",
+        content="model\n",
+        reason="基于读取结果覆盖",
+    )
+
+    assert artifact.ok is False
+    assert "其他进程修改" in text
+    assert _read_raw(require_wsl, f"{workspace}/a.txt") == "external\n"
+
+
+def test_move_renames_and_keeps_a_source_snapshot(
+    require_wsl: WslSandbox, tools: dict, workspace: str
+) -> None:
+    _invoke(
+        tools[WRITE_TOOL_NAME],
+        path="a.txt",
+        content="alpha\n",
+        reason="准备",
+    )
+
+    text, artifact = _invoke(
+        tools[MOVE_TOOL_NAME],
+        source="a.txt",
+        destination="dir/b.txt",
+        reason="移动",
+    )
+
+    assert artifact.ok
+    assert artifact.action == "move"
+    assert artifact.snapshot_id
+    assert _read_raw(require_wsl, f"{workspace}/dir/b.txt") == "alpha\n"
+    assert require_wsl.run(
+        f"test -e {shlex.quote(workspace)}/a.txt"
+    ).exit_code != 0
+    assert "已移动" in text
+
+
+def test_copy_keeps_the_source(require_wsl, tools, workspace) -> None:
+    _invoke(
+        tools[WRITE_TOOL_NAME],
+        path="a.txt",
+        content="alpha\n",
+        reason="准备",
+    )
+
+    _text, artifact = _invoke(
+        tools[COPY_TOOL_NAME],
+        source="a.txt",
+        destination="b.txt",
+        reason="复制",
+    )
+
+    assert artifact.action == "copy"
+    assert _read_raw(require_wsl, f"{workspace}/a.txt") == "alpha\n"
+    assert _read_raw(require_wsl, f"{workspace}/b.txt") == "alpha\n"
+
+
+def test_edit_many_applies_to_multiple_files_in_one_call(
+    require_wsl: WslSandbox, tools: dict, workspace: str
+) -> None:
+    _invoke(
+        tools[WRITE_TOOL_NAME], path="a.py", content="x = 1\n", reason="准备"
+    )
+    _invoke(
+        tools[WRITE_TOOL_NAME], path="b.py", content="y = 2\n", reason="准备"
+    )
+
+    text, artifact = _invoke_any(
+        tools[EDIT_MANY_TOOL_NAME],
+        edits=[
+            {"path": "a.py", "old_string": "x = 1", "new_string": "x = 10"},
+            {"path": "b.py", "old_string": "y = 2", "new_string": "y = 20"},
+        ],
+        reason="批量修改",
+    )
+
+    assert artifact["ok"] is True
+    assert set(artifact["files"]) == {"a.py", "b.py"}
+    assert _read_raw(require_wsl, f"{workspace}/a.py") == "x = 10\n"
+    assert _read_raw(require_wsl, f"{workspace}/b.py") == "y = 20\n"
+    assert "批量修改 2 个文件" in text
+
+
+def test_edit_many_rejects_the_whole_batch_on_a_bad_match(
+    require_wsl: WslSandbox, tools: dict, workspace: str
+) -> None:
+    _invoke(
+        tools[WRITE_TOOL_NAME], path="a.py", content="x = 1\n", reason="准备"
+    )
+    _invoke(
+        tools[WRITE_TOOL_NAME], path="b.py", content="y = 2\n", reason="准备"
+    )
+
+    text, artifact = _invoke_any(
+        tools[EDIT_MANY_TOOL_NAME],
+        edits=[
+            {"path": "a.py", "old_string": "x = 1", "new_string": "x = 10"},
+            {"path": "b.py", "old_string": "missing", "new_string": "z"},
+        ],
+        reason="批量修改",
+    )
+
+    assert artifact["ok"] is False
+    assert "整批未修改" in text
+    assert _read_raw(require_wsl, f"{workspace}/a.py") == "x = 1\n"
+    assert _read_raw(require_wsl, f"{workspace}/b.py") == "y = 2\n"
+
+
+def test_delete_can_be_restored_from_the_snapshot(
+    require_wsl: WslSandbox, tools: dict, workspace: str
+) -> None:
+    _invoke(
+        tools[WRITE_TOOL_NAME],
+        path="a.txt",
+        content="alpha\n",
+        reason="准备",
+    )
+    _text, deleted = _invoke(
+        tools[DELETE_TOOL_NAME], path="a.txt", reason="删除"
+    )
+    assert deleted.action == "delete"
+    assert deleted.snapshot_id
+    assert require_wsl.run(
+        f"test -e {shlex.quote(workspace)}/a.txt"
+    ).exit_code != 0
+
+    _text, restored = _invoke(
+        tools[RESTORE_TOOL_NAME],
+        path="a.txt",
+        snapshot_id=deleted.snapshot_id,
+        reason="恢复",
+    )
+    assert restored.ok
+    assert _read_raw(require_wsl, f"{workspace}/a.txt") == "alpha\n"
+
+
+def test_mkdir_and_list_show_the_tree(require_wsl, tools, workspace) -> None:
+    _text, made = _invoke(
+        tools[MKDIR_TOOL_NAME], path="src/pkg", reason="建目录"
+    )
+    assert made.action == "mkdir"
+    _invoke(
+        tools[WRITE_TOOL_NAME],
+        path="src/pkg/mod.py",
+        content="x = 1\n",
+        reason="准备",
+    )
+
+    text, listed = _invoke(
+        tools[LIST_TOOL_NAME],
+        path="src",
+        max_depth=2,
+        reason="看结构",
+    )
+
+    assert listed.ok
+    assert "pkg" in text
+    assert "pkg/mod.py" in text
 
 
 def test_write_preserves_awkward_content(require_wsl, tools, workspace) -> None:
@@ -312,7 +510,7 @@ def test_symlink_inside_workspace_is_allowed(tools, require_wsl, workspace) -> N
 def test_write_tools_absent_in_read_only_mode(require_wsl, workspace, settings) -> None:
     scoped = settings.model_copy(update={"wsl_workspace": workspace})
     names = {tool.name for tool in build_file_tools(scoped, require_wsl, allow_write=False)}
-    assert names == {READ_TOOL_NAME}
+    assert names == {READ_TOOL_NAME, LIST_TOOL_NAME}
 
 
 def test_read_of_oversized_file_points_at_offset_limit(tools, settings) -> None:

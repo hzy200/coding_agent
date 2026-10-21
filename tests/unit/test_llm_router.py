@@ -364,3 +364,94 @@ def test_rate_limiter_accumulates_cache_tokens() -> None:
     assert usage["cache_hit_tokens"] == 80
     assert usage["cache_miss_tokens"] == 20
     assert usage["providers"]["k"]["cache_hit_tokens"] == 80
+
+
+def test_governor_limits_concurrent_llm_calls() -> None:
+    from coding_agent.concurrency import ConcurrencyGovernor
+
+    class _BlockingProvider(_Provider):
+        def __init__(self) -> None:
+            super().__init__("p")
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def ainvoke(self, messages, config=None, **kwargs):
+            self.started.set()
+            await self.release.wait()
+            return "ok"
+
+    async def scenario() -> None:
+        provider = _BlockingProvider()
+        governor = ConcurrencyGovernor(
+            Settings(
+                _env_file=None,
+                concurrency_llm_per_provider=1,
+                concurrency_llm_global=1,
+            )
+        )
+        router = ProviderRouter(
+            [provider],
+            ["p"],
+            ["key-p"],
+            limiter=RateLimitCoordinator(base_cooldown=0.01, max_cooldown=0.05),
+            max_wait_s=0.1,
+            governor=governor,
+            acquire_timeout_s=0.5,
+        )
+
+        first = asyncio.create_task(router.ainvoke([]))
+        await provider.started.wait()
+        second = asyncio.create_task(router.ainvoke([]))
+        await asyncio.sleep(0.02)
+        assert not second.done()
+        assert governor.llm_pool("p").in_flight == 1
+
+        provider.release.set()
+        await asyncio.gather(first, second)
+        assert governor.llm_pool("p").in_flight == 0
+
+    asyncio.run(scenario())
+
+
+def test_aimd_shrinks_on_429_and_recovers_on_success() -> None:
+    from coding_agent.concurrency import ConcurrencyGovernor
+
+    async def scenario() -> tuple[int, int]:
+        provider = _Provider("p", error=_RateLimit("429"))
+        governor = ConcurrencyGovernor(
+            Settings(
+                _env_file=None,
+                concurrency_llm_per_provider=4,
+                concurrency_llm_global=8,
+                llm_aimd_min=1,
+                llm_aimd_max=8,
+            )
+        )
+        limiter = RateLimitCoordinator(base_cooldown=0.01, max_cooldown=0.05)
+        router = ProviderRouter(
+            [provider],
+            ["p"],
+            ["key-p"],
+            limiter=limiter,
+            max_wait_s=0.01,
+            governor=governor,
+            acquire_timeout_s=0.5,
+            aimd_min=1,
+            aimd_max=8,
+        )
+
+        with pytest.raises(ProviderUnavailableError):
+            await router.ainvoke([])
+        after_429 = governor.llm_pool("p").limit
+        assert limiter.concurrency_limit("key-p") == 2
+
+        provider.error = None
+        await asyncio.sleep(0.02)  # 等冷却结束
+        await router.ainvoke([])
+        after_success = governor.llm_pool("p").limit
+        assert limiter.concurrency_limit("key-p") == 3
+        return after_429, after_success
+
+    after_429, after_success = asyncio.run(scenario())
+    assert after_429 == 2
+    assert after_success == 3

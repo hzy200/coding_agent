@@ -24,64 +24,29 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 
+from coding_agent.concurrency import (
+    AsyncLeasePool,
+    ConcurrencyGovernor,
+    ResourceTimeout,
+)
 from coding_agent.config import Settings
 from coding_agent.llm.ratelimit import GLOBAL_LIMITER
 from coding_agent.orchestrator.contracts import WorkerResult
 from coding_agent.orchestrator.graph import mark_blocked, validate_proposals
-from coding_agent.orchestrator.merge import merge_implement_patches_atomic
+from coding_agent.orchestrator.merge_queue import MergeQueue
+from coding_agent.orchestrator.scheduling import (
+    RateLimitState,
+    TokenBudget,
+    aged_priority,
+    task_priority,
+    task_token_reserve,
+    usage_tokens,
+)
 from coding_agent.orchestrator.workers import WorkerRunner
 from coding_agent.sandbox.wsl_exec import WslSandbox
 from coding_agent.steering import SteeringController
 
 SCHEDULER = "scheduler"
-
-_ROLE_PRIORITY = {"implement": 30, "test": 20, "review": 20, "explore": 10}
-
-# 派发前的 token 预留估计。真实用量在 worker 返回后结算；这里只需要一个
-# 保守上界，避免把预算全部押在一个大任务上。
-_ROLE_TOKEN_RESERVE = {
-    "implement": 8_000,
-    "review": 3_000,
-    "explore": 2_000,
-    "test": 500,
-}
-
-
-def _token_reserve(task: dict[str, Any]) -> int:
-    raw = task.get("max_tokens")
-    if raw is not None:
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            value = 0
-        if value > 0:
-            return value
-    return _ROLE_TOKEN_RESERVE.get(str(task.get("role", "")), 2_000)
-_RATE_LIMIT_HINTS = (
-    "429",
-    "rate limit",
-    "rate_limit",
-    "too many requests",
-    "quota",
-    "overloaded",
-)
-
-
-def _is_rate_limited(record: dict[str, Any]) -> bool:
-    text = (
-        f"{record.get('summary', '')} {record.get('error', '')}"
-    ).lower()
-    return any(hint in text for hint in _RATE_LIMIT_HINTS)
-
-
-def _priority(task: dict[str, Any]) -> int:
-    raw = task.get("priority")
-    if raw is None:
-        return _ROLE_PRIORITY.get(str(task.get("role", "")), 10)
-    try:
-        return max(0, min(int(raw), 100))
-    except (TypeError, ValueError):
-        return _ROLE_PRIORITY.get(str(task.get("role", "")), 10)
 
 
 def _deps_met(task: dict[str, Any], status: dict[str, str]) -> bool:
@@ -147,6 +112,7 @@ def make_scheduler_node(
     sandbox: WslSandbox | None = None,
     root: str = "",
     steering: SteeringController | None = None,
+    governor: ConcurrencyGovernor | None = None,
 ) -> Callable[[dict[str, Any], RunnableConfig], Any]:
     async def scheduler(
         state: dict[str, Any], config: RunnableConfig
@@ -155,6 +121,14 @@ def make_scheduler_node(
             (((config or {}).get("configurable")) or {}).get("thread_id", "")
         )
         request = str(state.get("request") or "")
+        session_brief = str(state.get("session_brief") or "")
+        recovery_notice = str(state.get("recovery_notice") or "").strip()
+        if recovery_notice:
+            session_brief = (
+                f"{recovery_notice}\n\n{session_brief}"
+                if session_brief
+                else recovery_notice
+            )
         cwd = str(state.get("cwd", ""))
 
         tasks = [dict(task) for task in (state.get("tasks") or [])]
@@ -225,38 +199,43 @@ def make_scheduler_node(
             consume_proposals(result)
         seen = len(results)
 
-        max_limit = max(1, int(settings.orchestrator_max_concurrent_workers))
-        semaphore = asyncio.Semaphore(max_limit)
+        worker_pool = (
+            governor.worker
+            if governor is not None
+            else AsyncLeasePool(
+                "worker",
+                max(1, int(settings.orchestrator_max_concurrent_workers)),
+            )
+        )
+        max_limit = max(1, int(worker_pool.limit))
+        worker_timeout = float(
+            getattr(settings, "concurrency_worker_timeout_s", 60.0) or 60.0
+        )
         # 429/限流时临时降并发；成功后再逐步恢复到 max_limit。
-        current_limit = max_limit
-        rate_limit_until = 0.0
-        rate_limit_streak = 0
-        backoff_base = max(
-            float(settings.orchestrator_rate_limit_backoff_s), 0.01
+        rate_limit = RateLimitState(
+            max_limit=max_limit,
+            backoff_base=settings.orchestrator_rate_limit_backoff_s,
         )
-        token_budget = max(0, int(settings.orchestrator_total_tokens))
-        spent_tokens = sum(
-            int(result.get("input_tokens") or 0)
-            + int(result.get("output_tokens") or 0)
-            for result in results
-        )
-        reserved_tokens = 0
-        reserved_by_task: dict[str, int] = {}
+        budget = TokenBudget(settings.orchestrator_total_tokens, results)
+        merge_queue = MergeQueue()
         token_budget_exhausted = False
         ready: list[tuple[int, int, str]] = []
+        ready_at: dict[str, float] = {}
         queued: set[str] = set()
         seq = 0
         in_flight: dict[str, asyncio.Task[WorkerResult]] = {}
         future_task: dict[asyncio.Task[WorkerResult], str] = {}
         queued_at: dict[str, float] = {}
         # 已发出 worker_started 的 (worker_id, attempt)。取消/超时时只为它们
-        # 发 finished；还在 semaphore 排队的任务由 runtime 的 updates 分支
+        # 发 finished；还在 worker 池排队的任务由 runtime 的 updates 分支
         # 补发成对事件，避免前端看到“没有开始就结束”。
         started_keys: set[str] = set()
         stop = False
         completed_since_boundary = 0
-        launched_since_boundary = 0
         checkpoint_every = max(1, int(settings.orchestrator_checkpoint_every or 1))
+        max_pending_merges = max(
+            1, int(settings.orchestrator_max_pending_merges or 1)
+        )
 
         def refresh_ready() -> None:
             nonlocal seq
@@ -268,11 +247,65 @@ def make_scheduler_node(
                     continue
                 if not _deps_met(task, status):
                     continue
+                now = time.monotonic()
+                ready_at.setdefault(task_id, now)
                 heapq.heappush(
-                    ready, (-_priority(task), seq, task_id)
+                    ready, (-task_priority(task), seq, task_id)
                 )
                 seq += 1
                 queued.add(task_id)
+
+        def age_ready(now: float) -> None:
+            """按等待时间重建 ready 堆；aging 只影响顺序，不丢任务。"""
+            if not ready:
+                return
+            rebuilt: list[tuple[int, int, str]] = []
+            for _neg, order, task_id in ready:
+                task = by_id.get(task_id)
+                if task is None:
+                    continue
+                waited = now - ready_at.get(task_id, now)
+                rebuilt.append(
+                    (
+                        -aged_priority(task_priority(task), waited),
+                        order,
+                        task_id,
+                    )
+                )
+            ready[:] = rebuilt
+            heapq.heapify(ready)
+
+        def estimate_tokens(task: dict[str, Any]) -> int:
+            """优先用显式 max_tokens；否则用同角色历史实际用量的均值。"""
+            explicit = task.get("max_tokens")
+            if explicit is not None:
+                try:
+                    value = int(explicit)
+                except (TypeError, ValueError):
+                    value = 0
+                if value > 0:
+                    return value
+            role = str(task.get("role", ""))
+            samples = [
+                usage_tokens(result)
+                for result in results
+                if str(result.get("role", "")) == role
+                and usage_tokens(result) > 0
+            ]
+            if samples:
+                estimate = int(sum(samples) / len(samples) * 1.2)
+            else:
+                estimate = task_token_reserve(task)
+            return max(500, min(estimate, 16_000))
+
+        def implement_backpressure() -> bool:
+            """在飞/待合并的写任务太多时，先让合并队列排空。"""
+            active = sum(
+                1
+                for task_id in in_flight
+                if str(by_id.get(task_id, {}).get("role", "")) == "implement"
+            )
+            return len(merge_queue.pending) + active >= max_pending_merges
 
         async def run_one(task: dict[str, Any]) -> WorkerResult:
             task_id = str(task["id"])
@@ -280,7 +313,26 @@ def make_scheduler_node(
             worker_id = f"{role}:{task_id}"
             attempt = attempts.get(task_id, 1)
             started_wait = queued_at.get(task_id, time.monotonic())
-            async with semaphore:
+            try:
+                lease = await worker_pool.acquire(
+                    priority=task_priority(task), timeout=worker_timeout
+                )
+            except ResourceTimeout as exc:
+                result = WorkerResult(
+                    task_id=task_id,
+                    role=role,
+                    worker_id=worker_id,
+                    goal=str(task.get("goal", "")),
+                    status="failed",
+                    summary=f"等待 worker 槽位超时：{exc}",
+                    error=str(exc),
+                )
+                result.attempt = attempt
+                result.queue_wait_ms = 0
+                result.priority = task_priority(task)
+                result.depth = int(task.get("depth", 0))
+                return result
+            async with lease:
                 queue_wait_ms = int(
                     (time.monotonic() - started_wait) * 1000
                 )
@@ -300,6 +352,7 @@ def make_scheduler_node(
                     result = await worker_runner(
                         task,
                         parent_request=request,
+                        session_brief=session_brief,
                         cwd=cwd,
                         config=config,
                         cancel=cancelled,
@@ -316,7 +369,7 @@ def make_scheduler_node(
                     )
                 result.attempt = attempt
                 result.queue_wait_ms = queue_wait_ms
-                result.priority = _priority(task)
+                result.priority = task_priority(task)
                 result.depth = int(task.get("depth", 0))
                 return result
 
@@ -336,7 +389,6 @@ def make_scheduler_node(
             worker 的取消是协作式的；这里给不出无限等待的保证，所以到点
             直接 cancel。worktree 清理由 implement runner 的 finally 兜底。
             """
-            nonlocal reserved_tokens
             for future in list(in_flight.values()):
                 future.cancel()
             if in_flight:
@@ -344,9 +396,7 @@ def make_scheduler_node(
                     *in_flight.values(), return_exceptions=True
                 )
             for task_id in list(in_flight):
-                reserved_tokens = max(
-                    0, reserved_tokens - reserved_by_task.pop(task_id, 0)
-                )
+                budget.release(task_id)
                 task = by_id.get(task_id, {})
                 result = WorkerResult(
                     task_id=task_id,
@@ -366,12 +416,9 @@ def make_scheduler_node(
                     emit({"type": "worker_finished", "result": record})
             in_flight.clear()
 
-        merge_pending: list[dict[str, Any]] = []
-
         def finalize(record: dict[str, Any]) -> None:
             """落状态、发事件、处理重试与动态提议。"""
             nonlocal dirty, run_dirty, seen
-            nonlocal rate_limit_streak, current_limit, rate_limit_until
             task_id = str(record.get("task_id", ""))
             emit({"type": "worker_finished", "result": record})
             attempt = int(record.get("attempt", 1))
@@ -386,13 +433,8 @@ def make_scheduler_node(
             else:
                 status[task_id] = str(record.get("status", "failed"))
 
-            if _is_rate_limited(record):
-                rate_limit_streak += 1
-                current_limit = max(1, current_limit - 1)
-                delay = min(
-                    backoff_base * (2 ** (rate_limit_streak - 1)), 30.0
-                )
-                rate_limit_until = time.monotonic() + delay
+            delay = rate_limit.on_result(record)
+            if delay is not None:
                 # 与其他 runtime 协调：进程内共享一个短暂全局冷却。
                 GLOBAL_LIMITER.block_all(delay)
                 emit(
@@ -400,16 +442,9 @@ def make_scheduler_node(
                         "type": "worker_throttled",
                         "task_id": task_id,
                         "delay_s": delay,
-                        "current_limit": current_limit,
+                        "current_limit": rate_limit.current_limit,
                     }
                 )
-            else:
-                rate_limit_streak = 0
-                if (
-                    record.get("status") in {"success", "partial"}
-                    and current_limit < max_limit
-                ):
-                    current_limit += 1
 
             consume_proposals(record)
             seen = len(results)
@@ -417,60 +452,25 @@ def make_scheduler_node(
 
         def implement_active() -> bool:
             # 已跑完、正等合并的 implement 不算“还在跑”，否则 flush 永远不触发。
-            pending_merge = {
-                str(record.get("task_id", "")) for record in merge_pending
-            }
-            for task_id, task in by_id.items():
-                if task.get("role") != "implement":
-                    continue
-                if task_id in in_flight:
-                    return True
-                if (
-                    status.get(task_id) == "pending"
-                    and task_id not in pending_merge
-                ):
-                    return True
-            return False
+            return merge_queue.has_active_implement(
+                in_flight=set(in_flight), status=status, by_id=by_id
+            )
 
         async def flush_merges() -> None:
             """没有 implement 在飞/待启动时，原子合并整批补丁。"""
             nonlocal dirty, run_dirty
-            if not merge_pending:
-                return
-            batch = list(merge_pending)
-            merge_pending.clear()
-            if sandbox is None or not root:
-                for record in batch:
-                    finalize(record)
-                return
-            outcomes = await merge_implement_patches_atomic(
-                sandbox,
-                root,
-                batch,
+            merged_any = await merge_queue.flush(
+                sandbox=sandbox,
+                root=root,
                 allow_overlap=settings.orchestrator_allow_overlap,
+                finalize=finalize,
             )
-            for record in batch:
-                task_id = str(record.get("task_id", ""))
-                merged, merge_error, snapshot_ids = outcomes.get(
-                    task_id, (False, "未合并", [])
-                )
-                record["merged"] = merged
-                record["merge_error"] = merge_error
-                record["snapshot_ids"] = snapshot_ids
-                if merged:
-                    dirty = True
-                    run_dirty = True
-                elif record.get("status") in {"success", "partial"}:
-                    record["status"] = "failed"
-                finalize(record)
+            if merged_any:
+                dirty = True
+                run_dirty = True
 
         def discard_merges(reason: str) -> None:
-            for record in merge_pending:
-                record["status"] = "cancelled"
-                record["merged"] = False
-                record["merge_error"] = reason
-                finalize(record)
-            merge_pending.clear()
+            merge_queue.discard(reason, finalize)
 
         while True:
             if cancelled():
@@ -491,61 +491,84 @@ def make_scheduler_node(
 
             refresh_ready()
             now = time.monotonic()
-            shared_wait = GLOBAL_LIMITER.global_remaining()
-            if shared_wait > 0:
-                rate_limit_until = max(rate_limit_until, now + shared_wait)
+            rate_limit.note_global_wait(
+                GLOBAL_LIMITER.global_remaining(), now=now
+            )
+            age_ready(now)
             while (
                 ready
                 and not stop
-                and launched_since_boundary < checkpoint_every
-                and len(in_flight) < current_limit
-                and now >= rate_limit_until
+                and len(in_flight) < rate_limit.current_limit
+                and rate_limit.can_launch(now)
             ):
-                _neg_priority, _seq, task_id = heapq.heappop(ready)
-                queued.discard(task_id)
-                if status.get(task_id, "pending") != "pending":
-                    continue
-                if task_id in in_flight:
-                    continue
-                task = by_id.get(task_id)
-                if task is None:
-                    continue
-                reserve = _token_reserve(task)
-                if token_budget and (
-                    spent_tokens + reserved_tokens + reserve > token_budget
-                ):
-                    if in_flight:
-                        # 还有任务在跑：等它结算完再重新评估预算。
-                        heapq.heappush(
-                            ready, (_neg_priority, _seq, task_id)
-                        )
-                        queued.add(task_id)
+                # next-fit：优先取队首；它放不进预算时，继续找第一个放得进的
+                # 任务，而不是把所有 pending 一起判死。
+                chosen: tuple[tuple[int, int, str], dict[str, Any], int] | None = None
+                deferred: list[tuple[int, int, str]] = []
+                while ready:
+                    entry = heapq.heappop(ready)
+                    task_id = entry[2]
+                    if (
+                        status.get(task_id, "pending") != "pending"
+                        or task_id in in_flight
+                    ):
+                        queued.discard(task_id)
+                        ready_at.pop(task_id, None)
+                        continue
+                    task = by_id.get(task_id)
+                    if task is None:
+                        queued.discard(task_id)
+                        ready_at.pop(task_id, None)
+                        continue
+                    if (
+                        str(task.get("role", "")) == "implement"
+                        and implement_backpressure()
+                    ):
+                        deferred.append(entry)
+                        continue
+                    reserve = estimate_tokens(task)
+                    if budget.can_reserve(reserve):
+                        queued.discard(task_id)
+                        ready_at.pop(task_id, None)
+                        chosen = (entry, task, reserve)
                         break
-                    # 没有在飞任务且当前任务都放不下：预算耗尽，剩余任务阻塞。
+                    deferred.append(entry)
+                for entry in deferred:
+                    heapq.heappush(ready, entry)
+
+                if chosen is None:
+                    if in_flight or implement_backpressure():
+                        # 等当前任务结算/合并队列排空后，预算或并发可能重新可用。
+                        break
                     for pending_task in tasks:
                         pending_id = str(pending_task["id"])
                         if status.get(pending_id, "pending") == "pending":
                             status[pending_id] = "blocked"
                     ready.clear()
                     queued.clear()
+                    ready_at.clear()
                     token_budget_exhausted = True
                     break
+
+                entry, task, reserve = chosen
+                task_id = str(task["id"])
+                if not budget.reserve(task_id, reserve):
+                    # 单线程内不应发生；放回等待下一轮。
+                    heapq.heappush(ready, entry)
+                    queued.add(task_id)
+                    break
                 attempts[task_id] = attempts.get(task_id, 0) + 1
-                reserved_tokens += reserve
-                reserved_by_task[task_id] = reserve
                 queued_at[task_id] = time.monotonic()
                 future = asyncio.create_task(run_one(task))
                 in_flight[task_id] = future
                 future_task[future] = task_id
-                launched_since_boundary += 1
 
             if not in_flight:
                 now = time.monotonic()
-                if now < rate_limit_until:
+                remaining = rate_limit.wait_remaining(now)
+                if remaining > 0:
                     # 所有任务都在限流退避中：等一小段再重试，而不是直接结束。
-                    await asyncio.sleep(
-                        min(rate_limit_until - now, 1.0)
-                    )
+                    await asyncio.sleep(min(remaining, 1.0))
                     continue
                 break
 
@@ -555,10 +578,9 @@ def make_scheduler_node(
                 timeouts.append(
                     max(0.0, scheduler_deadline - time.monotonic())
                 )
-            if rate_limit_until:
-                timeouts.append(
-                    max(0.0, rate_limit_until - time.monotonic())
-                )
+            cooldown = rate_limit.wait_remaining()
+            if cooldown > 0:
+                timeouts.append(cooldown)
             if timeouts:
                 timeout = min(timeouts)
             done, _pending = await asyncio.wait(
@@ -608,12 +630,7 @@ def make_scheduler_node(
                     )
                 result.attempt = attempts.get(task_id, 1)
                 record = result.model_dump()
-                reserved_tokens = max(
-                    0, reserved_tokens - reserved_by_task.pop(task_id, 0)
-                )
-                spent_tokens += int(record.get("input_tokens") or 0) + int(
-                    record.get("output_tokens") or 0
-                )
+                budget.settle(task_id, record)
                 # 取消可能正好在 worker 返回之后才被看到：这一批的写补丁
                 # 一律丢弃，避免“取消了但还是合并进去”。
                 if cancelled() and record.get("role") == "implement":
@@ -631,7 +648,11 @@ def make_scheduler_node(
                     and record.get("status") not in {"cancelled", "failed"}
                 ):
                     # 先攒着：等本批 implement 全部结束后一次性原子合并。
-                    merge_pending.append(record)
+                    # 必须立刻离开 pending 状态，否则 refresh_ready 会把这
+                    # 个已完成、只是等合并的任务重新排进 ready，导致同一任务
+                    # 被重复启动、同一补丁被重复加入合并批次。
+                    status[str(record.get("task_id", ""))] = "merging"
+                    merge_queue.add(record)
                 else:
                     finalize(record)
                 completed_since_boundary += 1
@@ -643,7 +664,7 @@ def make_scheduler_node(
             if stop and not in_flight:
                 break
 
-        if merge_pending:
+        if merge_queue:
             if cancelled() or implement_active():
                 discard_merges("同批 implement 未完成，未合并")
             else:
@@ -683,9 +704,9 @@ def make_scheduler_node(
             "dirty": dirty,
             "run_dirty": run_dirty,
             "scheduler_deadline": scheduler_deadline,
-            "token_budget_limit": token_budget,
-            "token_budget_spent": spent_tokens,
-            "token_budget_reserved": reserved_tokens,
+            "token_budget_limit": budget.limit,
+            "token_budget_spent": budget.spent,
+            "token_budget_reserved": budget.reserved,
             "token_budget_exhausted": token_budget_exhausted,
             "scheduler_done": not scheduler_continue,
             "scheduler_continue": scheduler_continue,

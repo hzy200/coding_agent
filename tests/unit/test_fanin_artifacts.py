@@ -91,6 +91,75 @@ def test_per_task_budget_truncates_but_keeps_every_task() -> None:
     assert "任务摘要已截断" in out["worker_context"]
 
 
+def test_context_references_the_artifact_and_handoff_is_structured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeFs(object(), "/ws")
+    monkeypatch.setattr(
+        artifacts_module, "SandboxFs", lambda sandbox, root: fake
+    )
+    node = make_synthesize_node(
+        _settings(),
+        sandbox=object(),
+        root="/ws",
+        artifacts=True,
+    )
+
+    out = node(
+        {
+            "tasks": [{"id": "t1", "depends_on": []}],
+            "task_status": {"t1": "success"},
+            "worker_results": [
+                _result("t1", status="success", summary="结论"),
+            ],
+        },
+        {"configurable": {"thread_id": "thread-1"}},
+    )
+
+    artifact = out["orchestration_handoff"]["tasks"][0]["artifact"]
+    assert artifact.startswith(".agent/artifacts/")
+    assert f"完整结果：{artifact}" in out["worker_context"]
+    assert out["orchestration_artifacts"][0]["artifact_id"] == artifact
+    assert out["orchestration_handoff"]["tasks"][0]["task_id"] == "t1"
+    assert out["orchestration_handoff"]["counts"]["completed"] == 1
+
+
+def test_handoff_lists_unfinished_tasks_and_overlaps() -> None:
+    node = make_synthesize_node(_settings())
+
+    out = node(
+        {
+            "tasks": [
+                {"id": "t1", "depends_on": []},
+                {"id": "t2", "depends_on": ["t1"]},
+                {"id": "t3", "depends_on": []},
+            ],
+            "task_status": {
+                "t1": "failed",
+                "t2": "pending",
+                "t3": "success",
+            },
+            "worker_results": [
+                {
+                    **_result("t1", status="failed"),
+                    "files": ["app/x.py"],
+                },
+                {
+                    **_result("t3", status="success"),
+                    "files": ["app/x.py"],
+                },
+            ],
+        },
+        None,
+    )
+
+    handoff = out["orchestration_handoff"]
+    assert handoff["unfinished"] == ["t2"]
+    assert handoff["overlaps"]["app/x.py"] == ["t1", "t3"]
+    assert handoff["counts"]["failed"] == 2
+    assert handoff["tasks"][0]["status"] == "failed"
+
+
 def test_artifact_store_writes_json(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = _FakeFs(object(), "/ws")
     monkeypatch.setattr(

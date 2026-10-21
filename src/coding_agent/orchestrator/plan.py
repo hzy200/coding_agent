@@ -15,6 +15,7 @@ from coding_agent.llm.deepseek import with_json_output
 from coding_agent.orchestrator.contracts import TaskGraph
 from coding_agent.orchestrator.graph import validate_tasks
 from coding_agent.orchestrator.state import request_of
+from coding_agent.recovery import retry_async
 
 
 def _default_write_task(
@@ -126,6 +127,8 @@ def make_plan_tasks_node(
     ) -> dict[str, Any]:
         request = request_of(state)
         summary = state.get("repo_summary") or {}
+        session_brief = str(state.get("session_brief") or "").strip()
+        recovery_notice = str(state.get("recovery_notice") or "").strip()
         replan_mode = bool(state.get("steering_replan"))
         existing_tasks = [dict(task) for task in (state.get("tasks") or [])]
         existing_status = dict(state.get("task_status") or {})
@@ -147,7 +150,18 @@ def make_plan_tasks_node(
         )
         body = (
             f"用户请求：{request}\n\n"
-            f"仓库画像：{summary}\n\n"
+            + (
+                "之前轮次的会话约束（继续遵守）：\n"
+                f"{session_brief}\n\n"
+                if session_brief
+                else ""
+            )
+            + (
+                f"上次运行中断的恢复提示：\n{recovery_notice}\n\n"
+                if recovery_notice
+                else ""
+            )
+            + f"仓库画像：{summary}\n\n"
             f"工作流：{state.get('workflow', '')}\n\n"
         )
         if replan_mode:
@@ -161,6 +175,7 @@ def make_plan_tasks_node(
 
         tasks: list[dict[str, Any]] = []
         degraded = False
+        retry_events: list[dict[str, Any]] = []
         errors: list[str] = []
         prefetched = [
             dict(task) for task in (state.get("prefetched_tasks") or [])
@@ -177,34 +192,42 @@ def make_plan_tasks_node(
             degraded = degraded or bool(state.get("prefetched_degraded"))
         else:
             try:
-                graph = await structured.ainvoke(
-                    [
-                        SystemMessage(
-                            content=PLAN_TASKS_PROMPT.format(
-                                max_tasks=settings.orchestrator_max_tasks,
-                                role_notes=(
-                                    _IMPLEMENT_ROLE_NOTES
-                                    if write_mode
-                                    else _READ_ONLY_ROLE_NOTES
-                                ),
-                                write_rules=(
-                                    (
-                                        _IMPLEMENT_RULES
-                                        + (
-                                            "\n- 允许不同 implement 修改同一文件；"
-                                            "宿主会用 3-way 合并，冲突时整批回滚。"
-                                            if settings.orchestrator_allow_overlap
-                                            else ""
+                graph = await retry_async(
+                    lambda: structured.ainvoke(
+                        [
+                            SystemMessage(
+                                content=PLAN_TASKS_PROMPT.format(
+                                    max_tasks=settings.orchestrator_max_tasks,
+                                    role_notes=(
+                                        _IMPLEMENT_ROLE_NOTES
+                                        if write_mode
+                                        else _READ_ONLY_ROLE_NOTES
+                                    ),
+                                    write_rules=(
+                                        (
+                                            _IMPLEMENT_RULES
+                                            + (
+                                                "\n- 允许不同 implement 修改同一文件；"
+                                                "宿主会用 3-way 合并，冲突时整批回滚。"
+                                                if settings.orchestrator_allow_overlap
+                                                else ""
+                                            )
                                         )
-                                    )
-                                    if write_mode
-                                    else _READ_ONLY_RULES
-                                ),
-                            )
-                        ),
-                        HumanMessage(content=body),
-                    ],
-                    config,
+                                        if write_mode
+                                        else _READ_ONLY_RULES
+                                    ),
+                                )
+                            ),
+                            HumanMessage(content=body),
+                        ],
+                        config,
+                    ),
+                    attempts=settings.retry_attempts,
+                    base_delay=settings.retry_base_delay_s,
+                    max_delay=settings.retry_max_delay_s,
+                    max_total_wait=settings.retry_max_total_wait_s,
+                    on_retry=retry_events.append,
+                    label="plan_tasks",
                 )
                 tasks, degraded, errors = validate_tasks(
                     graph.tasks,
@@ -306,6 +329,7 @@ def make_plan_tasks_node(
             "prefetched_degraded": False,
             "orchestrator_degraded": degraded,
             "orchestrator_round": 0,
+            "transient_retries": len(retry_events),
             "orchestrator_summary": "；".join(errors),
             "steering_replan": False,
             "workflow_revised_reason": revised_reason,

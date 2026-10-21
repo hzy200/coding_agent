@@ -49,6 +49,43 @@ def _fanin_rank(result: dict[str, Any]) -> tuple[int, int, int, str]:
     )
 
 
+def _handoff_entry(
+    result: dict[str, Any], artifact: str
+) -> dict[str, Any]:
+    """单条任务的稳定结构化交接。
+
+    文本汇总会被预算截断；这份结构不截断关键字段（只做单字段上限），
+    完整细节仍在 artifact 里。
+    """
+    verification = result.get("verification") or {}
+    return {
+        "task_id": str(result.get("task_id", "")),
+        "role": str(result.get("role", "")),
+        "status": str(result.get("status", "")),
+        "attempt": max(1, int(result.get("attempt", 1) or 1)),
+        "goal": str(result.get("goal", "")),
+        "summary": str(result.get("summary", ""))[:1_000],
+        "files": [str(item) for item in (result.get("files") or [])[:20]],
+        "findings": [
+            str(item) for item in (result.get("findings") or [])[:10]
+        ],
+        "verification_status": str(verification.get("status") or ""),
+        "verification_summary": str(
+            verification.get("summary") or ""
+        )[:500],
+        "merged": bool(result.get("merged")),
+        "merge_error": str(result.get("merge_error") or "")[:500],
+        "artifact": artifact,
+        "input_tokens": int(result.get("input_tokens") or 0),
+        "output_tokens": int(result.get("output_tokens") or 0),
+        "duration_ms": int(result.get("duration_ms") or 0),
+        "timed_out": bool(result.get("timed_out")),
+        "scope_violations": [
+            str(item) for item in (result.get("scope_violations") or [])[:20]
+        ],
+    }
+
+
 def make_synthesize_node(
     settings: Settings,
     *,
@@ -97,6 +134,38 @@ def make_synthesize_node(
         limit = max(int(settings.orchestrator_context_chars), 500)
         ordered = sorted(latest.values(), key=_fanin_rank)
         per_task = max(200, limit // max(len(ordered), 1))
+
+        # 先落 artifact，再拼文本：文本里的「完整结果」路径必须指向已经存在
+        # 的文件。落盘失败只影响可追溯性，不影响本次汇总。
+        artifact_by_key: dict[tuple[str, int], str] = {}
+        artifact_items: list[dict[str, Any]] = []
+        run_id = ""
+        if artifacts and sandbox is not None and root:
+            thread_id = str(
+                (((config or {}).get("configurable")) or {}).get(
+                    "thread_id", ""
+                )
+            )
+            run_id = make_run_id(thread_id, time.strftime("%Y%m%dT%H%M%S"))
+            store = ArtifactStore(sandbox, root, run_id)
+            for result in ordered:
+                rel = store.save_result(result)
+                if not rel:
+                    continue
+                key = (
+                    str(result.get("task_id", "")),
+                    max(1, int(result.get("attempt", 1) or 1)),
+                )
+                artifact_by_key[key] = rel
+                artifact_items.append(
+                    {
+                        "task_id": key[0],
+                        "attempt": key[1],
+                        "status": str(result.get("status", "")),
+                        "artifact_id": rel,
+                    }
+                )
+
         blocks: list[str] = []
         for result in ordered:
             task_id = result.get("task_id", "?")
@@ -128,9 +197,14 @@ def make_synthesize_node(
                     "  发现：" + "；".join(str(f) for f in findings[:5])
                 )
             block = "\n".join(block_lines)
-            if len(block) > per_task:
-                block = block[:per_task] + "…（任务摘要已截断）"
-            blocks.append(block)
+            artifact = artifact_by_key.get((str(task_id), attempt), "")
+            artifact_line = (
+                f"\n  完整结果：{artifact}" if artifact else ""
+            )
+            if len(block) + len(artifact_line) > per_task:
+                keep = max(per_task - len(artifact_line), 0)
+                block = block[:keep] + "…（任务摘要已截断）"
+            blocks.append(block + artifact_line)
 
         head = [
             "[编排器汇总]"
@@ -149,31 +223,18 @@ def make_synthesize_node(
                 )
         if unfinished:
             head.append("未执行/阻塞的任务：" + "、".join(unfinished))
+        if artifact_items:
+            # 放在 blocks 之前：全局截断从尾部切，索引必须优先保留。
+            head.append("worker 完整结果（可用 file_read 回读）：")
+            for item in artifact_items[:10]:
+                head.append(
+                    f"- {item['task_id']} 第 {item['attempt']} 次："
+                    f"{item['artifact_id']}"
+                )
 
         context = "\n".join([*head, *blocks])
         if len(context) > limit:
             context = context[:limit] + "\n…（汇总已截断）"
-
-        artifact_items: list[dict[str, Any]] = []
-        if artifacts and sandbox is not None and root:
-            thread_id = str(
-                (((config or {}).get("configurable")) or {}).get(
-                    "thread_id", ""
-                )
-            )
-            run_id = make_run_id(thread_id, time.strftime("%Y%m%dT%H%M%S"))
-            store = ArtifactStore(sandbox, root, run_id)
-            for result in ordered:
-                rel = store.save_result(result)
-                if rel:
-                    artifact_items.append(
-                        {
-                            "task_id": str(result.get("task_id", "")),
-                            "attempt": int(result.get("attempt", 1)),
-                            "status": str(result.get("status", "")),
-                            "artifact_id": rel,
-                        }
-                    )
 
         completed = sum(1 for value in status.values() if value == "success")
         partial = sum(1 for value in status.values() if value == "partial")
@@ -185,17 +246,61 @@ def make_synthesize_node(
             if value in {"failed", "blocked", "cancelled"}
         )
         budget_note = ""
-        limit = int(state.get("token_budget_limit") or 0)
-        if limit > 0:
-            spent = int(state.get("token_budget_spent") or 0)
-            budget_note = f"，token {spent}/{limit}"
+        token_limit = int(state.get("token_budget_limit") or 0)
+        token_spent = int(state.get("token_budget_spent") or 0)
+        if token_limit > 0:
+            budget_note = f"，token {token_spent}/{token_limit}"
             if state.get("token_budget_exhausted"):
                 budget_note += "（预算耗尽）"
+
+        handoff = {
+            "run_id": run_id,
+            "tasks": [
+                _handoff_entry(
+                    result,
+                    artifact_by_key.get(
+                        (
+                            str(result.get("task_id", "")),
+                            max(1, int(result.get("attempt", 1) or 1)),
+                        ),
+                        "",
+                    ),
+                )
+                for result in ordered
+            ],
+            "unfinished": unfinished,
+            "overlaps": {
+                path: sorted(set(task_ids))
+                for path, task_ids in overlaps.items()
+            },
+            "counts": {
+                "completed": completed,
+                "partial": partial,
+                "failed": failed,
+                "cancelled": cancelled_count,
+                "merged": merged_count,
+            },
+            "token_budget": (
+                {
+                    "limit": token_limit,
+                    "spent": token_spent,
+                    "reserved": int(
+                        state.get("token_budget_reserved") or 0
+                    ),
+                    "exhausted": bool(
+                        state.get("token_budget_exhausted")
+                    ),
+                }
+                if token_limit > 0
+                else {}
+            ),
+        }
         return {
             "task_status": status,
             "worker_context": context,
             "worker_brief": context,
             "orchestration_artifacts": artifact_items,
+            "orchestration_handoff": handoff,
             "orchestrator_summary": (
                 f"成功 {completed}，部分 {partial}，失败/阻塞 {failed}"
                 f"（其中取消 {cancelled_count}），"

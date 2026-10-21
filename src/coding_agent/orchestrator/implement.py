@@ -40,11 +40,19 @@ from coding_agent.llm.prompts import (
 from coding_agent.messages import text_of
 from coding_agent.orchestrator.contracts import WorkerResult
 from coding_agent.orchestrator.retry import format_retry_context
+from coding_agent.read_cache import ReadCache
+from coding_agent.recovery import retry_async
 from coding_agent.sandbox.fs import SandboxFs
 from coding_agent.sandbox.wsl_exec import WslSandbox
 from coding_agent.tools.artifacts import unpack
 from coding_agent.tools.files import (
+    COPY_TOOL_NAME,
+    DELETE_TOOL_NAME,
+    EDIT_MANY_TOOL_NAME,
     EDIT_TOOL_NAME,
+    LIST_TOOL_NAME,
+    MKDIR_TOOL_NAME,
+    MOVE_TOOL_NAME,
     READ_TOOL_NAME,
     WRITE_TOOL_NAME,
 )
@@ -53,7 +61,19 @@ from coding_agent.tools.search import FIND_FILES, SEARCH_CODE
 from coding_agent.tools.testrun import related_test_paths, run_verification
 
 IMPLEMENT_TOOL_NAMES = frozenset(
-    {READ_TOOL_NAME, WRITE_TOOL_NAME, EDIT_TOOL_NAME, SEARCH_CODE, FIND_FILES}
+    {
+        READ_TOOL_NAME,
+        WRITE_TOOL_NAME,
+        EDIT_TOOL_NAME,
+        EDIT_MANY_TOOL_NAME,
+        MOVE_TOOL_NAME,
+        COPY_TOOL_NAME,
+        DELETE_TOOL_NAME,
+        MKDIR_TOOL_NAME,
+        LIST_TOOL_NAME,
+        SEARCH_CODE,
+        FIND_FILES,
+    }
 )
 
 ImplementRunner = Callable[..., Awaitable[WorkerResult]]
@@ -160,7 +180,12 @@ def _changed_files(sandbox: WslSandbox, worktree: str) -> list[str]:
     """
     excludes = stage_args()
     add = sandbox.run(f"git add -A -- . {excludes}", cwd=worktree)
-    if not add.ok:
+    # 快照写在 worktree 内的 `.agent/`，它被 .gitignore 忽略。Git 会对这个
+    # 被忽略目录返回 exit=1（但已经成功暂存真实改动）。这不是失败，继续看 diff。
+    ignored_warning = "ignored by one of your .gitignore" in (
+        add.stderr or ""
+    ).lower()
+    if not add.ok and not ignored_warning:
         return []
     names = sandbox.run(
         f"git diff --cached --name-status -M -z HEAD -- . {excludes}",
@@ -269,6 +294,7 @@ def make_implement_runner(
         cwd: str = "",
         config: RunnableConfig | None = None,
         cancel: Callable[[], bool] | None = None,
+        session_brief: str = "",
         memories: list[str] | None = None,
         instructions: str = "",
     ) -> WorkerResult:
@@ -394,7 +420,7 @@ def make_implement_runner(
                     scopes if settings.orchestrator_write_scope_enforce else None
                 ),
                 # worktree 内独立缓存；写路径会失效，不能与主工作区共享。
-                read_cache={},
+                read_cache=ReadCache(settings.read_cache_max_bytes),
             )
             if tool.name in IMPLEMENT_TOOL_NAMES
         ]
@@ -421,7 +447,13 @@ def make_implement_runner(
             SystemMessage(content=system_text),
             HumanMessage(
                 content=(
-                    f"用户请求：{parent_request or '（未提供）'}\n\n"
+                    (
+                        "之前轮次的会话约束（继续遵守）：\n"
+                        f"{session_brief.strip()}\n\n"
+                        if session_brief.strip()
+                        else ""
+                    )
+                    + f"当前用户请求：{parent_request or '（未提供）'}\n\n"
                     f"实现任务：{goal}\n\n"
                     f"write_scope：{', '.join(scopes)}"
                     f"{retry_note}"
@@ -458,7 +490,14 @@ def make_implement_runner(
                         cancelled = True
                         return
                     llm_started = time.monotonic()
-                    response = await child_llm.ainvoke(messages, child_config)
+                    response = await retry_async(
+                        lambda: child_llm.ainvoke(messages, child_config),
+                        attempts=settings.retry_attempts,
+                        base_delay=settings.retry_base_delay_s,
+                        max_delay=settings.retry_max_delay_s,
+                        max_total_wait=settings.retry_max_total_wait_s,
+                        label=f"implement:{task_id}",
+                    )
                     llm_ms += int((time.monotonic() - llm_started) * 1000)
                     used_in, used_out = _usage(response)
                     input_tokens += used_in

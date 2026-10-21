@@ -25,6 +25,7 @@ from coding_agent.llm.context import (
 )
 from coding_agent.llm.prompts import RESPOND_INSTRUCTION, RESPOND_PROMPT
 from coding_agent.messages import text_of
+from coding_agent.recovery import retry_async
 
 VERIFICATION_FAILED_NOTE = (
     "注意：本次运行的验证（{command}）**失败了**。\n"
@@ -32,6 +33,13 @@ VERIFICATION_FAILED_NOTE = (
     "发现以下问题：\n{issues}\n"
     "{attempts}"
     "请在答复中如实说明任务未通过验证，不要声称已完成。"
+)
+
+VERIFICATION_ERROR_NOTE = (
+    "注意：本次运行的自动验证**没有跑起来**（执行环境异常，不是测试失败）。\n"
+    "结果：{summary}\n"
+    "请在答复中如实说明「未能验证」，不要声称测试通过或任务已完成；"
+    "必要时提示用户检查沙箱环境后重试。"
 )
 
 REPAIRS_EXHAUSTED = (
@@ -60,18 +68,39 @@ def make_respond_node(
     *,
     max_repair_rounds: int = 0,
     budget: ContextBudget | None = None,
+    retry_attempts: int = 3,
+    retry_base_delay: float = 1.0,
+    retry_max_delay: float = 30.0,
+    retry_max_total_wait: float = 60.0,
 ) -> Callable[[AgentState, RunnableConfig], Awaitable[dict[str, Any]]]:
     budget = budget or ContextBudget()
 
     async def respond(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
         system = RESPOND_PROMPT
+        retry_events: list[dict[str, Any]] = []
+
+        async def _invoke(messages: list[Any]) -> Any:
+            return await retry_async(
+                lambda: llm.ainvoke(messages, config),
+                attempts=retry_attempts,
+                base_delay=retry_base_delay,
+                max_delay=retry_max_delay,
+                max_total_wait=retry_max_total_wait,
+                on_retry=retry_events.append,
+                label="respond",
+            )
         # replan 会清空 verification（旧结论针对旧做法）；收尾要看运行级快照。
         verification = (
             state.get("last_verification")
             or state.get("verification")
             or {}
         )
-        if verification.get("status") == "failed":
+        if verification.get("status") == "error":
+            system += "\n\n" + VERIFICATION_ERROR_NOTE.format(
+                summary=str(verification.get("summary", "")).strip()
+                or "（无摘要）",
+            )
+        elif verification.get("status") == "failed":
             issues = verification.get("issues") or []
             listed = "\n".join(
                 f"- {i.get('location', '')} {i.get('message', '')}".strip() for i in issues[:10]
@@ -111,7 +140,7 @@ def make_respond_node(
             HumanMessage(content=RESPOND_INSTRUCTION),
         ]
         try:
-            answer = await llm.ainvoke(messages, config)
+            answer = await _invoke(messages)
         except Exception as exc:  # noqa: BLE001
             if not is_context_length_error(exc):
                 raise
@@ -125,7 +154,7 @@ def make_respond_node(
                 *tighter_history,
                 HumanMessage(content=RESPOND_INSTRUCTION),
             ]
-            answer = await llm.ainvoke(messages, config)
+            answer = await _invoke(messages)
 
         # 确定性护栏：模型可能忽略提示，仍然声称成功。验证失败是事实，
         # 直接追加到用户可见的答复里，不依赖模型自觉。
@@ -135,6 +164,16 @@ def make_respond_node(
                 "\n\n（系统提示：本次运行最后一次自动验证未通过"
                 + (f"：{summary}" if summary else "")
                 + "。以上答复不能视为任务已完成。）"
+            )
+            answer = answer.model_copy(
+                update={"content": text_of(answer).rstrip() + note}
+            )
+        elif verification.get("status") == "error":
+            summary = str(verification.get("summary", "")).strip()
+            note = (
+                "\n\n（系统提示：本次运行的自动验证未能执行"
+                + (f"：{summary}" if summary else "")
+                + "。这不代表验证通过，以上答复不能视为任务已完成。）"
             )
             answer = answer.model_copy(
                 update={"content": text_of(answer).rstrip() + note}
@@ -150,6 +189,8 @@ def make_respond_node(
             )
         return {
             "messages": [answer],
+            "run_status": "finished",
+            "transient_retries": len(retry_events),
             "context_trim": {
                 **{
                     "trimmed": trim_report.trimmed,

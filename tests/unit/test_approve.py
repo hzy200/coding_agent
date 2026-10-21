@@ -59,6 +59,15 @@ def test_session_policy(allow_write, mode, level, expected) -> None:
     assert SessionPolicy(allow_write=allow_write, approval_mode=mode).decide(level) == expected
 
 
+def test_new_file_tool_levels() -> None:
+    assert tool_level("file_list", {}) == CommandLevel.READ
+    assert tool_level("file_move", {}) == CommandLevel.LOW_WRITE
+    assert tool_level("file_copy", {}) == CommandLevel.LOW_WRITE
+    assert tool_level("file_mkdir", {}) == CommandLevel.LOW_WRITE
+    # 删除是不可逆操作，走逐条确认。
+    assert tool_level("file_delete", {}) == CommandLevel.MUTATE
+
+
 def test_low_write_never_prompts() -> None:
     """L1 由 --write 一次性授权，不该逐条打断用户。"""
     policy = SessionPolicy(allow_write=True, approval_mode=APPROVAL_ASK)

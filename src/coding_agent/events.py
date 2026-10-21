@@ -117,6 +117,8 @@ class ToolCallFinished(Event):
     name: str = ""
     ok: bool = False
     rejected: bool = False
+    # 环境不具备该能力（例如未配置 LSP）：不是成功，也不该计入失败率。
+    skipped: bool = False
     # auto / approved / denied / rejected —— 审计据此区分「谁拒的」
     decision: str = "auto"
     exit_code: int | None = None
@@ -140,7 +142,8 @@ class FileChanged(Event):
 class Verification(Event):
     """一步做完后自动跑验证的结果。
 
-    status: ok / failed（跑过）、not_configured（没有可用的测试命令）、skipped（没跑）。
+    status: ok / failed（跑过）、error（验证环境异常，没跑起来）、
+    not_configured（没有可用的测试命令）、skipped（没跑）。
     """
 
     type: Literal["verification"] = "verification"
@@ -410,6 +413,8 @@ class RunFinished(Event):
     # 前端要显示总成本时自行相加。
     worker_input_tokens: int | None = None
     worker_output_tokens: int | None = None
+    # 本次运行的资源池快照（worker/tool/wsl/llm 的并发、排队与等待时间）。
+    concurrency: list[dict] | None = None
 
 
 class RunFailed(Event):

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from coding_agent.tools.testrun import (
     VerifyResult,
+    _selected_command,
     detect_test_command,
     extract_summary,
     parse_issues,
@@ -277,3 +278,15 @@ def test_the_audit_records_not_configured_as_unverified_not_passed() -> None:
     assert _verification_verdict({"status": "not_configured"}) is None
     assert _verification_verdict({"status": "skipped"}) is None
     assert _verification_verdict({}) is None
+
+
+def test_selected_command_appends_a_safe_pytest_nodeid() -> None:
+    assert (
+        _selected_command("pytest", ("tests/test_x.py::test_y",))
+        == "pytest tests/test_x.py::test_y"
+    )
+
+
+def test_selected_command_refuses_shell_like_selectors() -> None:
+    assert _selected_command("pytest", ("-k foo",)) == ""
+    assert _selected_command("make test", ("tests/test_x.py",)) == ""

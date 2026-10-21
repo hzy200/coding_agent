@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import time
 
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
@@ -93,13 +94,67 @@ def detect_manager(sandbox: WslSandbox, workspace: str) -> tuple[list[str], list
     return _DEFAULT_MANAGER
 
 
+def resolve_manager(
+    sandbox: WslSandbox, command: list[str]
+) -> list[str] | None:
+    """把探测到的命令落到**实际可用**的可执行文件。
+
+    - `pip` 不存在但 `python3 -m pip` 可用时自动改写；
+    - 明确依赖某个二进制（uv/npm/...）时先探测 `command -v`；
+    - 都不可用返回 None，由调用方给出可操作的环境错误。
+    """
+    if not command:
+        return None
+    exe = command[0]
+    if exe == "pip":
+        if sandbox.run("command -v pip >/dev/null 2>&1").ok:
+            return command
+        if sandbox.run("python3 -m pip --version >/dev/null 2>&1").ok:
+            return ["python3", "-m", "pip", *command[1:]]
+        return None
+    if exe in {"uv", "npm", "pnpm", "yarn", "poetry"}:
+        probe = sandbox.run(
+            f"command -v {shlex.quote(exe)} >/dev/null 2>&1"
+        )
+        return command if probe.ok else None
+    return command
+
+
 def build_deps_tools(settings: Settings, sandbox: WslSandbox) -> list[BaseTool]:
     workspace = resolve_workspace(settings, sandbox)
+    detected: tuple[list[str], list[str]] | None = None
+    detected_at = 0.0
 
-    def _detect() -> tuple[list[str], list[str]]:
-        return detect_manager(sandbox, workspace)
+    def _detect(*, force: bool = False) -> tuple[list[str], list[str]]:
+        nonlocal detected, detected_at
+        ttl = float(getattr(settings, "deps_detect_ttl_s", 30.0) or 0.0)
+        now = time.monotonic()
+        if force or detected is None or ttl <= 0 or now - detected_at > ttl:
+            detected = detect_manager(sandbox, workspace)
+            detected_at = now
+        return detected
+
+    def _invalidate() -> None:
+        nonlocal detected
+        detected = None
 
     def _report(command: list[str], reason: str, level: CommandLevel) -> str:
+        planned = " ".join(shlex.quote(part) for part in command)
+        resolved = resolve_manager(sandbox, command)
+        if resolved is None:
+            artifact = ShellArtifact(
+                command=planned,
+                ok=False,
+                level=int(level),
+                level_label=level.label,
+            )
+            return pack(
+                f"[{level.label}] {reason}\n$ {planned}\n"
+                f"未检测到可用的包管理器：{command[0]} 不可用。"
+                "请先安装对应工具，或改用手动命令。",
+                artifact,
+            )
+        command = resolved
         rendered = " ".join(shlex.quote(part) for part in command)
         result = sandbox.run(rendered, cwd=workspace)
         text = (
@@ -137,8 +192,13 @@ def build_deps_tools(settings: Settings, sandbox: WslSandbox) -> list[BaseTool]:
                 ),
             )
 
-        install, _ = _detect()
-        return _report([*install, *validated], reason, CommandLevel.MUTATE)
+        install, _ = _detect(force=True)
+        output = _report(
+            [*install, *validated], reason, CommandLevel.MUTATE
+        )
+        # 安装可能生成/改写锁文件；下次重新探测。
+        _invalidate()
+        return output
 
     def _list(reason: str) -> str:
         _, listing = _detect()

@@ -19,6 +19,7 @@ from coding_agent.graph.state import AgentState
 from coding_agent.llm.deepseek import with_json_output
 from coding_agent.orchestrator.contracts import TaskSpec, WorkflowDecision
 from coding_agent.orchestrator.state import request_of
+from coding_agent.recovery import retry_async
 
 
 class WorkflowPlan(BaseModel):
@@ -108,6 +109,8 @@ def make_select_workflow_node(
     ) -> dict[str, Any]:
         request = request_of(state)
         summary = state.get("repo_summary") or {}
+        session_brief = str(state.get("session_brief") or "").strip()
+        recovery_notice = str(state.get("recovery_notice") or "").strip()
         write_available = bool(
             settings.orchestrator_write_enabled
             and allow_write
@@ -120,6 +123,7 @@ def make_select_workflow_node(
         )
         prefetched: list[dict[str, Any]] = []
         prefetched_degraded = False
+        retry_events: list[dict[str, Any]] = []
 
         if decision is None:
             # 规则不确定时一次调用同时拿到 workflow 和任务图，省掉
@@ -147,21 +151,40 @@ def make_select_workflow_node(
             )
             body = (
                 f"用户请求：{request}\n\n"
-                f"仓库画像：{summary}\n\n"
+                + (
+                    "之前轮次的会话约束（继续遵守）：\n"
+                    f"{session_brief}\n\n"
+                    if session_brief
+                    else ""
+                )
+                + (
+                    f"上次运行中断的恢复提示：\n{recovery_notice}\n\n"
+                    if recovery_notice
+                    else ""
+                )
+                + f"仓库画像：{summary}\n\n"
                 "请先选择 workflow，再给出任务图。"
                 "输出 JSON："
                 '{"workflow": "direct|parallel_readonly|orchestrated_implement",'
                 ' "reason": "一句话", "tasks": [...]}'
             )
             try:
-                plan = await structured.ainvoke(
-                    [
-                        SystemMessage(
-                            content=WORKFLOW_PROMPT + "\n\n" + task_prompt
-                        ),
-                        HumanMessage(content=body),
-                    ],
-                    config,
+                plan = await retry_async(
+                    lambda: structured.ainvoke(
+                        [
+                            SystemMessage(
+                                content=WORKFLOW_PROMPT + "\n\n" + task_prompt
+                            ),
+                            HumanMessage(content=body),
+                        ],
+                        config,
+                    ),
+                    attempts=settings.retry_attempts,
+                    base_delay=settings.retry_base_delay_s,
+                    max_delay=settings.retry_max_delay_s,
+                    max_total_wait=settings.retry_max_total_wait_s,
+                    on_retry=retry_events.append,
+                    label="select_workflow",
                 )
             except Exception:  # noqa: BLE001 - 选择失败不能拖垮图
                 plan = None
@@ -193,6 +216,7 @@ def make_select_workflow_node(
             "workflow_reason": decision.reason,
             "prefetched_tasks": prefetched,
             "prefetched_degraded": prefetched_degraded,
+            "transient_retries": len(retry_events),
         }
 
     return select_workflow

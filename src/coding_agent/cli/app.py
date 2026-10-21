@@ -206,6 +206,15 @@ def doctor() -> None:
     if has_wsl:
         sandbox = WslSandbox(settings)
 
+        healthy = sandbox.health(force=True)
+        results.append(
+            _report(
+                "WSL 健康探针",
+                healthy,
+                f"circuit={sandbox.circuit_state()}",
+            )
+        )
+
         probe = sandbox.run("echo agent-sandbox-ok && uname -r")
         results.append(_report("沙箱执行探针", probe.ok, probe.stdout.strip().replace("\n", " | ")))
 
@@ -459,6 +468,9 @@ def _make_renderer() -> Callable[[Event], None]:
             if event.rejected:
                 console.print("[red]← 已被安全策略拒绝[/]")
                 return
+            if event.skipped:
+                console.print("[dim]← 已跳过（环境未配置）[/]")
+                return
             if event.ok:
                 mark, style = "✓", "dim"
             elif event.exit_code is not None:
@@ -670,9 +682,68 @@ def undo(
     workspace: str = _WORKSPACE_OPTION,
     snapshot_id: str = typer.Option("", "--snapshot", help="指定快照 id，默认回滚最近一次改动"),
     path: str = typer.Option("", "--path", help="只回滚这个文件"),
+    last_run: bool = typer.Option(
+        False, "--last-run", help="回滚最近一次运行产生的全部文件改动"
+    ),
+    since: str = typer.Option(
+        "", "--since", help="回滚该 ISO 时间（审计里的 run_start）之后的全部改动"
+    ),
+    thread_id: str = typer.Option(
+        "", "--thread-id", help="配合 --last-run 定位会话"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="只列出将回滚的文件，不写盘"
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="跳过确认"),
 ) -> None:
     """把文件回滚到某次修改前的状态。"""
     runtime = AgentRuntime(get_settings(), workspace=workspace or None)
+
+    if last_run or since:
+        if since:
+            prefix = runtime._snapshot_prefix(since)
+            if not prefix:
+                console.print(f"[red]无法解析时间：{escape(since)}[/]")
+                raise typer.Exit(code=1)
+        else:
+            started = runtime.last_run_started_at(thread_id or None)
+            if not started:
+                console.print("[red]找不到最近一次运行记录。[/]")
+                raise typer.Exit(code=1)
+            prefix = runtime._snapshot_prefix(started)
+
+        planned = runtime.restore_since(prefix, dry_run=True)
+        if not planned:
+            console.print("[dim]该时间之后没有产生任何快照。[/]")
+            return
+
+        table = Table(show_header=True, header_style="bold", box=None)
+        table.add_column("快照 id")
+        table.add_column("文件")
+        for item in planned:
+            table.add_row(item.snapshot_id, escape(item.path))
+        console.print(
+            f"[dim]将按新→旧回滚 {len(planned)} 处改动：[/]\n"
+        )
+        console.print(table)
+        console.print(
+            "[dim]按时间过滤；同一工作区若有并发运行，可能包含其改动。"
+            "回滚前每个文件都会先留底，仍可再次 undo。[/]"
+        )
+        if dry_run:
+            return
+        if not yes and not typer.confirm("确认回滚？", default=False):
+            raise typer.Exit(code=1)
+
+        results = runtime.restore_since(prefix)
+        failed = [item for item in results if not item.ok]
+        for item in results:
+            color = "green" if item.ok else "red"
+            console.print(f"[{color}]{escape(item.message)}[/]")
+        if failed:
+            raise typer.Exit(code=1)
+        return
+
     result = runtime.restore(snapshot_id=snapshot_id or None, path=path or None)
 
     if not result.ok:

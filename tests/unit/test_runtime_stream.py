@@ -769,6 +769,12 @@ def test_audit_records_the_whole_run(tmp_path) -> None:
     assert start.thread_id == THREAD
     assert start.workspace == "/mnt/d/proj"
     assert start.detail == "看看目录"
+    # run_end / tool_call 默认不带 workspace，写审计时统一补齐。
+    assert records[-1].workspace == "/mnt/d/proj"
+    tool_records = [r for r in records if r.kind == "tool_call"]
+    assert tool_records and all(
+        r.workspace == "/mnt/d/proj" for r in tool_records
+    )
 
 
 def test_audit_records_approved_decision(tmp_path) -> None:

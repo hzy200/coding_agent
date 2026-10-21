@@ -128,7 +128,12 @@ def make_route_after_verify(
     """
 
     def route_after_verify(state: AgentState) -> str:
-        if (state.get("verification") or {}).get("status") == "failed":
+        verification_status = (state.get("verification") or {}).get("status")
+        # 验证环境异常不是语义失败：repair 修不了坏掉的执行环境。
+        # 如实收尾，让用户看到「没验证」而不是假装通过或反复重试。
+        if verification_status == "error":
+            return RESPOND
+        if verification_status == "failed":
             # 连续出现同一失败签名 = 原地打转。继续 repair 只会重复同一类修改，
             # 直接换做法（replan）；replan 也有硬上限，最终会如实收尾。
             if state.get("same_failure_count", 0) >= max_same_failures:

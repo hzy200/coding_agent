@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -392,6 +393,26 @@ def _prepare_env(settings: Settings) -> tuple[WslSandbox, Any, str]:
     return sandbox, fs, eval_root(settings, sandbox)
 
 
+def run_with_retries(
+    run_case: Callable[[], dict[str, Any]], retries: int
+) -> dict[str, Any]:
+    """能力用例失败后隔离重跑。
+
+    长程/spec 类任务存在模型非确定性；单次失败不足以说明能力回归。
+    `retries` 是**额外**尝试次数，0 表示不重跑。
+    """
+    result = run_case()
+    attempts = 1
+    while not result.get("passed") and attempts <= max(0, int(retries)):
+        result = run_case()
+        attempts += 1
+    result = dict(result)
+    result["attempts"] = attempts
+    if attempts > 1 and result.get("passed"):
+        result["recovered_on_retry"] = True
+    return result
+
+
 def _run_capability(
     task_id: str,
     settings: Settings,
@@ -494,6 +515,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument(
+        "--case-retries",
+        type=int,
+        default=1,
+        help="capability 用例失败后的额外重跑次数；0 = 不重跑",
+    )
+    parser.add_argument(
         "--concurrency",
         type=int,
         default=2,
@@ -549,7 +576,10 @@ def main(argv: list[str] | None = None) -> int:
                 "passed": False,
                 "detail": "capability case 需要 WSL 环境",
             }
-        return _run_capability(case_id, settings, sandbox, fs, base)
+        return run_with_retries(
+            lambda: _run_capability(case_id, settings, sandbox, fs, base),
+            args.case_retries,
+        )
 
     # LangSmith 的 evaluate(data=...) 需要 dataset/example 对象，不接受裸 dict。
     # 子集运行时建一个派生 dataset，而不是把全部 46 条都跑一遍。

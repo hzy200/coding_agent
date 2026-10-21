@@ -110,7 +110,8 @@ survey
   worker 同时拉起过多 `wsl.exe`；
 - 主 agent 同一条消息里的多个**只读工具**按 `AGENT_MAX_CONCURRENT_TOOLS`
   并发执行；写工具与有依赖的调用保持串行；
-- implement worker 只绑定 `file_read/file_write/file_edit/search_code/find_files`，
+- implement worker 只绑定文件工具（read/write/edit/move/copy/delete/mkdir/list）与
+  `search_code/find_files`，
   不绑定 shell/git/deps/test。
 
 ### 写隔离与 fan-in
@@ -328,7 +329,40 @@ TUI 快捷键：`Ctrl+Q` 退出 · `Ctrl+N` 新会话 · `Ctrl+L` 清屏。
 - 只读 worker 共享 run 级内容缓存；
 - survey 与 git 前置检查各自合并为一次 `wsl.exe`；
 - 编排有全局 `AGENT_ORCHESTRATOR_RUN_DEADLINE_S`；
-- sandbox 有并发命令上限。
+- sandbox 有并发命令上限；
+- 瞬时错误（超时/连接重置/5xx/429/环境抖动）按 `AGENT_RETRY_*` 做有界
+  指数退避重试；语义错误与配置错误不重试；
+- 验证/审查遇到执行环境异常时**不拖垮整轮**：`verify` 记为 `error` 并直接
+  收尾，`review` 记为 `warned` 且不推进水位线；
+- 崩溃后同一 thread 重跑会为悬空的 `tool_calls` 补占位结果，避免下一轮
+  API 因消息配对不完整而 400；
+- 文件写入使用“同目录临时文件 + rename”原子替换；`EBUSY/ETXTBSY` 等
+  瞬时占用会短退避重试；
+- 模型读过的文件若在写前被外部修改，`file_write` / `file_edit` 会拒绝覆盖
+  并提示重新读取；
+- checkpoint SQLite 开启 WAL 与 `busy_timeout`，降低多前端并发锁冲突；
+- `run_status` 留在 checkpoint 里：上一轮异常中断时，新一轮会收到
+  “可能有未验证改动”的恢复提示；
+- `agent undo --last-run` 可按最近一次运行整体回滚，`--since` 按时间点，
+  两者都支持 `--dry-run`；
+- 有副作用的工具（写文件、shell 写命令、git、依赖、测试）记录
+  `started/finished`；崩溃后只有 `started` 的调用**不会自动重放**，而是明确
+  告知“结果未知”；
+- 单次运行有总墙钟上限 `AGENT_RUN_DEADLINE_S`（跨 resume 累计），自动验证有
+  独立的 `AGENT_VERIFY_TIMEOUT`；
+- WSL 连续传输失败达到 `AGENT_WSL_BREAKER_FAILURES` 后熔断，冷却期内直接
+  fail fast 并提示运行 `agent doctor`；冷却后放一个半开探测请求，成功即恢复；
+- worker / 工具 / WSL / LLM 并发由统一的 `ConcurrencyGovernor` 管理，所有
+  获取都有超时；LLM 按 provider + 全局双层限流，并根据成功/429 做 AIMD；
+- 调度器不再把 `checkpoint_every` 当作启动上限；token 预留使用同角色历史
+  用量的 EWMA，预算不足时优先选择放得下的任务，而不是全阻塞；
+- ready 队列带 aging：等待越久优先级越高，防止高优先级任务把低优先级任务饿死；
+- WSL 池保留 1 个槽位给健康探针；implement 在飞 + 待合并补丁超过阈值时
+  暂停启动新的写任务，先排空合并队列；
+- 同一工作区有单写者锁，第二个 runtime 会直接收到 `RunFailed`；
+- `run_end` 审计与 `RunFinished` 事件包含各资源池的并发/排队/等待快照；
+- LLM 的 AIMD 并发上限写入现有跨进程限流状态文件，多进程共享同一个收敛值；
+- WSL 池在饱和时按命令 p95 延迟自动降/升并发，非饱和时不因单条慢命令误降。
 
 ## 安全模型
 
@@ -380,20 +414,28 @@ TUI 快捷键：`Ctrl+Q` 退出 · `Ctrl+N` 新会话 · `Ctrl+L` 清屏。
 |---|---|---|
 | `shell_exec` | 按命令内容 | bash 命令，L2/L3 需确认 |
 | `file_read` | L0 | 带行号读文件，支持 offset/limit |
+| `file_list` | L0 | 列出目录（类型 + 相对路径，可限深度） |
 | `symbol_search` | L0 | AST 符号定位（类/函数/方法 → 文件:行号） |
-| `code_intel` | L0 | LSP 定义/引用/诊断（需配置 `AGENT_LSP_COMMAND`） |
+| `code_intel` | L0 | LSP 定义/引用/诊断（需配置 `AGENT_LSP_COMMAND`；未配置时记为 skipped） |
 | `file_write` / `file_edit` | L1 | 精确替换、diff、写前备份 |
+| `file_edit_many` | L1 | 一次提交多条编辑（可跨文件），全量校验后一次落盘 |
 | `file_restore` | L1 | 回滚到某次修改前 |
+| `file_move` / `file_copy` / `file_mkdir` | L1 | 移动/复制/建目录，带 write_scope 与留底 |
+| `file_delete` | L2 | 删除普通文件，删除前留底，需确认 |
 | `git_status` / `git_diff` / `git_log` | L0 | 只读 |
 | `git_add` | L1 | 只动索引 |
 | `git_commit` | L2 | 产生提交，需确认 |
 | `deps_install` | L2 | 自动识别 uv/poetry/pnpm/yarn/npm/pip，需确认 |
-| `deps_list` | L0 | 只读 |
+| `deps_list` | L0 | 只读；`pip` 缺失时回退 `python3 -m pip`，否则明确报环境错误 |
 | `search_code` / `find_files` | L0 | 按内容/文件名检索 |
 | `run_tests` | L2 | 模型主动运行测试，需确认 |
 | `delegate_explore` | L0 | 委派只读探索子智能体（需 `AGENT_EXPLORE_ENABLED=true`） |
 
 L1 工具需要 `--write`；未登记的新工具按最危险的 L3 处理。
+
+本机 WSL2 微基准（直接调用工具，不含 LLM/审批）：常驻 shell 开启时
+`file_read` ~20ms、`search_code` ~16ms、`file_write` ~100ms；关闭时分别
+约 175ms、170ms、675ms（合并写往返后约 364ms）。
 Git、依赖、检索做成结构化工具，参数无法逃逸、等级可判定、审计可读。
 
 `.agent/` 禁止进入版本控制：`git_add` 拒绝暂存，`git_commit` 提交前检查，
@@ -401,7 +443,8 @@ Git、依赖、检索做成结构化工具，参数无法逃逸、等级可判�
 
 ## 文件修改与回滚
 
-修改只走 `file_read` / `file_write` / `file_edit` / `file_restore`，不走 shell。
+修改只走 `file_read` / `file_write` / `file_edit` / `file_restore` /
+`file_move` / `file_copy` / `file_delete` / `file_mkdir`，不走 shell。
 内容经 base64 在沙箱内落盘，不经过命令行解释。
 
 - **精确替换**：`old_string` 必须唯一，出现 0 次或多次都拒绝并说明原因；
@@ -550,7 +593,7 @@ CI 在无 WSL 的 runner 上跑 `ruff` + `pytest -m "not wsl and not llm" --cov`
 | `AGENT_WSL_WORKSPACE` | 空 = `$HOME/agent-ws` | 支持 Windows 路径；Git Bash 下建议 `wsl:/home/u/proj` 避免 MSYS 路径转换 |
 | `AGENT_SHELL_SANDBOX` | `off` | `off` / `bwrap`；配了 bwrap 但不可用时拒绝执行 |
 | `AGENT_SHELL_NETWORK` | `true` | 仅 bwrap 生效；`false` 时加 `--unshare-net` |
-| `AGENT_PERSISTENT_SHELL` | `false` | 常驻 WSL bash 会话池；失败自动退回逐命令执行 |
+| `AGENT_PERSISTENT_SHELL` | `true` | 常驻 WSL bash 会话池；失败自动退回逐命令执行 |
 | `AGENT_PERSISTENT_SHELL_POOL` | `4` | 常驻会话数量（保留并发能力） |
 | `AGENT_SHELL_TIMEOUT` | `60` | 单条命令墙钟上限 |
 | `AGENT_WRITE_DENY_GLOBS` | 空 | 追加敏感写保护 glob（`.env`/密钥/`.git` 默认已保护） |
@@ -604,8 +647,23 @@ CI 在无 WSL 的 runner 上跑 `ruff` + `pytest -m "not wsl and not llm" --cov`
 | `AGENT_CONTEXT_MAX_CHARS` / `_MAX_TOKENS` / `_KEEP_RECENT` / `_TOOL_CHARS` | `60000` / `0` / `12` / `1500` | 上下文裁剪；字符/token 任一超限即降档，0 = 该预算关闭 |
 | `AGENT_MEMORY_TOP_K` | `8` | 每次运行注入的相关记忆条数；0 = 全部注入 |
 | `AGENT_INSTRUCTIONS_ENABLED` | `true` | 发现并注入仓库内的 `AGENTS.md` / `CLAUDE.md`（最多 4 层、总量 24k 字符） |
+| `AGENT_SESSION_BRIEF_CHARS` | `4000` | 编排子图/worker 的会话约束摘要上限；0 = 关闭 |
+| `AGENT_READ_CACHE_MAX_BYTES` | `64MB` | run 级文件内容缓存上限（LRU）；0 = 关闭 |
+| `AGENT_SYMBOL_INDEX_TTL_S` / `AGENT_DEPS_DETECT_TTL_S` | `10` / `30` | AST 符号索引 / 包管理器探测缓存时间 |
+| `AGENT_RETRY_ATTEMPTS` / `_BASE_DELAY_S` / `_MAX_DELAY_S` / `_MAX_TOTAL_WAIT_S` | `3` / `1.0` / `30` / `60` | 节点级瞬时错误重试；attempts 为总尝试次数，1 = 不重试 |
 | `AGENT_MAX_PLAN_STEPS` / `_TOOL_ROUNDS` / `_REPAIR_ROUNDS` / `_MAX_RESUMES` | `5` / `12` / `3` / `50` | 循环与恢复上限 |
 | `AGENT_MAX_REPLANS` | `2` | 执行中重建剩余计划的次数 |
+| `AGENT_RUN_DEADLINE_S` / `AGENT_VERIFY_TIMEOUT` | `1800` / `300` | 单次运行总墙钟上限 / 自动验证独立超时（秒） |
+| `AGENT_TOOL_JOURNAL_ENABLED` | `true` | 有副作用工具的执行日志；崩溃后同一调用不自动重放 |
+| `AGENT_WSL_HEALTH_CHECK` / `_TTL_S` / `_TIMEOUT_S` | `true` / `30` / `10` | WSL 轻量健康探针与缓存 |
+| `AGENT_WSL_BREAKER_FAILURES` / `_COOLDOWN_S` / `_MAX_COOLDOWN_S` | `3` / `15` / `60` | 连续传输失败后的熔断阈值与退避上限 |
+| `AGENT_CONCURRENCY_WORKERS` / `_TOOLS` / `_WSL` | `0`（回退旧配置） | 统一资源池的 worker / 工具 / WSL 并发 |
+| `AGENT_CONCURRENCY_WSL_RESERVE` | `1` | 保留给健康探针的 WSL 槽位 |
+| `AGENT_CONCURRENCY_WSL_ADAPTIVE` / `_MIN` / `_MAX` / `_TARGET_MS` / `_LATENCY_WINDOW` | `true` / `2` / `0` / `1500` / `20` | 池子饱和时按命令 p95 延迟弹性调整 WSL 并发 |
+| `AGENT_CONCURRENCY_LLM_PER_PROVIDER` / `_GLOBAL` | `4` / `6` | LLM 每 provider 与全局并发 |
+| `AGENT_LLM_AIMD_MIN` / `_MAX` | `1` / `8` | LLM 并发自适应范围 |
+| `AGENT_ORCHESTRATOR_MAX_PENDING_MERGES` | `8` | 在飞 + 待合并 implement 的上限，超过后暂停新写任务 |
+| `AGENT_WORKSPACE_LOCK` | `true` | 同一工作区只允许一个 runtime 运行 |
 | `AGENT_MAX_DELEGATE_CALLS` / `AGENT_MAX_CONCURRENT_AGENTS` | `6` / `4` | 主 agent 委派预算与并发 |
 | `AGENT_MAX_CONCURRENT_TOOLS` | `4` | 同一消息内只读工具的并发上限；写工具始终串行 |
 

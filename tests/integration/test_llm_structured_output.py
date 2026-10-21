@@ -48,7 +48,9 @@ def test_planner_structured_output_returns_steps(settings: Settings) -> None:
     llm = build_llm(settings, streaming=False)
     structured = with_json_output(llm, TaskPlan)
     prompt = PLANNER_PROMPT.format(
-        max_steps=5, permission_note=PLANNER_PERMISSION_WRITE
+        max_steps=5,
+        permission_note=PLANNER_PERMISSION_WRITE,
+        delegation_note="",
     )
 
     task_plan = structured.invoke(
@@ -71,7 +73,9 @@ def test_planner_splits_a_multi_part_request(settings: Settings) -> None:
     llm = build_llm(settings, streaming=False)
     structured = with_json_output(llm, TaskPlan)
     prompt = PLANNER_PROMPT.format(
-        max_steps=5, permission_note=PLANNER_PERMISSION_WRITE
+        max_steps=5,
+        permission_note=PLANNER_PERMISSION_WRITE,
+        delegation_note="",
     )
 
     task_plan = structured.invoke(

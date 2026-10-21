@@ -13,6 +13,7 @@ approval_gate 只负责"决定"（放行/询问/拒绝），真正拦住调用�
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -21,11 +22,17 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 
 from coding_agent.agents.explore import DelegateRunner, render_subagent_result
+from coding_agent.concurrency import ConcurrencyGovernor
 from coding_agent.graph.nodes.approve import tool_level
 from coding_agent.graph.plan import EXPLORE, current_step_kind
 from coding_agent.graph.state import AgentState
 from coding_agent.messages import last_human_text
 from coding_agent.sandbox.policy import APPROVED, AUTO, DENIED, DENY, CommandLevel
+from coding_agent.tool_journal import (
+    ToolJournal,
+    replayed_artifact,
+    unknown_result_artifact,
+)
 from coding_agent.tools.artifacts import (
     CallArtifact,
     FileArtifact,
@@ -36,13 +43,20 @@ from coding_agent.tools.artifacts import (
 from coding_agent.tools.delegate import DELEGATE_EXPLORE
 from coding_agent.tools.deps import DEPS_INSTALL
 from coding_agent.tools.files import (
+    COPY_TOOL_NAME,
+    DELETE_TOOL_NAME,
+    EDIT_MANY_TOOL_NAME,
     EDIT_TOOL_NAME,
+    LIST_TOOL_NAME,
+    MKDIR_TOOL_NAME,
+    MOVE_TOOL_NAME,
     READ_TOOL_NAME,
     RESTORE_TOOL_NAME,
     WRITE_TOOL_NAME,
 )
 from coding_agent.tools.git import GIT_ADD, GIT_COMMIT
 from coding_agent.tools.shell import SHELL_TOOL_NAME
+from coding_agent.tools.testrun import RUN_TESTS_TOOL
 
 # 这些工具接受 cwd 参数；模型没显式给出时，用图状态里的当前工作目录补上，
 # 保证工具跟着会话走，而不是固定在构造时的默认值。
@@ -53,7 +67,12 @@ MUTATING_TOOLS = frozenset(
     {
         WRITE_TOOL_NAME,
         EDIT_TOOL_NAME,
+        EDIT_MANY_TOOL_NAME,
         RESTORE_TOOL_NAME,
+        MOVE_TOOL_NAME,
+        COPY_TOOL_NAME,
+        DELETE_TOOL_NAME,
+        MKDIR_TOOL_NAME,
         GIT_ADD,
         GIT_COMMIT,
         DEPS_INSTALL,
@@ -65,7 +84,33 @@ _EXECUTABLE = frozenset({AUTO, APPROVED})
 
 # 文件工具的产出是 FileArtifact；其余工具（git_commit / deps_install / run_tests…）
 # 的产出是 CallArtifact。事件层据此选对标签，别把前者安到后者头上。
-_FILE_TOOLS = frozenset({READ_TOOL_NAME, WRITE_TOOL_NAME, EDIT_TOOL_NAME, RESTORE_TOOL_NAME})
+_FILE_TOOLS = frozenset(
+    {
+        READ_TOOL_NAME,
+        WRITE_TOOL_NAME,
+        EDIT_TOOL_NAME,
+        RESTORE_TOOL_NAME,
+        MOVE_TOOL_NAME,
+        COPY_TOOL_NAME,
+        DELETE_TOOL_NAME,
+        MKDIR_TOOL_NAME,
+        LIST_TOOL_NAME,
+    }
+)
+
+# 只有这些文件工具会改变文件内容，需要把路径记进 stale_paths。
+# list/mkdir 不改变已有文件的读取结果，不需要让模型重读。
+_STALE_TOOLS = frozenset(
+    {
+        WRITE_TOOL_NAME,
+        EDIT_TOOL_NAME,
+        EDIT_MANY_TOOL_NAME,
+        RESTORE_TOOL_NAME,
+        MOVE_TOOL_NAME,
+        COPY_TOOL_NAME,
+        DELETE_TOOL_NAME,
+    }
+)
 
 _DENIED_TEXT = (
     "用户拒绝了这条命令，未执行任何操作。\n"
@@ -77,6 +122,21 @@ _SHELL_MUTATION_NOTE = (
     "\n提示：这条命令改动了工作区，但**没有快照留底**，无法用 file_restore 回滚。"
     "后续改动请改用 file_write / file_edit，才能被记录并可回滚。"
 )
+
+
+def _needs_journal(name: str, args: dict[str, Any]) -> bool:
+    """这次调用是否可能产生不可逆副作用。
+
+    只读工具不需要日志；写文件、git、依赖安装、测试执行（会跑工作区代码）
+    以及写入类 shell 命令需要，避免崩溃恢复时重复执行。
+    """
+    if name == RUN_TESTS_TOOL:
+        return True
+    if name in MUTATING_TOOLS:
+        return True
+    if name == SHELL_TOOL_NAME:
+        return tool_level(name, args) >= CommandLevel.LOW_WRITE
+    return False
 
 
 def _mutates_workspace(name: str, args: dict[str, Any]) -> bool:
@@ -142,10 +202,15 @@ def make_tools_node(
     max_delegate_calls: int = 0,
     max_concurrent_agents: int = 1,
     max_concurrent_tools: int = 4,
+    journal: ToolJournal | None = None,
+    governor: ConcurrencyGovernor | None = None,
 ) -> Callable[[AgentState, RunnableConfig], Awaitable[dict[str, Any]]]:
     tool_map = {tool.name: tool for tool in tools}
 
     async def run_tools(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+        thread_id = str(
+            (((config or {}).get("configurable")) or {}).get("thread_id", "")
+        )
         last = state["messages"][-1]
         calls = getattr(last, "tool_calls", None) or []
         approvals = state.get("approvals") or {}
@@ -270,8 +335,23 @@ def make_tools_node(
 
         parallel_messages: dict[str, ToolMessage] = {}
         if len(parallel_jobs) > 1:
-            tool_semaphore = asyncio.Semaphore(
-                max(1, int(max_concurrent_tools))
+            tool_pool = governor.tool if governor is not None else None
+            tool_semaphore = (
+                None
+                if tool_pool is not None
+                else asyncio.Semaphore(max(1, int(max_concurrent_tools)))
+            )
+            tool_timeout = (
+                float(
+                    getattr(
+                        governor.settings,
+                        "concurrency_worker_timeout_s",
+                        60.0,
+                    )
+                    or 60.0
+                )
+                if governor is not None
+                else None
             )
 
             async def _read_only(
@@ -280,28 +360,42 @@ def make_tools_node(
                 args: dict[str, Any],
                 decision: str,
             ) -> ToolMessage:
-                async with tool_semaphore:
-                    tool = tool_map[name]
-                    try:
-                        content, artifact = unpack(
-                            await asyncio.to_thread(
-                                tool.invoke, args, config
+                tool = tool_map[name]
+                started_at = time.perf_counter()
+                try:
+                    if tool_pool is not None:
+                        async with tool_pool.lease(
+                            priority=10, timeout=tool_timeout
+                        ):
+                            content, artifact = unpack(
+                                await asyncio.to_thread(
+                                    tool.invoke, args, config
+                                )
                             )
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        content = (
-                            f"工具执行异常：{type(exc).__name__}: {exc}"
-                        )
-                        artifact = None
-                    if isinstance(artifact, dict):
-                        artifact["decision"] = decision
-                        content = pack(content, artifact)
-                    return ToolMessage(
-                        content=content,
-                        tool_call_id=call_id,
-                        name=name,
-                        artifact=artifact,
+                    else:
+                        async with tool_semaphore:  # type: ignore[union-attr]
+                            content, artifact = unpack(
+                                await asyncio.to_thread(
+                                    tool.invoke, args, config
+                                )
+                            )
+                except Exception as exc:  # noqa: BLE001
+                    content = (
+                        f"工具执行异常：{type(exc).__name__}: {exc}"
                     )
+                    artifact = None
+                if isinstance(artifact, dict):
+                    artifact["duration_ms"] = int(
+                        (time.perf_counter() - started_at) * 1000
+                    )
+                    artifact["decision"] = decision
+                    content = pack(content, artifact)
+                return ToolMessage(
+                    content=content,
+                    tool_call_id=call_id,
+                    name=name,
+                    artifact=artifact,
+                )
 
             outcomes = await asyncio.gather(
                 *(_read_only(*job) for job in parallel_jobs),
@@ -436,14 +530,71 @@ def make_tools_node(
                 )
                 continue
 
-            artifact = None
-            try:
-                # 现有工具/沙箱是同步的：放进线程池，避免阻塞事件循环。
-                content, artifact = unpack(
-                    await asyncio.to_thread(tool.invoke, args, config)
+            # 有副作用的调用先查日志：崩溃恢复时不能把同一次 shell/git 再执行一遍。
+            use_journal = journal is not None and _needs_journal(name, args)
+            record = (
+                journal.lookup(thread_id, call_id) if use_journal else None
+            )
+            if record is not None and record.get("event") == "started":
+                # 只看到 started：副作用可能已经发生，也可能没有。重放不安全，
+                # 明确告诉模型“结果未知”，并强制本步进入验证。
+                content = (
+                    "上一次执行在工具返回前中断，结果未知。"
+                    "为避免重复副作用，本次没有自动重放；请先检查文件/git 状态，"
+                    "再决定是否重新执行。"
                 )
-            except Exception as exc:  # noqa: BLE001 - 工具失败要回灌给模型而非中断
-                content = f"工具执行异常：{type(exc).__name__}: {exc}"
+                artifact = unknown_result_artifact(name)
+                artifact["duration_ms"] = 0
+                dirty = True
+                run_dirty = True
+                results.append(
+                    ToolMessage(
+                        content=pack(content, artifact),
+                        tool_call_id=call_id,
+                        name=name,
+                        artifact=artifact,
+                    )
+                )
+                continue
+
+            replayed = record is not None and record.get("event") == "finished"
+            artifact = None
+            if replayed:
+                content = str(record.get("content") or "")
+                if record.get("content_truncated"):
+                    content += "\n（日志中的结果已截断）"
+                artifact = replayed_artifact(record, name)
+            else:
+                if use_journal and journal is not None:
+                    journal.begin(thread_id, call_id, name, args)
+                started_at = time.perf_counter()
+                try:
+                    # 现有工具/沙箱是同步的：放进线程池，避免阻塞事件循环。
+                    content, artifact = unpack(
+                        await asyncio.to_thread(tool.invoke, args, config)
+                    )
+                    ok = (
+                        artifact.get("ok", True)
+                        if isinstance(artifact, dict)
+                        else True
+                    )
+                except Exception as exc:  # noqa: BLE001 - 工具失败要回灌给模型而非中断
+                    content = f"工具执行异常：{type(exc).__name__}: {exc}"
+                    ok = False
+                duration_ms = int(
+                    (time.perf_counter() - started_at) * 1000
+                )
+                if isinstance(artifact, dict):
+                    artifact["duration_ms"] = duration_ms
+                if use_journal and journal is not None:
+                    journal.finish(
+                        thread_id,
+                        call_id,
+                        name,
+                        ok=bool(ok),
+                        content=content,
+                        artifact=artifact,
+                    )
 
             # 执行过的调用补上审批结果，供审计区分 auto 与 approved
             if isinstance(artifact, dict):
@@ -457,13 +608,28 @@ def make_tools_node(
                     if name == SHELL_TOOL_NAME or artifact.get("ok"):
                         dirty = True
                         run_dirty = True
-                        if name in _FILE_TOOLS:
-                            changed = str(
-                                artifact.get("path") or args.get("path") or ""
-                            )
-                            if changed and changed not in stale_paths:
-                                stale_paths.append(changed)
-                                del stale_paths[:-50]  # 只留最近 50 个
+                        if name in _STALE_TOOLS:
+                            artifact_files = artifact.get("files")
+                            if isinstance(artifact_files, list) and artifact_files:
+                                changed_paths = [
+                                    str(item) for item in artifact_files
+                                ]
+                            else:
+                                changed_paths = [
+                                    str(
+                                        artifact.get("path")
+                                        or args.get("path")
+                                        or ""
+                                    )
+                                ]
+                            if name in {MOVE_TOOL_NAME, COPY_TOOL_NAME}:
+                                changed_paths.append(
+                                    str(args.get("source") or "")
+                                )
+                            for changed in changed_paths:
+                                if changed and changed not in stale_paths:
+                                    stale_paths.append(changed)
+                                    del stale_paths[:-50]  # 只留最近 50 个
                     if name == SHELL_TOOL_NAME:
                         content += _SHELL_MUTATION_NOTE
                 content = pack(content, artifact)

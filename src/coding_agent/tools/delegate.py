@@ -14,7 +14,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
 
 from coding_agent.tools.code_intel import CODE_INTEL
-from coding_agent.tools.files import READ_TOOL_NAME
+from coding_agent.tools.files import LIST_TOOL_NAME, READ_TOOL_NAME
 from coding_agent.tools.memory import MEMORY_SEARCH
 from coding_agent.tools.search import FIND_FILES, SEARCH_CODE
 from coding_agent.tools.symbols import SYMBOL_SEARCH
@@ -31,6 +31,7 @@ DELEGATE_EXPLORE = "delegate_explore"
 EXPLORE_TOOL_NAMES = frozenset(
     {
         READ_TOOL_NAME,
+        LIST_TOOL_NAME,
         SEARCH_CODE,
         FIND_FILES,
         SYMBOL_SEARCH,

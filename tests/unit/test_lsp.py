@@ -10,6 +10,9 @@ from coding_agent.codeintel.lsp import (
     path_to_uri,
     uri_to_path,
 )
+from coding_agent.config import Settings
+from coding_agent.tools.artifacts import unpack
+from coding_agent.tools.code_intel import build_code_intel_tool
 
 FAKE_SERVER = r'''
 import json, sys
@@ -172,3 +175,25 @@ def test_uri_helpers() -> None:
 def test_command_from_settings() -> None:
     assert command_from_settings("pylsp --check") == ["pylsp", "--check"]
     assert command_from_settings("") == []
+
+
+def test_code_intel_without_lsp_is_skipped_not_failed() -> None:
+    settings = Settings(
+        _env_file=None, deepseek_api_key="x", wsl_workspace="/ws"
+    )
+    tool = build_code_intel_tool(settings, object())  # type: ignore[arg-type]
+
+    text, artifact = unpack(
+        tool.invoke(
+            {
+                "action": "diagnostics",
+                "path": "app.py",
+                "reason": "检查",
+            }
+        )
+    )
+
+    assert "未配置" in text
+    assert artifact is not None
+    assert artifact["ok"] is False
+    assert artifact["skipped"] is True

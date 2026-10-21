@@ -9,6 +9,7 @@ from __future__ import annotations
 from coding_agent.config import Settings
 from coding_agent.graph.nodes.verify import make_verify_node
 from coding_agent.sandbox.wsl_exec import ExecResult
+from coding_agent.tools.testrun import run_verification
 
 
 class _FakeSandbox:
@@ -17,11 +18,13 @@ class _FakeSandbox:
     def __init__(self) -> None:
         self.settings = Settings(_env_file=None, wsl_workspace="/ws")
         self.runs = 0
+        self.timeouts: list[int | None] = []
 
     def run(
         self, command: str, *, cwd: str | None = None, timeout: int | None = None
     ) -> ExecResult:
         self.runs += 1
+        self.timeouts.append(timeout)
         return ExecResult(command=command, exit_code=0, stdout="", stderr="", duration_ms=1)
 
     # 桩件刻意不做缓存：这里要数的就是 `run` 的调用次数。
@@ -46,6 +49,35 @@ def test_dirty_step_attempts_verification() -> None:
     out = node({"dirty": True}, None)  # type: ignore[arg-type]
     assert sandbox.runs >= 1  # 确实去探测/执行了验证命令
     assert out["verification"]["status"] == "not_configured"
+
+
+class _BrokenSandbox(_FakeSandbox):
+    def run(self, *args, **kwargs):  # noqa: ANN002, ANN003
+        raise RuntimeError("wsl.exe: 系统找不到指定的文件")
+
+
+def test_verification_uses_the_dedicated_timeout() -> None:
+    sandbox = _FakeSandbox()
+    sandbox.settings = Settings(
+        _env_file=None,
+        wsl_workspace="/ws",
+        verify_command="pytest",
+        verify_timeout=123,
+    )
+
+    run_verification(sandbox, "/ws")  # type: ignore[arg-type]
+
+    assert 123 in sandbox.timeouts
+
+
+def test_environment_failure_is_reported_not_fatal() -> None:
+    node = make_verify_node(_BrokenSandbox())  # type: ignore[arg-type]
+
+    out = node({"dirty": True}, None)  # type: ignore[arg-type]
+
+    assert out["verification"]["status"] == "error"
+    assert "wsl.exe" in out["verification"]["summary"]
+    assert out["verification"]["kind"] == "none"
 
 
 def test_verify_disabled_short_circuits() -> None:

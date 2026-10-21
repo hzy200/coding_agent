@@ -30,6 +30,8 @@ class ToolArtifact(BaseModel):
     kind: str = ""
     # auto / approved / denied / rejected —— 审计据此记账，见 sandbox/policy.py
     decision: str = "auto"
+    # 工具调用耗时（宿主侧测量，所有工具统一）。
+    duration_ms: int | None = None
 
 
 class ShellArtifact(ToolArtifact):
@@ -38,7 +40,6 @@ class ShellArtifact(ToolArtifact):
     command: str = ""
     ok: bool = False
     exit_code: int | None = None
-    duration_ms: int | None = None
     timed_out: bool = False
     # 被安全策略拦下时为 True，此时命令根本没有执行
     rejected: bool = False
@@ -79,8 +80,13 @@ class CallArtifact(ToolArtifact):
     ok: bool = False
     # 被安全策略 / 审批拒绝时为 True，此时工具未被调用
     rejected: bool = False
+    # 环境不具备该能力（例如未配置 LSP）：既不是成功，也不该算失败。
+    skipped: bool = False
     level: int | None = None
     level_label: str = ""
+    # 批量操作（file_edit_many）涉及的文件与合并 diff。
+    files: list[str] = Field(default_factory=list)
+    diff: str = ""
 
 
 class SubAgentArtifact(ToolArtifact):
@@ -111,7 +117,6 @@ class SubAgentArtifact(ToolArtifact):
     tool_calls: list[dict[str, Any]] = Field(default_factory=list)
     input_tokens: int = 0
     output_tokens: int = 0
-    duration_ms: int = 0
     llm_ms: int = 0
     tool_ms: int = 0
     timed_out: bool = False

@@ -1063,6 +1063,38 @@ def test_review_role_uses_the_review_runner() -> None:
     assert result.findings == ["[warning] app/x.py 边界条件"]
 
 
+def test_worker_runner_forwards_the_session_brief() -> None:
+    seen: dict[str, Any] = {}
+
+    async def review_runner(**kwargs):
+        seen.update(kwargs)
+        return SubAgentArtifact(
+            agent_id="review:r1",
+            parent_call_id="r1",
+            role="review",
+            goal="审查",
+            status="success",
+            summary="ok",
+        )
+
+    runner = make_worker_runner(
+        explore_runner=None,
+        review_runner=review_runner,  # type: ignore[arg-type]
+        sandbox=None,  # type: ignore[arg-type]
+        root="/ws",
+    )
+    _run(
+        runner(
+            {"id": "r1", "role": "review", "goal": "审查"},
+            parent_request="当前请求",
+            session_brief="之前轮次：不要改测试",
+            cwd="/ws",
+        )
+    )
+
+    assert seen["args"]["session_brief"] == "之前轮次：不要改测试"
+
+
 def test_synthesize_uses_latest_attempt_and_reports_file_overlap() -> None:
     node = make_synthesize_node(_settings())
     results = [

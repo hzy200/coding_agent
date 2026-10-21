@@ -12,10 +12,14 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import MutableMapping
+
 from langchain_core.tools import BaseTool
 
 from coding_agent.config import Settings, get_settings
 from coding_agent.sandbox.wsl_exec import WslSandbox
+from coding_agent.tools.artifacts import pack, unpack
 from coding_agent.tools.code_intel import build_code_intel_tool
 from coding_agent.tools.deps import build_deps_tools
 from coding_agent.tools.files import build_file_tools
@@ -33,7 +37,7 @@ def build_tools(
     allow_write: bool = False,
     sandbox: WslSandbox | None = None,
     write_scope: list[str] | None = None,
-    read_cache: dict[str, bytes] | None = None,
+    read_cache: MutableMapping[str, bytes] | None = None,
 ) -> list[BaseTool]:
     """构造本次会话的全部工具。
 
@@ -69,4 +73,31 @@ def build_tools(
     tools.append(build_symbol_tool(settings, sandbox))
     tools.append(build_code_intel_tool(settings, sandbox))
     tools.append(build_test_tool(settings, sandbox))
-    return tools
+    return [_instrument(tool) for tool in tools]
+
+
+def _instrument(tool: BaseTool) -> BaseTool:
+    """给每个工具补上 `duration_ms`，让直接 `tool.invoke` 的调用方也能拿到。
+
+    tools 节点会再测一次（包含排队/线程开销）并覆盖；这里测的是工具自身
+    执行时间，主要用于评测、脚本和没有经过图的直调。
+    """
+    original = getattr(tool, "func", None)
+    if original is None:
+        return tool
+
+    def timed(*args, **kwargs):  # noqa: ANN002, ANN003
+        started = time.perf_counter()
+        raw = original(*args, **kwargs)
+        text, artifact = unpack(raw)
+        if not isinstance(artifact, dict):
+            return raw
+        # 基类字段的默认值是 None，`setdefault` 会把 None 当成“已设置”。
+        if not artifact.get("duration_ms"):
+            artifact["duration_ms"] = int(
+                (time.perf_counter() - started) * 1000
+            )
+        return pack(text, artifact)
+
+    tool.func = timed  # type: ignore[attr-defined]
+    return tool

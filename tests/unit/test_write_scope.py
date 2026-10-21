@@ -10,6 +10,7 @@ from coding_agent.config import Settings
 from coding_agent.sandbox.fs import FileStat
 from coding_agent.sandbox.pathguard import ensure_inside
 from coding_agent.tools import files as files_module
+from coding_agent.tools.files import _changed_since_read
 
 
 class _FakeFs:
@@ -29,12 +30,36 @@ class _FakeFs:
             exists=False, is_file=False, size=0, real_path=target
         )
 
-    def read_text(self, path: str, *, max_bytes: int) -> str:
+    def read_text(
+        self, path: str, *, max_bytes: int, use_cache: bool = True
+    ) -> str:
         return ""
+
+    def read_for_update(self, path: str, *, max_bytes: int):
+        target = self.lexical(path)
+        return target, FileStat(
+            exists=False, is_file=False, size=0, real_path=target
+        ), None
+
+    def cached_bytes(self, path: str) -> bytes | None:
+        return None
+
+    def invalidate(self, path: str) -> None:
+        return None
 
     def write_text(self, path: str, content: str) -> int:
         self.writes[path] = content
         return len(content.encode("utf-8"))
+
+    def write_many(self, files: dict[str, str]) -> int:
+        self.writes.update(files)
+        return sum(len(content.encode("utf-8")) for content in files.values())
+
+    def mkdir(self, path: str) -> str:
+        return self.lexical(path)
+
+    def list_dir(self, path: str, *, max_depth: int = 1, limit: int = 200):
+        return []
 
 
 @pytest.fixture
@@ -48,6 +73,14 @@ def file_tools(monkeypatch: pytest.MonkeyPatch):
         write_scope=["app/allowed"],
     )
     return {tool.name: tool for tool in tools}, settings
+
+
+def test_changed_since_read_detects_external_modification() -> None:
+    assert _changed_since_read(b"old\n", "new\n") is True
+    assert _changed_since_read(b"same\n", "same\n") is False
+    # 没有读取记录（或文件已不存在）时不猜。
+    assert _changed_since_read(None, "new\n") is False
+    assert _changed_since_read(b"old\n", None) is False
 
 
 def test_write_outside_scope_is_rejected_before_io(file_tools) -> None:

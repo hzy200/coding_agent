@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    ToolMessage,
+)
 
 
 def text_of(message: object) -> str:
@@ -36,3 +41,65 @@ def last_human_text(messages: Sequence[BaseMessage]) -> str:
         if isinstance(message, HumanMessage):
             return text_of(message)
     return ""
+
+
+def recover_dangling_tool_calls(
+    messages: Sequence[BaseMessage],
+) -> list[ToolMessage]:
+    """为崩溃前没来得及返回的 tool_calls 补占位结果。
+
+    崩溃可能发生在 `act` 已提交（checkpoint 里有带 tool_calls 的 AIMessage）、
+    `tools` 尚未提交之间。此时同一 thread 重新运行会把新消息追加在悬空
+    tool_calls 后面，OpenAI 兼容接口会因为「assistant tool_calls 没有对应
+    tool 消息」直接报错。
+
+    这里只在**尾部的 tool_calls 批次**上工作：如果它后面已经出现非 ToolMessage，
+    说明不是一次中断留下的尾巴，不做猜测。返回的占位消息由调用方插到新用户
+    消息之前，从而恢复合法的消息顺序。
+    """
+    if not messages:
+        return []
+
+    start = -1
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, AIMessage) and getattr(
+            message, "tool_calls", None
+        ):
+            start = index
+            break
+    if start < 0:
+        return []
+
+    tail = messages[start + 1 :]
+    if any(not isinstance(message, ToolMessage) for message in tail):
+        return []
+
+    answered = {
+        str(getattr(message, "tool_call_id", ""))
+        for message in tail
+        if isinstance(message, ToolMessage)
+    }
+    recovered: list[ToolMessage] = []
+    for call in messages[start].tool_calls or []:
+        call_id = str(call.get("id", ""))
+        if not call_id or call_id in answered:
+            continue
+        recovered.append(
+            ToolMessage(
+                content=(
+                    "上次运行在工具执行完成前中断；该调用的结果未知。"
+                    "不要假设它已成功：只读操作可以重新执行，写操作请先"
+                    "读取文件当前内容确认状态。"
+                ),
+                tool_call_id=call_id,
+                name=str(call.get("name", "")),
+                artifact={
+                    "ok": False,
+                    "interrupted": True,
+                    "recovered": True,
+                    "tool": str(call.get("name", "")),
+                },
+            )
+        )
+    return recovered

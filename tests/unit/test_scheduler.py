@@ -184,6 +184,123 @@ def test_retry_carries_the_previous_failure_context() -> None:
     assert out["task_status"]["a"] == "success"
 
 
+def test_completed_implement_is_not_relaunched_while_waiting_for_merge(
+    monkeypatch,
+) -> None:
+    """一个 implement 完成、另一个还在跑时，前者只能等合并，不能被重排。"""
+    async def fake_merge(sandbox, root, records, *, allow_overlap=False):  # noqa: ANN001
+        return {
+            record["task_id"]: (True, "", ["snap"]) for record in records
+        }
+
+    monkeypatch.setattr(
+        "coding_agent.orchestrator.merge_queue.merge_implement_patches_atomic",
+        fake_merge,
+    )
+    calls: dict[str, int] = {}
+
+    async def runner(task: dict[str, Any], **_kwargs: Any) -> WorkerResult:
+        task_id = str(task["id"])
+        calls[task_id] = calls.get(task_id, 0) + 1
+        await asyncio.sleep(0.01 if task_id == "a" else 0.08)
+        return _result(task)
+
+    node = make_scheduler_node(
+        worker_runner=runner,
+        settings=_settings(orchestrator_max_concurrent_workers=2),
+        sandbox=object(),  # type: ignore[arg-type]
+        root="/ws",
+        steering=SteeringController(),
+    )
+    out = asyncio.run(
+        node(
+            _state(
+                [
+                    _task("a", role="implement"),
+                    _task("b", role="implement"),
+                ]
+            ),
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+
+    assert calls == {"a": 1, "b": 1}
+    assert out["task_status"] == {"a": "success", "b": "success"}
+
+
+def test_merge_backpressure_limits_concurrent_implement(monkeypatch) -> None:
+    async def fake_merge(sandbox, root, records, *, allow_overlap=False):  # noqa: ANN001
+        return {
+            record["task_id"]: (True, "", ["snap"]) for record in records
+        }
+
+    monkeypatch.setattr(
+        "coding_agent.orchestrator.merge_queue.merge_implement_patches_atomic",
+        fake_merge,
+    )
+    active = 0
+    max_active = 0
+
+    async def runner(task: dict[str, Any], **_kwargs: Any) -> WorkerResult:
+        nonlocal active, max_active
+        if task["role"] == "implement":
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+        return _result(task)
+
+    node = make_scheduler_node(
+        worker_runner=runner,
+        settings=_settings(
+            orchestrator_max_concurrent_workers=4,
+            orchestrator_max_pending_merges=1,
+        ),
+        sandbox=object(),  # type: ignore[arg-type]
+        root="/ws",
+        steering=SteeringController(),
+    )
+    out = asyncio.run(
+        node(
+            _state(
+                [
+                    _task("i1", role="implement"),
+                    _task("i2", role="implement"),
+                ]
+            ),
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+
+    assert max_active == 1
+    assert out["task_status"] == {"i1": "success", "i2": "success"}
+
+
+def test_checkpoint_boundary_does_not_cap_launches() -> None:
+    """边界只控制“何时返回”，不再限制“这一边界能启动几个”。"""
+    async def runner(task: dict[str, Any], **_kwargs: Any) -> WorkerResult:
+        return _result(task)
+
+    node = make_scheduler_node(
+        worker_runner=runner,
+        settings=_settings(
+            orchestrator_max_concurrent_workers=4,
+            orchestrator_checkpoint_every=2,
+        ),
+        steering=SteeringController(),
+    )
+    out = asyncio.run(
+        node(
+            _state([_task("a"), _task("b"), _task("c"), _task("d")]),
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+
+    # 旧实现每边界最多启动 checkpoint_every 个，只会跑 2 个。
+    assert len(out["worker_results"]) == 4
+    assert out["scheduler_done"] is True
+
+
 def test_checkpoint_boundary_returns_continue_for_remaining_tasks() -> None:
     async def runner(task: dict[str, Any], **_kwargs: Any) -> WorkerResult:
         return _result(task)
@@ -213,16 +330,16 @@ def test_checkpoint_boundary_returns_continue_for_remaining_tasks() -> None:
     assert len(second["worker_results"]) == 3
 
 
-def test_total_token_budget_blocks_tasks_that_do_not_fit() -> None:
+def test_total_token_budget_blocks_tasks_that_really_do_not_fit() -> None:
     async def runner(task: dict[str, Any], **_kwargs: Any) -> WorkerResult:
         result = _result(task)
-        result.input_tokens = 100
+        result.input_tokens = 2_000
         return result
 
     node = make_scheduler_node(
         worker_runner=runner,
         settings=_settings(
-            orchestrator_total_tokens=2_000,
+            orchestrator_total_tokens=2_200,
             orchestrator_max_concurrent_workers=1,
         ),
         steering=SteeringController(),
@@ -234,13 +351,41 @@ def test_total_token_budget_blocks_tasks_that_do_not_fit() -> None:
         )
     )
 
-    # 第一个 explore 预留 2000 并跑完（实际 100），第二个已无法再预留 2000。
+    # 第一个 explore 预留 2000 并跑完（实际 2000）；第二个的 EWMA 估算
+    # 已经是 2400，放不进剩余预算。
     assert out["task_status"]["a"] == "success"
     assert out["task_status"]["b"] == "blocked"
     assert out["token_budget_exhausted"] is True
-    assert out["token_budget_limit"] == 2_000
-    assert out["token_budget_spent"] == 100
+    assert out["token_budget_limit"] == 2_200
+    assert out["token_budget_spent"] == 2_000
     assert out["token_budget_reserved"] == 0
+
+
+def test_observed_usage_lets_a_small_task_fit_where_static_reserve_would_not() -> None:
+    async def runner(task: dict[str, Any], **_kwargs: Any) -> WorkerResult:
+        result = _result(task)
+        result.input_tokens = 100
+        return result
+
+    node = make_scheduler_node(
+        worker_runner=runner,
+        settings=_settings(
+            orchestrator_total_tokens=2_100,
+            orchestrator_max_concurrent_workers=1,
+        ),
+        steering=SteeringController(),
+    )
+    out = asyncio.run(
+        node(
+            _state([_task("a"), _task("b")]),
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+
+    # 静态 2000 的预留会把第二个卡死；用实际用量（100 → 估算 500）后两者都能跑。
+    assert out["task_status"] == {"a": "success", "b": "success"}
+    assert out["token_budget_exhausted"] is False
+    assert out["token_budget_spent"] == 200
 
 
 def test_token_budget_is_unlimited_by_default() -> None:

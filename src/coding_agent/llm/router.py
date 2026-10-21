@@ -8,9 +8,13 @@ ChatOpenAI 相同的调用面。
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
+from coding_agent.concurrency import ConcurrencyGovernor, ResourceTimeout
 from coding_agent.llm.ratelimit import GLOBAL_LIMITER, RateLimitCoordinator
+from coding_agent.recovery import TRANSIENT, classify_error
 
 
 class ProviderUnavailableError(RuntimeError):
@@ -122,6 +126,10 @@ class ProviderRouter:
         required_capabilities: tuple[str, ...] = (),
         capabilities: list[set[str]] | None = None,
         task_types: list[set[str]] | None = None,
+        governor: ConcurrencyGovernor | None = None,
+        acquire_timeout_s: float = 30.0,
+        aimd_min: int = 1,
+        aimd_max: int = 8,
     ) -> None:
         if not providers:
             raise ValueError("ProviderRouter 至少需要一个 provider")
@@ -138,6 +146,10 @@ class ProviderRouter:
         self._required_capabilities = set(required_capabilities)
         self._capabilities = capabilities or [set() for _ in providers]
         self._task_types = task_types or [set() for _ in providers]
+        self._governor = governor
+        self._acquire_timeout_s = max(0.0, float(acquire_timeout_s))
+        self._aimd_min = max(1, int(aimd_min))
+        self._aimd_max = max(self._aimd_min, int(aimd_max))
         self.provider_names = tuple(names)
 
     def _cost_score(self, index: int) -> float:
@@ -210,6 +222,63 @@ class ProviderRouter:
             index, input_tokens, output_tokens, run_id, hit, miss
         )
 
+    def _pool_for(self, index: int):
+        if self._governor is None:
+            return None
+        return self._governor.llm_pool(self._names[index])
+
+    def _clamp_limit(self, value: int) -> int:
+        return max(self._aimd_min, min(self._aimd_max, int(value)))
+
+    def _sync_shared_limit(self, index: int):
+        """把其他进程写入的自适应并发同步到本地池。"""
+        pool = self._pool_for(index)
+        if pool is None:
+            return None
+        shared = self._limiter.concurrency_limit(self._keys[index])
+        if shared > 0:
+            pool.set_limit(self._clamp_limit(shared))
+        return pool
+
+    def _write_shared_limit(self, index: int, value: int) -> int:
+        return self._limiter.record_concurrency(
+            self._keys[index], self._clamp_limit(value)
+        )
+
+    @asynccontextmanager
+    async def _call_slot(self, index: int) -> AsyncIterator[None]:
+        """为一次 provider 调用占用 global + per-provider 两个槽位。"""
+        if self._governor is None:
+            yield
+            return
+        timeout = self._acquire_timeout_s or None
+        # 先拿 provider 的专用槽，再拿全局槽：全局槽通常更宽，等待它时
+        # 只占住本 provider，不会连带堵住其它 provider。
+        pool = self._sync_shared_limit(index)
+        assert pool is not None
+        async with pool.lease(timeout=timeout):
+            async with self._governor.llm_global.lease(timeout=timeout):
+                yield
+
+    def _aimd_success(self, index: int) -> None:
+        pool = self._sync_shared_limit(index)
+        if pool is None:
+            return
+        shared = self._write_shared_limit(index, pool.limit + 1)
+        pool.set_limit(self._clamp_limit(shared))
+
+    def _aimd_failure(self, index: int, exc: BaseException) -> None:
+        pool = self._sync_shared_limit(index)
+        if pool is None:
+            return
+        if _is_rate_limit(exc):
+            shared = self._write_shared_limit(index, pool.limit // 2)
+        elif classify_error(exc) == TRANSIENT:
+            shared = self._write_shared_limit(index, pool.limit - 1)
+        else:
+            return
+        pool.set_limit(self._clamp_limit(shared))
+
     # ---------------- LangChain 兼容面 ----------------
 
     def bind_tools(self, tools: list[Any], **kwargs: Any) -> ProviderRouter:
@@ -227,6 +296,10 @@ class ProviderRouter:
             required_capabilities=tuple(self._required_capabilities),
             capabilities=self._capabilities,
             task_types=self._task_types,
+            governor=self._governor,
+            acquire_timeout_s=self._acquire_timeout_s,
+            aimd_min=self._aimd_min,
+            aimd_max=self._aimd_max,
         )
 
     def with_structured_output(self, schema: Any, **kwargs: Any) -> ProviderRouter:
@@ -247,6 +320,10 @@ class ProviderRouter:
             required_capabilities=tuple(self._required_capabilities),
             capabilities=self._capabilities,
             task_types=self._task_types,
+            governor=self._governor,
+            acquire_timeout_s=self._acquire_timeout_s,
+            aimd_min=self._aimd_min,
+            aimd_max=self._aimd_max,
         )
 
     def with_retry(self, **kwargs: Any) -> ProviderRouter:
@@ -270,6 +347,10 @@ class ProviderRouter:
             required_capabilities=tuple(self._required_capabilities),
             capabilities=self._capabilities,
             task_types=self._task_types,
+            governor=self._governor,
+            acquire_timeout_s=self._acquire_timeout_s,
+            aimd_min=self._aimd_min,
+            aimd_max=self._aimd_max,
         )
 
     @property
@@ -287,14 +368,22 @@ class ProviderRouter:
         for _attempt in range(2):
             for index in self._ordered_indices():
                 provider = self._providers[index]
+                name = self._names[index]
                 key = self._keys[index]
                 attempted = True
                 try:
-                    result = await provider.ainvoke(messages, config, **kwargs)
+                    async with self._call_slot(index):
+                        result = await provider.ainvoke(
+                            messages, config, **kwargs
+                        )
                     self._record_usage(index, result, _run_id(config))
                     self._limiter.record_success(key)
+                    self._aimd_success(index)
                     return result
+                except ResourceTimeout as exc:
+                    errors.append(f"{name}: {exc}")
                 except Exception as exc:  # noqa: BLE001 - 逐个 provider 回退
+                    self._aimd_failure(index, exc)
                     errors.append(
                         await self._handle_failure(
                             index, key, exc, streaming_started=False
@@ -339,6 +428,7 @@ class ProviderRouter:
         errors: list[str] = []
         for index in self._ordered_indices():
             provider = self._providers[index]
+            name = self._names[index]
             key = self._keys[index]
             emitted = False
             input_tokens = 0
@@ -346,13 +436,18 @@ class ProviderRouter:
             cache_hit = 0
             cache_miss = 0
             try:
-                async for chunk in provider.astream(messages, config, **kwargs):
-                    emitted = True
-                    chunk_in, chunk_out, chunk_hit, chunk_miss = _usage_of(chunk)
-                    if chunk_in or chunk_out:
-                        input_tokens, output_tokens = chunk_in, chunk_out
-                        cache_hit, cache_miss = chunk_hit, chunk_miss
-                    yield chunk
+                async with self._call_slot(index):
+                    async for chunk in provider.astream(
+                        messages, config, **kwargs
+                    ):
+                        emitted = True
+                        chunk_in, chunk_out, chunk_hit, chunk_miss = _usage_of(
+                            chunk
+                        )
+                        if chunk_in or chunk_out:
+                            input_tokens, output_tokens = chunk_in, chunk_out
+                            cache_hit, cache_miss = chunk_hit, chunk_miss
+                        yield chunk
                 self._record_usage_counts(
                     index,
                     input_tokens,
@@ -362,8 +457,12 @@ class ProviderRouter:
                     cache_miss,
                 )
                 self._limiter.record_success(key)
+                self._aimd_success(index)
                 return
+            except ResourceTimeout as exc:
+                errors.append(f"{name}: {exc}")
             except Exception as exc:  # noqa: BLE001
+                self._aimd_failure(index, exc)
                 if emitted:
                     # 已经输出过内容，不能再换 provider 重放。
                     raise

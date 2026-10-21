@@ -11,13 +11,86 @@ import base64
 
 import pytest
 
-from coding_agent.sandbox.fs import SandboxFs, SandboxFsError, SandboxFsTooLarge
+from coding_agent.sandbox.fs import (
+    SandboxFs,
+    SandboxFsError,
+    SandboxFsTooLarge,
+    _is_retryable_write_failure,
+)
 from coding_agent.sandbox.pathguard import SandboxPathError
+from coding_agent.sandbox.wsl_exec import ExecResult
 
 
 def _fs() -> SandboxFs:
     # _stat_script / _parse_stat 都不用沙箱，传个占位即可
     return SandboxFs(None, "/ws")  # type: ignore[arg-type]
+
+
+# ---------------- 写盘：原子替换与忙锁重试 ----------------
+
+class _ScriptedSandbox:
+    def __init__(self, failures: int, stderr: str = "") -> None:
+        self.failures = failures
+        self.stderr = stderr
+        self.calls = 0
+        self.scripts: list[str] = []
+
+    def run(self, script: str, *, cwd: str | None = None, timeout: int | None = None):
+        self.calls += 1
+        self.scripts.append(script)
+        if self.calls <= self.failures:
+            return ExecResult(
+                command=script,
+                exit_code=1,
+                stdout="",
+                stderr=self.stderr,
+                duration_ms=1,
+            )
+        return ExecResult(
+            command=script, exit_code=0, stdout="", stderr="", duration_ms=1
+        )
+
+
+def test_write_uses_a_temp_file_and_atomic_replace() -> None:
+    sandbox = _ScriptedSandbox(failures=0)
+    fs = SandboxFs(sandbox, "/ws")  # type: ignore[arg-type]
+    fs._real_root = "/ws"
+
+    fs.write_text("/ws/a.py", "x = 1\n")
+
+    script = sandbox.scripts[0]
+    assert ".agent-tmp." in script
+    assert "mv -f" in script
+
+
+def test_write_retries_on_busy_file() -> None:
+    sandbox = _ScriptedSandbox(
+        failures=2, stderr="mv: cannot create regular file: Text file busy"
+    )
+    fs = SandboxFs(sandbox, "/ws")  # type: ignore[arg-type]
+    fs._real_root = "/ws"
+
+    assert fs.write_text("/ws/a.py", "x") == 1
+    assert sandbox.calls == 3
+
+
+def test_write_does_not_retry_a_semantic_failure() -> None:
+    sandbox = _ScriptedSandbox(
+        failures=1, stderr="mv: Permission denied"
+    )
+    fs = SandboxFs(sandbox, "/ws")  # type: ignore[arg-type]
+    fs._real_root = "/ws"
+
+    with pytest.raises(SandboxFsError):
+        fs.write_text("/ws/a.py", "x")
+
+    assert sandbox.calls == 1
+
+
+def test_busy_error_detection_is_case_insensitive() -> None:
+    assert _is_retryable_write_failure("TEXT FILE BUSY")
+    assert _is_retryable_write_failure("Device or resource busy")
+    assert not _is_retryable_write_failure("No such file or directory")
 
 
 # ---------------- 脚本契约：超限不读 ----------------
