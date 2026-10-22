@@ -68,8 +68,10 @@ class _Provider:
         return self
 
 
-def _router(*providers: _Provider) -> tuple[ProviderRouter, RateLimitCoordinator]:
-    limiter = RateLimitCoordinator(base_cooldown=0.01, max_cooldown=0.05)
+def _router(
+    *providers: _Provider, max_cooldown: float = 0.05
+) -> tuple[ProviderRouter, RateLimitCoordinator]:
+    limiter = RateLimitCoordinator(base_cooldown=0.01, max_cooldown=max_cooldown)
     router = ProviderRouter(
         list(providers),
         [provider.name for provider in providers],
@@ -238,7 +240,9 @@ def test_bind_tools_is_applied_to_every_provider() -> None:
 
 
 def test_unavailable_error_is_explicit() -> None:
-    router, limiter = _router(_Provider("primary", text="ok"))
+    # 冷却窗口必须明显长于 runner 的启动/调度开销：默认 0.05s 在慢机器上
+    # 可能在 ainvoke 之前就过期，provider 变为可用，断言就会随机失败。
+    router, limiter = _router(_Provider("primary", text="ok"), max_cooldown=60)
     limiter.record_rate_limit("key-primary", retry_after=60)
     router._max_wait_s = 0  # type: ignore[attr-defined]
 
