@@ -2,10 +2,11 @@
 
 拓扑：
 
-    START → planner → act ─┬─→ approval_gate → tools ─→ act
-                           └─→ verify ─┬─(通过)─→ review ─┬─(通过)─→ advance → replan
-                                       │                 │            ├─→ act
-                                       │                 │            └─→ respond → END
+    START → planner → act → steering_cancel
+              ┌─(有 tool_calls)─→ approval_gate → tools ─→ steering_cancel
+              └─(无 tool_calls)─→ verify ─┬─(通过)─→ review ─┬─(通过)─→ advance → replan
+                                          │                 ├─→ act
+                                          │                 └─→ respond → END
                                        │                 └─(阻断)─┐
                                        └─(失败)────────────────────┴─┬─(有预算)→ repair → act
                                                                      └─(用尽)──→ replan
@@ -32,7 +33,12 @@ from langgraph.graph import END, START, StateGraph
 
 from coding_agent.agents.explore import make_explore_runner, make_review_runner
 from coding_agent.concurrency import ConcurrencyGovernor
-from coding_agent.config import Settings, get_settings
+from coding_agent.config import (
+    PRODUCTION_PROFILES,
+    Settings,
+    apply_security_profile,
+    get_settings,
+)
 from coding_agent.graph.nodes import (
     advance,
     make_act_node,
@@ -41,6 +47,7 @@ from coding_agent.graph.nodes import (
     make_replan_node,
     make_respond_node,
     make_review_node,
+    make_steering_cancel_node,
     make_steering_final_node,
     make_steering_step_node,
     make_tools_node,
@@ -57,19 +64,21 @@ from coding_agent.graph.routing import (
     REPLAN,
     RESPOND,
     REVIEW,
+    STEERING_CANCEL,
     STEERING_FINAL,
     STEERING_STEP,
     TOOLS,
     VERIFY,
     make_route_after_review,
     make_route_after_verify,
-    route_after_act,
     route_after_replan,
+    route_after_steering_cancel,
     route_after_steering_step,
     route_after_synthesize,
 )
 from coding_agent.graph.state import AgentState
 from coding_agent.llm.deepseek import build_llm
+from coding_agent.memory.longterm import resolve_memory_root
 from coding_agent.orchestrator import make_worker_runner, route_entry
 from coding_agent.orchestrator.implement import make_implement_runner
 from coding_agent.orchestrator.subgraph import build_orchestrator_subgraph
@@ -99,8 +108,9 @@ def estimate_recursion_limit(
 
     一个周期（act 跑满本轮工具预算、直到不再产 tool_calls）最坏走过的超步：
     `act` 被调 (轮次+1) 次（末次超预算不产 tool_calls，直接去 verify）
+    + `steering_cancel` 每次 act 后 1 次、每次 tools 后 1 次（共 `2×轮次+1`）
     + `approval_gate` 与 `tools` 各 轮次 次 + `verify` 1 次 + `review` 1 次，
-    即 `3×轮次 + 3`。
+    即 `5×轮次 + 4`。
 
     这个公式已经**算歪过三次**，每次都是漏算了某个会「重新开始」的机制：
 
@@ -120,7 +130,12 @@ def estimate_recursion_limit(
     （review 阻断走的还是同一条 REPAIR 边），所以阶段结构不变，只是每周期多 1 个
     超步。若哪天给 review 单开一个修复计数器，这里要多乘一层 `(审查修复次数+1)`。
     """
-    per_cycle = (max_tool_rounds + 1) + 2 * max_tool_rounds + 2
+    per_cycle = (
+        (max_tool_rounds + 1)          # act
+        + (2 * max_tool_rounds + 1)    # steering_cancel（act 后与 tools 后）
+        + 2 * max_tool_rounds          # approval_gate + tools
+        + 2                            # verify + review
+    )
     phase = (max_repair_rounds + 1) * per_cycle + max_repair_rounds
     # 最坏路径是「一路失败」：每个阶段（修复用尽）之后都进一次 replan，
     # **包括最后一个**——它负责放弃并把剩余步骤砍掉。所以是 (重规划次数+1) 个
@@ -166,10 +181,14 @@ def build_graph(
     # 一次运行只该有一份沙箱：环境探测（$HOME、bwrap、rg）的结果缓存在**实例**上，
     # 各建一份就等于各探一遍 —— 曾经这里是 runtime / build_tools / verify 三份，
     # 冷启动光探测就要 4 次 wsl.exe 进程启动。
-    settings = settings or get_settings()
+    settings = apply_security_profile(settings or get_settings())
+    if str(settings.security_profile or "").strip().lower() in PRODUCTION_PROFILES:
+        allow_write = False
     policy = policy or SessionPolicy(
         allow_write=allow_write,
+        approval_mode=settings.approval_mode,
         allow_rules=parse_allow_rules(settings.allow_rules),
+        read_deny_globs=settings.read_deny_globs,
     )
     governor = governor or ConcurrencyGovernor(settings)
     sandbox = sandbox or WslSandbox(settings, slots=governor.wsl)
@@ -179,6 +198,14 @@ def build_graph(
     # 工作区只解析一次，再往下传：verify 的沙箱是共享的，它那份 settings 未必带
     # `--workspace` 覆盖，让它自己推会退回 $HOME。
     root = resolve_workspace(settings, sandbox)
+    # bwrap 的 workdir/可写绑定读的是 sandbox.settings；配置留空时把推导值写回。
+    if sandbox.settings.wsl_workspace != root:
+        sandbox.settings = settings.model_copy(update={"wsl_workspace": root})
+    # 不可信仓库的记忆在仓库外；bwrap 只绑定工作区，必须显式加入可写绑定。
+    memory_root = resolve_memory_root(settings, sandbox, root)
+    if memory_root != root:
+        sandbox.ensure_directory(memory_root)
+        sandbox.add_extra_bind(memory_root)
     # 同一次运行内只读 worker 共享内容缓存；写路径会主动失效。
     read_cache = ReadCache(settings.read_cache_max_bytes)
     tools = build_tools(
@@ -317,6 +344,7 @@ def build_graph(
         sandbox=sandbox,
         root=root,
         memory_top_k=settings.memory_top_k,
+        settings=settings,
     )
     # 独立子图：父图只看到 orchestrator 一个节点；内层节点通过
     # `subgraphs=True` 的 stream 上报事件。
@@ -334,6 +362,9 @@ def build_graph(
         ),
     )
     graph.add_node(STEERING_STEP, make_steering_step_node(steering, settings))
+    graph.add_node(
+        STEERING_CANCEL, make_steering_cancel_node(steering, settings)
+    )
     graph.add_node(STEERING_FINAL, make_steering_final_node(steering, settings))
 
     # direct 走单 agent；orchestrated 进独立子图，最后仍回到 planner。
@@ -348,13 +379,21 @@ def build_graph(
         {STEERING_FINAL: STEERING_FINAL, "planner": "planner"},
     )
     graph.add_edge("planner", "act")
+    # act ⇄ tools 的每一段都先过取消检查点：cancel 不必等整个 step 跑完，
+    # 且在真正执行工具之前就能截断。add/replan/pause 不在这里消费。
+    graph.add_edge("act", STEERING_CANCEL)
+    graph.add_edge(TOOLS, STEERING_CANCEL)
     graph.add_conditional_edges(
-        "act",
-        route_after_act,
-        {APPROVE: APPROVE, VERIFY: VERIFY},
+        STEERING_CANCEL,
+        route_after_steering_cancel,
+        {
+            STEERING_FINAL: STEERING_FINAL,
+            APPROVE: APPROVE,
+            VERIFY: VERIFY,
+            ACT: "act",
+        },
     )
     graph.add_edge(APPROVE, TOOLS)
-    graph.add_edge(TOOLS, "act")
     graph.add_conditional_edges(
         VERIFY,
         make_route_after_verify(

@@ -49,29 +49,38 @@ def make_verify_node(
     root = root or resolve_workspace(sandbox.settings, sandbox)
 
     def verify(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+        # 编排层合并过补丁、但主 agent 还没验证：即使 dirty=False 也必须跑一次。
+        pending = bool(state.get("pending_verification"))
         if not sandbox.settings.verify_enabled:
-            return {"verification": {}}
+            # 用户显式关闭验证时，不能让这个标志永远挂着（否则每次都会再判断一遍）。
+            return (
+                {"verification": {}, "pending_verification": False}
+                if pending
+                else {"verification": {}}
+            )
 
         kind = current_step_kind(state)
         # 探索步是只读的。即便某条 shell 命令被误判成写（dirty=True），
         # 也不该让它跑全量测试 —— 后续实现/验证步会兜住真正的问题。
-        if kind == EXPLORE:
+        # 例外：编排刚合并过补丁，此时验证的是合并结果，不是这一步的探索。
+        if kind == EXPLORE and not pending:
             return {"verification": {}}
 
         # kind=verify 的步骤就是用来跑全量验证的：即使这一步没有新改动
         # （dirty=False，比如前面的实现步已经写完），也要跑。
-        if kind != VERIFY_KIND and not state.get("dirty"):
+        if kind != VERIFY_KIND and not state.get("dirty") and not pending:
             return {"verification": {}}
 
-        # 多步任务：早期 implement 步只完成了一部分，跑全量套件必然因为
-        # 后面还没做的步骤而失败，会把 agent 钉死在这一步。只在最终实现步
-        # 或 kind=verify 的步骤验证；单步任务（也是最后一步）照常验证。
+        # 多步任务：早期步骤只完成了一部分，跑全量套件必然因为后面还没做的
+        # 步骤而失败，会把 agent 钉死在这一步。只在最终步（或 kind=verify）
+        # 验证；单步任务（也是最后一步）照常验证。
         if sandbox.settings.verify_only_final:
             plan = state.get("plan") or []
             step_idx = int(state.get("step_idx", 0))
             is_last = step_idx >= len(plan) - 1
-            if kind == IMPLEMENT and not is_last:
-                return {"verification": {}}
+            if not is_last and kind != VERIFY_KIND:
+                if kind == IMPLEMENT or pending:
+                    return {"verification": {}}
 
         previous = state.get("verification") or {}
         # repair 的快速通道：只重跑上次失败的测试；子集通过后 runner 会自动
@@ -112,7 +121,7 @@ def make_verify_node(
         else:
             same_failure_count = 0
 
-        return {
+        update: dict[str, Any] = {
             "verification": result.model_dump(),
             # 运行级快照：replan 会清 verification，但收尾要靠它判断真实结论
             "last_verification": result.model_dump(),
@@ -121,5 +130,9 @@ def make_verify_node(
                 result_signature if result_status == "failed" else ""
             ),
         }
+        if pending:
+            # 已经为合并结果跑过一次验证（无论通过与否），后续交给 repair/replan。
+            update["pending_verification"] = False
+        return update
 
     return verify

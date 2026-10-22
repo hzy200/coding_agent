@@ -39,7 +39,12 @@ from coding_agent.audit.logger import (
     truncate,
 )
 from coding_agent.concurrency import ConcurrencyGovernor
-from coding_agent.config import Settings, get_settings
+from coding_agent.config import (
+    PRODUCTION_PROFILES,
+    Settings,
+    apply_security_profile,
+    get_settings,
+)
 from coding_agent.diffing import unified_diff
 from coding_agent.events import (
     ApprovalRequested,
@@ -76,9 +81,13 @@ from coding_agent.graph.nodes.approve import tool_level
 from coding_agent.llm.billing import fetch_billing
 from coding_agent.llm.ratelimit import GLOBAL_LIMITER
 from coding_agent.memory.checkpointer import CheckpointStore
-from coding_agent.memory.longterm import LongTermMemory
+from coding_agent.memory.longterm import LongTermMemory, resolve_memory_root
 from coding_agent.memory.sessions import SessionIndex
-from coding_agent.messages import recover_dangling_tool_calls, text_of
+from coding_agent.messages import (
+    recover_dangling_tool_calls,
+    text_of,
+    unanswered_tool_calls,
+)
 from coding_agent.sandbox.fs import SandboxFs
 from coding_agent.sandbox.pathguard import normalize_root
 from coding_agent.sandbox.policy import (
@@ -100,6 +109,7 @@ from coding_agent.steering import SteeringCommand, SteeringController
 from coding_agent.tools.artifacts import (
     CallArtifact,
     FileArtifact,
+    InterruptedArtifact,
     ShellArtifact,
     SubAgentArtifact,
     parse_artifact,
@@ -127,6 +137,12 @@ STREAMING_NODES = frozenset({"act", "respond"})
 
 _PREVIEW_CHARS = 240
 _FAILURE_MARKERS = ("工具执行异常：", "错误：")
+# 同一 runtime 同时只允许一个事件流。工作区锁是可重入的，不能替代这层保护：
+# Web 端并发 resume 会同时驱动同一个 LangGraph/checkpointer。
+_STREAM_BUSY_MESSAGE = (
+    "该会话已有正在执行的事件流；请等待当前运行结束，"
+    "或先消费挂起/审批事件。"
+)
 _SUMMARY_KEYS = ("command", "path", "pattern", "query")
 # planner 没解析出步骤、退化成单步时记进审计的 detail，供事后复盘
 _PLAN_DEGRADED_DETAIL = "规划未解析，已退化为单步执行"
@@ -147,7 +163,8 @@ def _verification_verdict(raw: dict[str, Any]) -> bool | None:
     与 `_verification_passed`（路由口径）刻意分开：路由只需要"要不要拦"，所以
     `not_configured` / `skipped` 都算"不拦"；但审计要回答的是"这次到底验证了没有"，
     把"没做"记成 `ok=True` 会让**验证有缺口在账上看不出来** —— 而审计本该是可信
-    来源，这正是本项目最不能接受的失败模式之一（IMPROVEMENT_PLAN 的 P0-2）。
+    来源，这正是本项目最不能接受的失败模式之一（原 IMPROVEMENT_PLAN 的 P0-2，
+    去向见 `docs/archive/README.md`）。
     """
     status = str(raw.get("status", "skipped"))
     if status == _VERIFICATION_BLOCKING_STATUS:
@@ -214,6 +231,44 @@ def _add_usage(message: Any, input_tokens: int, output_tokens: int) -> tuple[int
     )
 
 
+def submit_steering_command(
+    settings: Settings,
+    thread_id: str,
+    command: SteeringCommand,
+    *,
+    workspace: str | None = None,
+) -> None:
+    """跨进程入口：先落审计，再写入 steering 队列。
+
+    供 `agent steer` 使用。刻意不构造 `AgentRuntime` —— 它需要沙箱/checkpoint
+    等运行期资源，而这里只想写一条宿主侧协调数据。审计字段与
+    `AgentRuntime.steer()` 保持一致（提交时落账，source 记录来源）。
+    """
+    audit = AuditLogger(
+        settings.resolved_audit_dir,
+        enabled=settings.audit_enabled,
+        max_bytes=settings.audit_max_mb * 1024 * 1024,
+    )
+    detail = (
+        command.action
+        if not command.text
+        else f"{command.action}: {command.text}"
+    )
+    audit.write(
+        AuditRecord(
+            ts=now_iso(),
+            kind=audit_models.STEERING,
+            thread_id=thread_id,
+            workspace=workspace or "",
+            detail=truncate(detail),
+            source=command.source,
+        )
+    )
+    SteeringController(settings.resolved_steering_dir).submit(
+        thread_id, command
+    )
+
+
 class AgentRuntime:
     """跑一轮任务，产出事件流。"""
 
@@ -226,16 +281,29 @@ class AgentRuntime:
         checkpointer: Any = None,
         audit: AuditLogger | None = None,
         approval_mode: str | None = None,
+        governor: ConcurrencyGovernor | None = None,
     ) -> None:
-        self.settings = settings or get_settings()
+        self.settings = apply_security_profile(settings or get_settings())
+        # production/ops 是只读审计档：无论调用方传了什么，都强制关闭写能力
+        # 并把审批模式钉在 deny。否则 `agent run --write` 或 Web 的显式参数
+        # 会把 profile 的保证绕过去。
+        if (
+            str(self.settings.security_profile or "").strip().lower()
+            in PRODUCTION_PROFILES
+        ):
+            allow_write = False
+            approval_mode = "deny"
         GLOBAL_LIMITER.configure(self.settings.resolved_rate_limit_state_path)
         # 一次运行共享一套资源池：worker / 主 agent 工具 / WSL / LLM。
-        self.concurrency = ConcurrencyGovernor(self.settings)
+        # 多 runtime 的宿主（Web）应传入同一个 governor，否则 WSL/LLM 上限
+        # 会按 runtime 数量相乘。
+        self.concurrency = governor or ConcurrencyGovernor(self.settings)
         self.allow_write = allow_write
         self.policy = SessionPolicy(
             allow_write=allow_write,
             approval_mode=approval_mode or self.settings.approval_mode,
             allow_rules=parse_allow_rules(self.settings.allow_rules),
+            read_deny_globs=self.settings.read_deny_globs,
         )
         self._sandbox = WslSandbox(
             self.settings, slots=self.concurrency.wsl
@@ -262,6 +330,8 @@ class AgentRuntime:
         # thread_id -> 已 resume 次数（fresh run 归零），用于封顶挂起-恢复循环
         self._resume_counts: dict[str, int] = {}
         self._workspace_lock: WorkspaceLock | None = None
+        # 同一 runtime 的 run/resume 不能并发驱动同一张图。
+        self._stream_active = False
 
         # 显式传入的 checkpointer 由调用方负责生命周期；否则按配置自行管理
         self._external_checkpointer = checkpointer
@@ -281,6 +351,15 @@ class AgentRuntime:
         """沙箱内的工作区绝对路径，按需解析并缓存。"""
         if self._workspace is None:
             self._workspace = resolve_workspace(self.settings, self._sandbox)
+            # bwrap 要求 workdir 存在；默认 $HOME/agent-ws 可能尚未创建。
+            if self.settings.shell_sandbox == "bwrap":
+                self._sandbox.ensure_directory(self._workspace)
+            # bwrap 的 workdir/可写绑定来自 sandbox.settings.wsl_workspace。
+            # 配置留空时由 resolve_workspace 推导，必须写回沙箱，否则
+            # untrusted 模式下所有不带 cwd 的文件/检索脚本都会失败。
+            self._sandbox.settings = self.settings.model_copy(
+                update={"wsl_workspace": self._workspace}
+            )
         return self._workspace
 
     def _repo_profile(self) -> RepoProfile:
@@ -322,11 +401,30 @@ class AgentRuntime:
             )
         return self._snapshots
 
+    def _memory_root(self) -> str:
+        return resolve_memory_root(
+            self.settings, self._sandbox, self.workspace
+        )
+
+    def _ensure_memory_bind(self) -> None:
+        """记忆在仓库外时，bwrap 需要显式可写绑定。"""
+        memory_root = self._memory_root()
+        if memory_root == self.workspace:
+            return
+        self._sandbox.ensure_directory(memory_root)
+        self._sandbox.add_extra_bind(memory_root)
+
     @property
     def memory(self) -> LongTermMemory:
-        """跨会话的项目记忆。"""
+        """跨会话的项目记忆（不可信仓库下位于仓库之外）。"""
         if self._memory is None:
-            self._memory = LongTermMemory(self._sandbox_fs(), self.workspace)
+            self._ensure_memory_bind()
+            memory_root = self._memory_root()
+            self._memory = LongTermMemory(
+                SandboxFs(self._sandbox, memory_root),
+                self.workspace,
+                state_root=memory_root,
+            )
         return self._memory
 
     @property
@@ -665,20 +763,31 @@ class AgentRuntime:
         事件流以 `RunFinished` / `RunFailed` 收尾；若以 `ApprovalRequested` 收尾，
         说明图已挂起等待人工确认，前端应收集答复后调用 `resume()`。
         """
+        if self._stream_active:
+            yield RunFailed(message=_STREAM_BUSY_MESSAGE)
+            return
         if not self._acquire_workspace_lock():
             yield RunFailed(message=self._workspace_lock_busy)
             return
+        self._stream_active = True
         try:
             async for event in self._run_unlocked(
                 prompt, thread_id=thread_id
             ):
                 yield event
         finally:
+            self._stream_active = False
             self._release_workspace_lock()
 
     async def _run_unlocked(
         self, prompt: str, *, thread_id: str
     ) -> AsyncIterator[Event]:
+        # 新一轮先作废旧指令。**必须放在任何耗时初始化之前**：Web 在 run 的
+        # SSE 响应建立后、TUI 在 _execute 一开始就能提交 /pause /cancel，
+        # 而记忆读取、仓库画像探测、checkpoint 回读可能要数秒 —— 放到后面
+        # 会把这段时间里提交的指令静默清掉（审计只留下"用户提交过"）。
+        self.steering.clear(thread_id)
+
         # 读记忆（工作区 `.agent/memory.md`）需要沙箱；失败也必须以事件收尾，
         # 否则异常会在生成器第一步裸抛给前端（CLI 会以 traceback 收场）。
         try:
@@ -707,7 +816,9 @@ class AgentRuntime:
                 from coding_agent.instructions import load_project_instructions
 
                 instructions = load_project_instructions(
-                    self._sandbox, self.workspace
+                    self._sandbox,
+                    self.workspace,
+                    trusted=self.settings.trust_repo_instructions,
                 )
             except Exception:  # noqa: BLE001 - 指令加载失败不应阻断任务
                 instructions = ""
@@ -771,6 +882,8 @@ class AgentRuntime:
             "budget_exhausted": False,
             "dirty": False,
             "run_dirty": False,
+            # 编排合并补丁后由 scheduler 置位；新一轮必须复位。
+            "pending_verification": False,
             # 本轮改过的文件会累积到这里，act 据此提醒「旧读取已过期」
             "stale_paths": [],
             "approvals": {},
@@ -810,7 +923,6 @@ class AgentRuntime:
             "steering_applied": [],
             "workflow_revised_reason": "",
         }
-        self.steering.clear(thread_id)
         async for event in self._stream(
             inputs, thread_id=thread_id, fresh_run=True, prompt=prompt
         ):
@@ -847,13 +959,18 @@ class AgentRuntime:
 
     async def resume(self, thread_id: str, decisions: dict[str, bool]) -> AsyncIterator[Event]:
         """带着审批结果继续被挂起的图（持有工作区单写者锁）。"""
+        if self._stream_active:
+            yield RunFailed(message=_STREAM_BUSY_MESSAGE)
+            return
         if not self._acquire_workspace_lock():
             yield RunFailed(message=self._workspace_lock_busy)
             return
+        self._stream_active = True
         try:
             async for event in self._resume_unlocked(thread_id, decisions):
                 yield event
         finally:
+            self._stream_active = False
             self._release_workspace_lock()
 
     async def _resume_unlocked(
@@ -912,13 +1029,18 @@ class AgentRuntime:
 
     async def resume_steering(self, thread_id: str) -> AsyncIterator[Event]:
         """从 steering pause 恢复（持有工作区单写者锁）。"""
+        if self._stream_active:
+            yield RunFailed(message=_STREAM_BUSY_MESSAGE)
+            return
         if not self._acquire_workspace_lock():
             yield RunFailed(message=self._workspace_lock_busy)
             return
+        self._stream_active = True
         try:
             async for event in self._resume_steering_unlocked(thread_id):
                 yield event
         finally:
+            self._stream_active = False
             self._release_workspace_lock()
 
     async def _resume_steering_unlocked(
@@ -941,7 +1063,9 @@ class AgentRuntime:
     ) -> AsyncIterator[Event]:
         settings = self.settings
         run_started_at = time.time()
-        GLOBAL_LIMITER.start_run(thread_id)
+        # 同一 thread 会被多轮 run 复用：全新 run 必须清零，resume 必须保留
+        # 挂起前那一段的用量。
+        GLOBAL_LIMITER.start_run(thread_id, reset=fresh_run)
         config = {
             "configurable": {"thread_id": thread_id},
             # 按图拓扑推导，别再把系数算歪（见 estimate_recursion_limit）
@@ -971,6 +1095,22 @@ class AgentRuntime:
             pending.clear()
             progress.clear()
             self._resume_counts[thread_id] = 0
+        else:
+            # 进程重启后 `_pending_calls` 是空的：从 checkpoint 的尾部
+            # tool_calls 恢复调用参数，否则恢复后的审计会丢掉 L2/L3 的参数。
+            # 同进程 resume 时 pending 已有记录，这里不会重复补发。
+            prior = await self._prior_state(thread_id)
+            for call in unanswered_tool_calls(prior.get("messages") or []):
+                call_id = str(call.get("id", ""))
+                if not call_id or call_id in pending:
+                    continue
+                started = self._tool_started(
+                    str(call.get("name", "")),
+                    dict(call.get("args") or {}),
+                    call_id,
+                )
+                pending[call_id] = started
+                yield started
         # 模型回报的用量累计。**存 progress 而不是 _stream 的局部变量**：挂起与
         # 恢复是两次 `_stream`，存局部会让挂起之前那段用量整个丢掉 —— 而挂起
         # 恰恰常见于 L2/L3 审批，那是最费 token 的路径。provider 未提供时保持 0，
@@ -1454,8 +1594,7 @@ class AgentRuntime:
                                         ),
                                     )
 
-                            changed = self._file_changed(message)
-                            if changed is not None:
+                            for changed in self._file_changes(message):
                                 self._audit_file_change(changed, thread_id)
                                 yield changed
 
@@ -1915,6 +2054,13 @@ class AgentRuntime:
             decision = audit_models.DECISION_REJECTED
         else:
             decision = audit_models.DECISION_AUTO
+        # `skipped` / `interrupted` 都是「没得出成功或失败」：审计必须记 None，
+        # 不能把“没验证/结果未知”混进成功或失败率。
+        audit_ok = (
+            None
+            if finished.interrupted or finished.skipped
+            else finished.ok
+        )
         self._audit(
             AuditRecord(
                 ts=now_iso(),
@@ -1925,7 +2071,7 @@ class AgentRuntime:
                 args=sanitize_args(dict(started.args) if started else {}),
                 level=finished.level or (started.level if started else "") or "",
                 decision=decision,
-                ok=finished.ok,
+                ok=audit_ok,
                 exit_code=finished.exit_code,
                 duration_ms=finished.duration_ms,
             )
@@ -2141,7 +2287,10 @@ class AgentRuntime:
         # 不存在"UI 判定通过就执行"的路径。
         level = None
         if name == SHELL_TOOL_NAME:
-            level = classify(str(args.get("command", ""))).level.label
+            level = classify(
+                str(args.get("command", "")),
+                read_deny_globs=self.settings.read_deny_globs,
+            ).level.label
         return ToolCallStarted(
             call_id=call_id,
             name=name,
@@ -2179,6 +2328,18 @@ class AgentRuntime:
                 decision=artifact.decision,
                 duration_ms=artifact.duration_ms,
                 level="文件工具",
+                preview=preview,
+            )
+
+        if isinstance(artifact, InterruptedArtifact):
+            # 副作用执行到一半中断：既不能记成功，也不能断言失败。
+            return ToolCallFinished(
+                call_id=call_id,
+                name=name,
+                ok=False,
+                interrupted=True,
+                decision=artifact.decision,
+                duration_ms=artifact.duration_ms,
                 preview=preview,
             )
 
@@ -2278,3 +2439,36 @@ class AgentRuntime:
             diff=artifact.diff,
             snapshot_id=artifact.snapshot_id,
         )
+
+    def _file_changes(self, message: Any) -> list[FileChanged]:
+        """一个工具结果涉及的所有文件改动。
+
+        单文件工具返回 FileArtifact；`file_edit_many` 返回带 `file_changes`
+        的 CallArtifact —— 否则批量编辑只有一条 tool_call，前端看不到逐文件
+        的 ✎ 行，审计里也没有逐文件的 file_change。
+        """
+        artifact = parse_artifact(getattr(message, "artifact", None))
+        if isinstance(artifact, FileArtifact):
+            changed = self._file_changed(message)
+            return [changed] if changed is not None else []
+        if isinstance(artifact, CallArtifact) and artifact.ok:
+            changes: list[FileChanged] = []
+            for raw in artifact.file_changes:
+                if not isinstance(raw, dict):
+                    continue
+                action = str(raw.get("action", ""))
+                path = str(raw.get("path", ""))
+                if not path or action not in MUTATING_FILE_ACTIONS:
+                    continue
+                changes.append(
+                    FileChanged(
+                        path=path,
+                        action=action,
+                        added=int(raw.get("added", 0) or 0),
+                        removed=int(raw.get("removed", 0) or 0),
+                        diff=str(raw.get("diff", "") or ""),
+                        snapshot_id=str(raw.get("snapshot_id") or "") or None,
+                    )
+                )
+            return changes
+        return []

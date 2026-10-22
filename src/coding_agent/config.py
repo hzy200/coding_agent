@@ -24,6 +24,22 @@ from typing import Any
 from pydantic import Field
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
+DEFAULT_READ_DENY_GLOBS = (
+    ".env,.env.*,*.pem,*.key,*.p12,*.pfx,"
+    "id_rsa*,id_ed25519*,id_ecdsa*,.ssh/**,"
+    # 常见凭据文件：不能靠“扩展名是 .env”来判断敏感与否
+    ".netrc,.npmrc,.pypirc,.git-credentials,"
+    "credentials,**/credentials,credentials.json,**/credentials.json,"
+    "*service-account*.json,*service_account*.json,"
+    ".aws/**,**/.aws/**,.kube/**,**/.kube/**,"
+    ".config/gcloud/**,**/.config/gcloud/**,"
+    ".docker/config.json,**/.docker/config.json,"
+    "*.tfstate,*.tfstate.backup,*.jks,*.keystore,*.gpg"
+)
+
+# 这些 profile 面向生产/只读审计：命令变更一律拒绝，写能力也被强制关闭。
+PRODUCTION_PROFILES = frozenset({"production", "ops"})
+
 
 class _NonEmptyDotEnvSource(PydanticBaseSettingsSource):
     """给 `.env` 源加一层空值过滤：`KEY=` 这种占位不算「配置过」。
@@ -132,6 +148,12 @@ class Settings(BaseSettings):
     # shell 隔离后端：off（默认，仅工作区 cwd 约束）| bwrap（挂载命名空间隔离）
     # bwrap 模式下若沙箱内不可用，会**拒绝执行**（fail closed），不静默降级
     shell_sandbox: str = Field(default="off", alias="AGENT_SHELL_SANDBOX")
+    # WSL 命令默认 `env -i` 清空宿主环境。这里按名称显式放行少量构建变量
+    # （如 JAVA_HOME/GOPATH/VIRTUAL_ENV）。名称含
+    # KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL/AUTH/COOKIE/SESSION 的一律忽略。
+    shell_env_allowlist: str = Field(
+        default="", alias="AGENT_SHELL_ENV_ALLOWLIST"
+    )
     # 仅 bwrap 模式生效：false 时加 --unshare-net，命令完全无网络。
     # off 模式没有内核级隔离，词法策略无法禁止 curl/wget 出网。
     shell_network: bool = Field(default=True, alias="AGENT_SHELL_NETWORK")
@@ -182,6 +204,12 @@ class Settings(BaseSettings):
     shell_max_file_mb: int = Field(default=512, alias="AGENT_SHELL_MAX_FILE_MB")
     shell_max_processes: int = Field(default=1024, alias="AGENT_SHELL_MAX_PROCESSES")
     max_output_chars: int = Field(default=20_000, alias="AGENT_MAX_OUTPUT_CHARS")
+    # 宿主从沙箱捕获单条命令输出的字节上限（stdout/stderr 各自）。
+    # `max_output_chars` 只控制回灌给模型的文本；捕获阶段若不设上限，
+    # 一条 `yes`/`cat big.log` 会在截断前先把宿主内存打满。
+    max_capture_bytes: int = Field(
+        default=1_000_000, alias="AGENT_MAX_CAPTURE_BYTES"
+    )
     max_file_read_bytes: int = Field(default=2_000_000, alias="AGENT_MAX_FILE_READ_BYTES")
     # 同时启动的 wsl.exe 进程上限。并发 worker 会各自调用沙箱，没有这层
     # 背压时 4 个 worker 的一次工具轮次就能同时拉起十几个 WSL 进程。
@@ -293,6 +321,11 @@ class Settings(BaseSettings):
     # 与自动 verify 同一口径：不过审批，所以只跑宿主写死的检查，不读工作区里的
     # 任何"配置"。关掉它等于去掉「测试通过 ≠ 代码正确」那第二道关。
     review_enabled: bool = Field(default=True, alias="AGENT_REVIEW_ENABLED")
+    # 探测到的 linter/formatter 对**本次改动文件**的发现是否阻断。
+    # 只把改动文件提升为 blocking：仓库里已有的历史问题不该每一步都卡死。
+    review_lint_blocking: bool = Field(
+        default=True, alias="AGENT_REVIEW_LINT_BLOCKING"
+    )
 
     # ---------- 子智能体（Phase 1：只读 Explore）----------
     # **默认关闭**：它会给主模型多一个工具、改变 agent 行为，打开后旧评测基线
@@ -444,6 +477,72 @@ class Settings(BaseSettings):
     # 单个审计文件超过该大小（MB）就轮转；0 表示不轮转
     audit_max_mb: int = Field(default=0, alias="AGENT_AUDIT_MAX_MB")
 
+    # ---------- 安全 profile 与不可信仓库 ----------
+    # local（默认，面向可信仓库）| untrusted（bwrap + 禁网 + 强制 ask +
+    # 不信任仓库指令/记忆）。
+    security_profile: str = Field(
+        default="local", alias="AGENT_SECURITY_PROFILE"
+    )
+    # 仓库内的 AGENTS.md / CLAUDE.md 是否作为可信指令注入。
+    trust_repo_instructions: bool = Field(
+        default=True, alias="AGENT_TRUST_REPO_INSTRUCTIONS"
+    )
+    # 是否读取仓库内 `.agent/memory.md`；false 时记忆改存 memory_root。
+    trust_repo_memory: bool = Field(
+        default=True, alias="AGENT_TRUST_REPO_MEMORY"
+    )
+    # 长期记忆根目录（WSL 绝对路径）；空则按 trust_repo_memory 推导。
+    memory_root: str = Field(default="", alias="AGENT_MEMORY_ROOT")
+    # 秘密文件读保护 glob（逗号分隔）；.env.example 等模板自动放行。
+    read_deny_globs: str = Field(
+        default=DEFAULT_READ_DENY_GLOBS,
+        alias="AGENT_READ_DENY_GLOBS",
+    )
+
+    # ---------- Web 多用户 ----------
+    # JSON：{"token": "user"}；与 AGENT_WEB_AUTH_TOKENS_FILE 二选一。
+    web_auth_tokens: str = Field(
+        default="", alias="AGENT_WEB_AUTH_TOKENS"
+    )
+    web_auth_tokens_file: str = Field(
+        default="", alias="AGENT_WEB_AUTH_TOKENS_FILE"
+    )
+    # per-user 工作区根目录；空 = 沙箱 $HOME/agent-ws/users。
+    web_workspaces_root: str = Field(
+        default="", alias="AGENT_WEB_WORKSPACES_ROOT"
+    )
+    # per-user 宿主侧数据根目录（审计/checkpoint/steering）；
+    # 空 = <当前目录>/.agent/web/users。
+    web_data_root: str = Field(default="", alias="AGENT_WEB_DATA_ROOT")
+    # per-user WSL 侧记忆根目录；空 = 沙箱 $HOME/agent-memory。
+    # 记忆在沙箱内、仓库之外，避免不可信仓库预置记忆。
+    web_memory_root: str = Field(
+        default="", alias="AGENT_WEB_MEMORY_ROOT"
+    )
+    web_max_body_bytes: int = Field(
+        default=256 * 1024, alias="AGENT_WEB_MAX_BODY_BYTES"
+    )
+    web_max_prompt_chars: int = Field(
+        default=100_000, alias="AGENT_WEB_MAX_PROMPT_CHARS"
+    )
+    web_rate_limit_per_min: int = Field(
+        default=60, alias="AGENT_WEB_RATE_LIMIT_PER_MIN"
+    )
+    web_max_runtimes: int = Field(
+        default=8, alias="AGENT_WEB_MAX_RUNTIMES"
+    )
+    web_max_runtimes_per_user: int = Field(
+        default=2, alias="AGENT_WEB_MAX_RUNTIMES_PER_USER"
+    )
+    # 挂起 runtime 的空闲保留时间；超时后释放，resume 时从 checkpoint 重建。
+    web_runtime_ttl_s: int = Field(
+        default=1800, alias="AGENT_WEB_RUNTIME_TTL_S"
+    )
+    # 未配置 token 时是否允许 loopback 匿名访问（单用户本地模式）。
+    web_allow_anonymous_local: bool = Field(
+        default=True, alias="AGENT_WEB_ALLOW_ANONYMOUS_LOCAL"
+    )
+
     # ---------- Agent 循环 ----------
     max_repair_rounds: int = Field(default=3, alias="AGENT_MAX_REPAIR_ROUNDS")
     # 连续出现同一失败签名多少次后停止 repair、改走 replan。
@@ -459,7 +558,7 @@ class Settings(BaseSettings):
     # 一次完整运行（含审批/暂停后的 resume）的总墙钟上限，0 表示不限制。
     # 与 recursion_limit 互补：后者管步数，这里管时间（例如模型长时间卡住）。
     run_deadline_s: int = Field(default=1800, alias="AGENT_RUN_DEADLINE_S")
-    # ask（逐条询问）| approve（一律放行）| deny（一律拒绝）
+    # ask（逐条询问）| approve（自动放行 L2；L3 仍需确认）| deny（一律拒绝）
     approval_mode: str = Field(default="ask", alias="AGENT_APPROVAL_MODE")
     # 持久放行规则，逗号分隔的 `tool:glob`，例如
     # `shell_exec:git status*,run_tests:*`。只覆盖原本会 ASK 的 L2。
@@ -515,6 +614,51 @@ class Settings(BaseSettings):
             os.environ["LANGSMITH_API_KEY"] = self.langsmith_api_key
 
 
+def apply_security_profile(settings: Settings) -> Settings:
+    """把 `AGENT_SECURITY_PROFILE` 展开成具体的安全开关。
+
+    `untrusted` 面向不可信仓库/公网：bwrap 不可用时 fail closed、命令无网络、
+    L2/L3 全部人工确认、不注入仓库自带的指令/记忆、清空持久放行规则。
+    """
+    profile = str(settings.security_profile or "").strip().lower()
+    if profile == "untrusted":
+        update = {
+            "shell_sandbox": "bwrap",
+            "shell_network": False,
+            "approval_mode": "ask",
+            # 持久放行规则会把 L2 自动放行，与 untrusted 的“全部人工确认”冲突。
+            "allow_rules": "",
+            "trust_repo_instructions": False,
+            "trust_repo_memory": False,
+            "audit_enabled": True,
+            "tool_journal_enabled": True,
+            "workspace_lock_enabled": True,
+        }
+        if not str(settings.read_deny_globs or "").strip():
+            update["read_deny_globs"] = DEFAULT_READ_DENY_GLOBS
+        return settings.model_copy(update=update)
+
+    if profile in PRODUCTION_PROFILES:
+        # production/ops 是**只读审计档**：任何 L2/L3 变更都直接拒绝，
+        # 写能力由 AgentRuntime/build_graph 强制关闭（见 allow_write 覆盖）。
+        update = {
+            "shell_sandbox": "bwrap",
+            "shell_network": False,
+            "approval_mode": "deny",
+            "allow_rules": "",
+            "trust_repo_instructions": False,
+            "trust_repo_memory": False,
+            "audit_enabled": True,
+            "tool_journal_enabled": True,
+            "workspace_lock_enabled": True,
+        }
+        if not str(settings.read_deny_globs or "").strip():
+            update["read_deny_globs"] = DEFAULT_READ_DENY_GLOBS
+        return settings.model_copy(update=update)
+
+    return settings
+
+
 def shadowed_env_keys(env_file: str = ".env") -> dict[str, str]:
     """找出「环境变量里有、但被 .env 覆盖掉」的键。
 
@@ -540,6 +684,6 @@ def shadowed_env_keys(env_file: str = ".env") -> dict[str, str]:
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    settings = Settings()
+    settings = apply_security_profile(Settings())
     settings.apply_tracing_env()
     return settings

@@ -77,6 +77,53 @@ def test_steer_audits_and_queues_a_command(tmp_path) -> None:
     assert queued[0].source == "test"
 
 
+def test_fresh_run_clears_stale_commands_but_keeps_early_new_ones(tmp_path) -> None:
+    """清队列必须发生在耗时初始化之前。
+
+    旧指令要在新 run 开始前作废；但用户在初始化期间（记忆读取、画像探测）
+    提交的指令不能一起被清掉 —— 那正是 TUI/Web 上最早能点到按钮的窗口。
+    """
+    runtime = _runtime(tmp_path)
+    runtime.steer(THREAD, "replan", source="test")  # 上一轮残留
+
+    class _SubmittingMemory:
+        def load(self) -> list[str]:
+            return []
+
+        def search(self, query: str = "", limit: int = 8) -> list[str]:
+            # 模拟初始化过程中用户提交 /cancel
+            runtime.steer(THREAD, "cancel", source="test")
+            return []
+
+    class _PeekGraph(FakeGraph):
+        def __init__(self, script: list[tuple[str, Any]]) -> None:
+            super().__init__(script)
+            self.seen: list[str] = []
+
+        async def astream(  # type: ignore[override]
+            self, payload, config=None, stream_mode=None, subgraphs=None
+        ):
+            self.seen = [
+                command.action
+                for command in runtime.steering.peek(THREAD)
+            ]
+            async for item in super().astream(
+                payload, config, stream_mode, subgraphs
+            ):
+                yield item
+
+    runtime._memory = _SubmittingMemory()  # type: ignore[assignment]
+    graph = _PeekGraph(
+        [_updates(respond={"messages": [AIMessage(content="完成")]})]
+    )
+    runtime._graph = graph
+
+    _collect(runtime)
+
+    # 启动前的 replan 被清掉；初始化期间提交的 cancel 保留到图入口。
+    assert graph.seen == ["cancel"]
+
+
 def test_steering_update_becomes_an_event_and_closes_the_step(tmp_path) -> None:
     runtime = _runtime(tmp_path)
     runtime._graph = FakeGraph(

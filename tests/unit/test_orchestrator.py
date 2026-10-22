@@ -1486,3 +1486,11 @@ def test_plan_tasks_consumes_prefetched_tasks_without_a_second_call() -> None:
     assert structured.calls == 0
     assert out["tasks"][0]["id"] == "t1"
     assert out["prefetched_tasks"] == []
+
+
+def test_implement_workers_cannot_delete_files() -> None:
+    """删除在主 agent 路径是 L2；worker 不经过 approval_gate，必须没有这个能力。"""
+    from coding_agent.orchestrator.implement import IMPLEMENT_TOOL_NAMES
+    from coding_agent.tools.files import DELETE_TOOL_NAME
+
+    assert DELETE_TOOL_NAME not in IMPLEMENT_TOOL_NAMES

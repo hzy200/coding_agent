@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from langchain_core.messages import ToolMessage
+
 from coding_agent.graph.plan import (
     EXPLORE,
     current_step_kind,
@@ -12,7 +14,6 @@ from coding_agent.graph.plan import (
     VERIFY as VERIFY_KIND,
 )
 from coding_agent.graph.state import AgentState
-from coding_agent.orchestrator.graph import ready_tasks
 
 ACT = "act"
 APPROVE = "approval_gate"
@@ -29,9 +30,9 @@ RESPOND = "respond"
 STEERING_PLAN = "steering_plan"
 STEERING_DISPATCH = "steering_dispatch"
 STEERING_STEP = "steering_step"
+STEERING_CANCEL = "steering_cancel"
 STEERING_FINAL = "steering_final"
-DISPATCH = "dispatch"
-EXTEND_TASKS = "extend_tasks"
+WRITE_GATE = "write_gate"
 PLAN_TASKS = "plan_tasks"
 SYNTHESIZE = "synthesize"
 
@@ -62,24 +63,34 @@ def route_after_replan(state: AgentState) -> str:
 # --------------------------------------------------------------------------
 
 def route_after_steering_plan(state: AgentState) -> str:
-    """任务图刚生成：取消直接去汇总，否则开始派发。"""
-    return SYNTHESIZE if state.get("steering_cancelled") else DISPATCH
+    """任务图刚生成：取消直接去汇总，否则进入写审批/派发。
 
-
-def route_after_steering_dispatch(state: AgentState) -> str:
-    """一批 worker 之后：取消/无 ready → 汇总；重规划 → 重建任务图。"""
-    if state.get("steering_cancelled"):
-        return SYNTHESIZE
-    if state.get("steering_replan"):
-        return PLAN_TASKS
-    if ready_tasks(state.get("tasks") or [], state.get("task_status") or {}):
-        return DISPATCH
-    return SYNTHESIZE
+    取消必须在这里截断：scheduler 只轮询队列里的 cancel，而 cancel 已经被
+    steering_plan 消费掉；若继续进入 scheduler，同批追加的任务仍会被派发。
+    """
+    return SYNTHESIZE if state.get("steering_cancelled") else WRITE_GATE
 
 
 def route_after_steering_step(state: AgentState) -> str:
     """direct 模式一步之后：取消直接收尾，否则照常重规划。"""
     return RESPOND if state.get("steering_cancelled") else REPLAN
+
+
+def route_after_steering_cancel(state: AgentState) -> str:
+    """act/tools 之间的取消检查点之后去哪。
+
+    同一个节点会被两条边进入：
+    - act → steering_cancel：有 tool_calls 去审批，没有则去验证；
+    - tools → steering_cancel：最后一条是 ToolMessage，回到 act。
+
+    取消优先于两者：直接收尾，不再执行后续工具或模型调用。
+    """
+    if state.get("steering_cancelled"):
+        return STEERING_FINAL
+    last = state["messages"][-1]
+    if isinstance(last, ToolMessage):
+        return ACT
+    return route_after_act(state)
 
 
 def route_after_synthesize(state: AgentState) -> str:

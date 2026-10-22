@@ -21,7 +21,14 @@ from coding_agent.events import (
     ToolCallStarted,
 )
 from coding_agent.runtime import AgentRuntime
-from coding_agent.tools.artifacts import FileArtifact, ShellArtifact, pack, unpack
+from coding_agent.tool_journal import unknown_result_artifact
+from coding_agent.tools.artifacts import (
+    CallArtifact,
+    FileArtifact,
+    ShellArtifact,
+    pack,
+    unpack,
+)
 
 
 def _runtime() -> AgentRuntime:
@@ -118,6 +125,43 @@ def test_tool_finished_without_artifact_falls_back_to_text() -> None:
     assert bad.ok is False
 
 
+def test_interrupted_result_is_not_reported_as_success() -> None:
+    """结果未知既不是成功也不是普通失败，事件与审计都必须保留三态。"""
+    artifact = unknown_result_artifact("shell_exec")
+    message = ToolMessage(
+        content=pack("上一次执行在工具返回前中断，结果未知。", artifact),
+        tool_call_id="c1",
+        name="shell_exec",
+        artifact=artifact,
+    )
+    event = _runtime()._tool_finished(message)
+
+    assert event.ok is False
+    assert event.interrupted is True
+    assert event.rejected is False
+
+
+def test_interrupted_tool_audit_is_recorded_as_unknown(tmp_path) -> None:
+    runtime = AgentRuntime(
+        Settings(_env_file=None),
+        workspace="/tmp/ws",
+        audit=AuditLogger(tmp_path),
+    )
+    artifact = unknown_result_artifact("shell_exec")
+    message = ToolMessage(
+        content=pack("结果未知", artifact),
+        tool_call_id="c1",
+        name="shell_exec",
+        artifact=artifact,
+    )
+    event = runtime._tool_finished(message)
+    runtime._audit_tool_call(None, event, "t")
+
+    record = next(r for r in read_records(runtime.audit_path) if r.kind == "tool_call")
+    assert record.ok is None
+    assert record.tool == "shell_exec"
+
+
 def test_tool_finished_preview_is_truncated() -> None:
     message = ToolMessage(content="x" * 5000, tool_call_id="1", name="t")
     event = _runtime()._tool_finished(message)
@@ -162,6 +206,32 @@ def test_file_changed_not_emitted_when_rejected_or_failed() -> None:
     assert AgentRuntime._file_changed(
         _file_message(path="a.py", action="edit", ok=False)
     ) is None
+
+
+def test_batch_edit_emits_one_file_changed_per_file() -> None:
+    artifact = CallArtifact(
+        tool="file_edit_many",
+        ok=True,
+        files=["a.py", "b.py"],
+        file_changes=[
+            {"path": "a.py", "action": "edit", "added": 2, "removed": 1,
+             "diff": "--- a/a.py\n+++ b/a.py\n", "snapshot_id": "s1"},
+            {"path": "b.py", "action": "edit", "added": 1, "removed": 1,
+             "diff": "--- a/b.py\n+++ b/b.py\n", "snapshot_id": "s2"},
+        ],
+    )
+    message = ToolMessage(
+        content="batch",
+        tool_call_id="1",
+        name="file_edit_many",
+        artifact=artifact.model_dump(),
+    )
+
+    changes = _runtime()._file_changes(message)
+
+    assert [item.path for item in changes] == ["a.py", "b.py"]
+    assert [item.snapshot_id for item in changes] == ["s1", "s2"]
+    assert all(item.action == "edit" for item in changes)
 
 
 def test_file_changed_ignores_shell_artifact() -> None:

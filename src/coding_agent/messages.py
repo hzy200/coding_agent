@@ -43,19 +43,13 @@ def last_human_text(messages: Sequence[BaseMessage]) -> str:
     return ""
 
 
-def recover_dangling_tool_calls(
+def unanswered_tool_calls(
     messages: Sequence[BaseMessage],
-) -> list[ToolMessage]:
-    """为崩溃前没来得及返回的 tool_calls 补占位结果。
+) -> list[dict]:
+    """返回尾部 tool_calls 批次里仍未被 ToolMessage 应答的调用。
 
-    崩溃可能发生在 `act` 已提交（checkpoint 里有带 tool_calls 的 AIMessage）、
-    `tools` 尚未提交之间。此时同一 thread 重新运行会把新消息追加在悬空
-    tool_calls 后面，OpenAI 兼容接口会因为「assistant tool_calls 没有对应
-    tool 消息」直接报错。
-
-    这里只在**尾部的 tool_calls 批次**上工作：如果它后面已经出现非 ToolMessage，
-    说明不是一次中断留下的尾巴，不做猜测。返回的占位消息由调用方插到新用户
-    消息之前，从而恢复合法的消息顺序。
+    只在**尾部的 tool_calls 批次**上工作：如果它后面已经出现非 ToolMessage，
+    说明不是一次中断留下的尾巴，不做猜测。
     """
     if not messages:
         return []
@@ -80,11 +74,28 @@ def recover_dangling_tool_calls(
         for message in tail
         if isinstance(message, ToolMessage)
     }
+    return [
+        call
+        for call in messages[start].tool_calls or []
+        if str(call.get("id", "")) and str(call.get("id", "")) not in answered
+    ]
+
+
+def recover_dangling_tool_calls(
+    messages: Sequence[BaseMessage],
+) -> list[ToolMessage]:
+    """为崩溃前没来得及返回的 tool_calls 补占位结果。
+
+    崩溃可能发生在 `act` 已提交（checkpoint 里有带 tool_calls 的 AIMessage）、
+    `tools` 尚未提交之间。此时同一 thread 重新运行会把新消息追加在悬空
+    tool_calls 后面，OpenAI 兼容接口会因为「assistant tool_calls 没有对应
+    tool 消息」直接报错。
+
+    返回的占位消息由调用方插到新用户消息之前，从而恢复合法的消息顺序。
+    """
     recovered: list[ToolMessage] = []
-    for call in messages[start].tool_calls or []:
+    for call in unanswered_tool_calls(messages):
         call_id = str(call.get("id", ""))
-        if not call_id or call_id in answered:
-            continue
         recovered.append(
             ToolMessage(
                 content=(

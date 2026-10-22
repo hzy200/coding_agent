@@ -10,17 +10,27 @@ import asyncio
 from typing import Any
 
 import pytest
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 
 from coding_agent.config import Settings
 from coding_agent.graph.nodes.steering import (
+    make_steering_cancel_node,
     make_steering_dispatch_node,
     make_steering_final_node,
     make_steering_plan_node,
     make_steering_step_node,
+)
+from coding_agent.graph.routing import (
+    ACT,
+    APPROVE,
+    STEERING_FINAL,
+    SYNTHESIZE,
+    VERIFY,
+    route_after_steering_cancel,
+    route_after_steering_plan,
 )
 from coding_agent.graph.state import AgentState
 from coding_agent.orchestrator.contracts import TaskGraph, TaskSpec, WorkerResult
@@ -80,6 +90,43 @@ def test_controller_cancel_is_non_destructive() -> None:
     assert controller.cancel_requested("t") is True
     assert controller.cancel_requested("t") is True
     assert len(controller.peek("t")) == 1
+
+
+def test_two_controllers_merge_commands_on_the_same_thread(tmp_path) -> None:
+    """两个进程（两个 controller）先后提交，不能后写覆盖先写。"""
+    first = SteeringController(tmp_path)
+    second = SteeringController(tmp_path)
+
+    first.submit("t", SteeringCommand("add", text="甲"))
+    second.submit("t", SteeringCommand("add", text="乙"))
+
+    commands = first.consume("t")
+    assert [command.text for command in commands] == ["甲", "乙"]
+
+
+def test_concurrent_submits_do_not_lose_commands(tmp_path) -> None:
+    import threading
+
+    first = SteeringController(tmp_path)
+    second = SteeringController(tmp_path)
+    barrier = threading.Barrier(2)
+
+    def submit(controller: SteeringController, text: str) -> None:
+        barrier.wait(2)
+        controller.submit("t", SteeringCommand("add", text=text))
+
+    threads = [
+        threading.Thread(target=submit, args=(first, "甲")),
+        threading.Thread(target=submit, args=(second, "乙")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    commands = first.consume("t")
+    assert len(commands) == 2
+    assert {command.text for command in commands} == {"甲", "乙"}
 
 
 def test_add_rejects_write_roles() -> None:
@@ -175,7 +222,129 @@ def test_final_node_consumes_late_cancel_and_ignores_replan() -> None:
     assert out["steering_cancelled"] is True
     actions = [item["action"] for item in out["steering_applied"]]
     assert actions == ["cancel", "replan"]
-    assert "收尾" in out["steering_applied"][1]["detail"]
+    assert "未执行" in out["steering_applied"][1]["detail"]
+
+
+def test_dispatch_node_applies_every_add_in_one_batch() -> None:
+    """同批多条 /add 必须都落地：id 要基于累积后的列表分配。"""
+    controller = SteeringController()
+    controller.submit("", SteeringCommand("add", text="甲", role="explore"))
+    controller.submit("", SteeringCommand("add", text="乙", role="review"))
+    node = make_steering_dispatch_node(controller, _settings())
+
+    out = node(_state(), None)
+
+    assert [task["id"] for task in out["tasks"]] == ["t1", "user-1", "user-2"]
+    assert [task["goal"] for task in out["tasks"][1:]] == ["甲", "乙"]
+    assert out["task_status"]["user-1"] == "pending"
+    assert out["task_status"]["user-2"] == "pending"
+    assert [item["task_id"] for item in out["steering_applied"]] == [
+        "user-1",
+        "user-2",
+    ]
+
+
+def test_step_node_applies_every_add_in_one_batch() -> None:
+    controller = SteeringController()
+    controller.submit("", SteeringCommand("add", text="甲", role="explore"))
+    controller.submit("", SteeringCommand("add", text="乙", role="test"))
+    node = make_steering_step_node(controller, _settings())
+
+    out = node(
+        _state(execution_mode="direct", plan=["做 A"], plan_kinds=["explore"]),
+        None,
+    )
+
+    assert out["plan"] == ["做 A", "甲", "乙"]
+    assert out["plan_kinds"] == ["explore", "explore", "verify"]
+
+
+def test_cancel_wins_over_add_in_the_same_batch() -> None:
+    """cancel 是终态：同批随后的 add 不能再变成 pending 任务。"""
+    controller = SteeringController()
+    controller.submit("", SteeringCommand("cancel"))
+    controller.submit("", SteeringCommand("add", text="取消后追加"))
+    node = make_steering_plan_node(controller, _settings())
+
+    out = node(_state(), None)
+
+    assert out["steering_cancelled"] is True
+    assert "tasks" not in out
+    assert out["task_status"] == {"t1": "cancelled"}
+    assert [item["action"] for item in out["steering_applied"]] == [
+        "cancel",
+        "add",
+    ]
+    assert "未执行" in out["steering_applied"][1]["detail"]
+
+
+def test_dispatch_node_counts_multiple_replans_once() -> None:
+    controller = SteeringController()
+    controller.submit("", SteeringCommand("replan"))
+    controller.submit("", SteeringCommand("replan"))
+    node = make_steering_dispatch_node(controller, _settings(max_replans=2))
+
+    out = node(_state(), None)
+
+    assert out["steering_replan"] is True
+    assert out["steering_replans"] == 1
+    assert "已包含" in out["steering_applied"][1]["detail"]
+
+
+# --------------------------------------------------------------------------
+# direct 模式步内取消：只消费 cancel，其它指令留给语义边界
+# --------------------------------------------------------------------------
+
+def test_steering_cancel_node_consumes_only_cancel_and_keeps_others() -> None:
+    controller = SteeringController()
+    controller.submit("t", SteeringCommand("cancel"))
+    controller.submit("t", SteeringCommand("add", text="稍后执行", role="review"))
+    controller.submit("t", SteeringCommand("replan"))
+    node = make_steering_cancel_node(controller, _settings())
+
+    out = node(_state(), {"configurable": {"thread_id": "t"}})
+
+    assert out["steering_cancelled"] is True
+    assert out["steering_applied"][0]["action"] == "cancel"
+    # add/replan 没有被步内节点吃掉，交给下一个边界
+    assert [item.action for item in controller.peek("t")] == ["add", "replan"]
+
+
+def test_steering_cancel_node_is_a_noop_without_cancel() -> None:
+    controller = SteeringController()
+    controller.submit("t", SteeringCommand("add", text="稍后执行", role="review"))
+    node = make_steering_cancel_node(controller, _settings())
+
+    out = node(_state(), {"configurable": {"thread_id": "t"}})
+
+    assert out == {}
+    assert [item.action for item in controller.peek("t")] == ["add"]
+
+
+def test_route_after_steering_cancel_follows_the_actual_message() -> None:
+    assert route_after_steering_cancel(_state(steering_cancelled=True)) == (
+        STEERING_FINAL
+    )
+    with_tool = _state(
+        messages=[
+            AIMessage(
+                content="",
+                tool_calls=[{"id": "c1", "name": "read_file", "args": {}}],
+            )
+        ]
+    )
+    assert route_after_steering_cancel(with_tool) == APPROVE
+    without_tool = _state(messages=[AIMessage(content="做完了")])
+    assert route_after_steering_cancel(without_tool) == VERIFY
+    tool_result = _state(
+        messages=[ToolMessage(content="ok", tool_call_id="c1")]
+    )
+    assert route_after_steering_cancel(tool_result) == ACT
+
+
+def test_route_after_steering_plan_stops_scheduler_on_cancel() -> None:
+    assert route_after_steering_plan(_state(steering_cancelled=True)) == SYNTHESIZE
+    assert route_after_steering_plan(_state()) == "write_gate"
 
 
 # --------------------------------------------------------------------------

@@ -16,9 +16,10 @@ MARGIN = 10  # planner + respond + 余量
 
 def test_matches_worst_case_topology() -> None:
     rounds, steps, repairs, replans = 12, 5, 3, 2
-    # 一个周期：act×(r+1) + approval_gate×r + tools×r + verify + review
-    per_cycle = (rounds + 1) + 2 * rounds + 2
-    assert per_cycle == 3 * rounds + 3
+    # 一个周期：act×(r+1) + steering_cancel×(2r+1，act 后与 tools 后)
+    # + approval_gate×r + tools×r + verify + review
+    per_cycle = (rounds + 1) + (2 * rounds + 1) + 2 * rounds + 2
+    assert per_cycle == 5 * rounds + 4
     # 一个阶段：修复把工具轮次清零，所以是 (修复次数+1) 个周期 + repair 自身
     phase = (repairs + 1) * per_cycle + repairs
     # 最坏路径是一路失败：每个阶段之后都进一次 replan（含最后一个，它负责放弃），
@@ -65,9 +66,14 @@ def test_event_driven_scheduler_boundaries_are_counted() -> None:
 def test_covers_a_maxed_out_default_plan() -> None:
     """默认上限下的最坏路径不能超过限额 —— 含把每一轮修复与每一次重规划都烧光。"""
     s = Settings(_env_file=None)
-    # 周期里含 review：验证通过后必过一遍。它与 verify **共用**修复预算，
-    # 所以阶段结构不变，只是每周期多一个超步。
-    per_cycle = (s.max_tool_rounds + 1) + 2 * s.max_tool_rounds + 2
+    # 周期里含 review（验证后必过）与 act/tools 后的 steering_cancel。
+    # review 与 verify **共用**修复预算，所以阶段结构不变。
+    per_cycle = (
+        (s.max_tool_rounds + 1)
+        + (2 * s.max_tool_rounds + 1)
+        + 2 * s.max_tool_rounds
+        + 2
+    )
     phase = (s.max_repair_rounds + 1) * per_cycle + s.max_repair_rounds
     # 每步还可能在步进之后多一次「步进微调」（advance + steering_step + replan）
     worst = s.max_plan_steps * ((s.max_replans + 1) * (phase + 1) + 3)

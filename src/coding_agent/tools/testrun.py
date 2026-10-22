@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 
 from coding_agent.config import Settings
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
-from coding_agent.tools.artifacts import ShellArtifact, pack
+from coding_agent.tools.artifacts import CallArtifact, ShellArtifact, pack
 
 RUN_TESTS_TOOL = "run_tests"
 
@@ -323,7 +323,8 @@ def extract_summary(output: str) -> str:
 #
 # 为什么要它：识别不出测试命令 → `not_configured` → 路由判为非 failed → 直接
 # advance，审计还记成 `ok=True`。于是**「没验证」与「验证通过」在账上长得一样**，
-# 在没有测试的项目上整条验证脊柱静默失效（IMPROVEMENT_PLAN 的 P0-2）。
+# 在没有测试的项目上整条验证脊柱静默失效（原 IMPROVEMENT_PLAN 的 P0-2，
+# 去向见 docs/archive/README.md）。
 # 今天 P0-3 的修复又放大了它：`make test` / `npm test` 不再走自动 verify，
 # 这类项目现在必然落进 `not_configured`。
 #
@@ -533,13 +534,26 @@ def run_verification(
     # 测试/构建通常比普通命令长；没显式给超时就用独立的 verify_timeout。
     if timeout is None:
         timeout = int(getattr(sandbox.settings, "verify_timeout", 0) or 0)
-    result = sandbox.run(effective, cwd=root, timeout=timeout or None)
+    capture_limit = int(
+        getattr(sandbox.settings, "max_capture_bytes", 0) or 0
+    )
+    result = sandbox.run(
+        effective,
+        cwd=root,
+        timeout=timeout or None,
+        capture_limit=capture_limit,
+    )
 
     # 默认补跑完整套件抓回归；编排 worker 可以把全量留给合并后的主 agent。
     if scope == "selected" and result.ok and full_after_selected:
         effective = resolved
         scope = "full"
-        result = sandbox.run(effective, cwd=root, timeout=timeout or None)
+        result = sandbox.run(
+            effective,
+            cwd=root,
+            timeout=timeout or None,
+            capture_limit=capture_limit,
+        )
 
     combined = f"{result.stdout}\n{result.stderr}"
     status = "ok" if result.ok else "failed"
@@ -609,15 +623,27 @@ def build_test_tool(settings: Settings, sandbox: WslSandbox):
                 "\n（注意：当前测试命令不支持只跑指定用例，"
                 "已退回运行完整套件。）"
             )
-        artifact = ShellArtifact(
-            command=result.command,
-            ok=result.ok,
-            exit_code=result.exit_code,
-            duration_ms=result.duration_ms,
-            timed_out=result.timed_out,
-            level=2,
-            level_label="L2 变更性",
-        )
+        if result.status in {"not_configured", "skipped"}:
+            # 没跑验证 != 验证通过。`VerifyResult.ok` 为兼容历史调用仍把它们
+            # 当 True，但这里必须如实标成 skipped，事件与审计才不会记成成功。
+            artifact = CallArtifact(
+                tool=RUN_TESTS_TOOL,
+                ok=False,
+                skipped=True,
+                level=2,
+                level_label="L2 变更性",
+                duration_ms=result.duration_ms,
+            )
+        else:
+            artifact = ShellArtifact(
+                command=result.command,
+                ok=result.status == "ok",
+                exit_code=result.exit_code,
+                duration_ms=result.duration_ms,
+                timed_out=result.timed_out,
+                level=2,
+                level_label="L2 变更性",
+            )
         return pack(text, artifact)
 
     return StructuredTool.from_function(

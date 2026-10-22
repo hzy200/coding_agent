@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
@@ -66,3 +68,25 @@ def test_awkward_quoting_survives(require_wsl: WslSandbox) -> None:
     result = require_wsl.run("""printf '%s\\n' "a 'b' c" | tr -d "'" """)
     assert result.ok
     assert "a b c" in result.stdout
+
+
+def test_sixteen_concurrent_commands_all_complete(require_wsl: WslSandbox) -> None:
+    """8 个 WSL 槽位下的 16 并发：只断言正确性，不断言墙钟时间。"""
+    require_wsl.run("true", timeout=60)  # 预热发行版
+
+    def one(index: int):
+        return require_wsl.run(
+            f"sleep 0.05; printf 'soak-{index}'",
+            timeout=30,
+            capture_limit=4_096,
+        )
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(one, range(16)))
+
+    assert len(results) == 16
+    for index, result in enumerate(results):
+        assert result.ok, result.render(500)
+        assert f"soak-{index}" in result.stdout
+        assert result.timed_out is False
+    assert require_wsl.circuit_state() == "closed"

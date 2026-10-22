@@ -6,6 +6,7 @@ from coding_agent.messages import (
     last_human_text,
     recover_dangling_tool_calls,
     text_of,
+    unanswered_tool_calls,
 )
 
 
@@ -94,6 +95,20 @@ def test_recover_only_fills_the_missing_calls() -> None:
     recovered = recover_dangling_tool_calls(messages)
 
     assert [item.tool_call_id for item in recovered] == ["c2"]
+
+
+def test_unanswered_tool_calls_returns_full_call_metadata() -> None:
+    messages = [
+        HumanMessage(content="装依赖"),
+        _dangling(("c1", "c2")),
+        ToolMessage(content="done", tool_call_id="c1"),
+    ]
+
+    pending = unanswered_tool_calls(messages)
+
+    assert [call["id"] for call in pending] == ["c2"]
+    assert pending[0]["name"] == "file_write"
+    assert pending[0]["args"] == {"path": "a.py"}
 
 
 def test_recover_does_not_guess_when_the_tail_is_not_a_tool_batch() -> None:

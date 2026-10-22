@@ -4,7 +4,8 @@
 --------------------
 
 `verify` 跑的是项目自己的测试，它回答的是「行为对不对」。但**测试通过 ≠ 代码正确**
-（`docs/IMPROVEMENT_PLAN.md` P1-6）：调试残留、被改弱的断言、语法坏掉的分支、
+（原 IMPROVEMENT_PLAN 的 P1-6；文件已归档，去向见 `docs/archive/README.md`）：
+调试残留、被改弱的断言、语法坏掉的分支、
 往 `.agent/` 里写东西，这些都可以让测试全绿。所以质量需要第二道关 —— 这就是它。
 
 与 verify 的关系是**串行**，不是替代：verify 失败先走 repair/replan，通过了才轮到
@@ -62,6 +63,7 @@ def make_review_node(
                 sandbox,
                 root,
                 watermark=watermark,
+                lint_blocking=sandbox.settings.review_lint_blocking,
             )
         except Exception as exc:  # noqa: BLE001 - 审查环境异常不拖垮整轮
             # 不推进水位线：下次还能重审这批文件。用 warned 而不是 clean，

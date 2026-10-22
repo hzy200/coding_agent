@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.metadata as metadata
+import ipaddress
 import shlex
 import sys
 import uuid
@@ -28,8 +29,20 @@ from rich.markup import escape
 from rich.table import Table
 from rich.text import Text
 
-from coding_agent.audit import AuditLogger, read_records, read_records_many
-from coding_agent.config import Settings, get_settings, shadowed_env_keys
+from coding_agent.audit import (
+    AuditError,
+    AuditLogger,
+    read_records_many,
+    verify_audit_files,
+)
+from coding_agent.audit.logger import now_iso
+from coding_agent.config import (
+    PRODUCTION_PROFILES,
+    Settings,
+    apply_security_profile,
+    get_settings,
+    shadowed_env_keys,
+)
 from coding_agent.events import (
     ApprovalRequested,
     AssistantToken,
@@ -59,9 +72,10 @@ from coding_agent.llm.deepseek import MissingApiKeyError, build_llm
 from coding_agent.llm.prompts import SYSTEM_PROMPT
 from coding_agent.memory.sessions import SessionIndex, format_table_rows
 from coding_agent.messages import text_of
-from coding_agent.runtime import AgentRuntime
+from coding_agent.runtime import AgentRuntime, submit_steering_command
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
-from coding_agent.steering import SteeringCommand, SteeringController
+from coding_agent.steering import SteeringCommand
+from coding_agent.workspace_lock import WorkspaceLock
 
 
 def _configure_stdio() -> None:
@@ -157,6 +171,42 @@ def _check_langsmith(settings: Settings) -> list[bool]:
     return [_report("LangSmith 追踪", True, detail)]
 
 
+def _check_file_locks(settings: Settings) -> list[bool]:
+    """探测审计目录是否支持 OS 文件锁。
+
+    不支持时不阻断运行：审计/steering/journal 是协调数据，降级为线程互斥
+    仍然可用；但必须让用户知道跨进程保护已经失效。
+    """
+    from coding_agent.filelock import FileLock
+
+    path = settings.resolved_audit_dir / ".doctor.lock"
+    try:
+        lock = FileLock(path)
+        with lock:
+            degraded = lock.degraded
+    except Exception as exc:  # noqa: BLE001 - 自检只报告，不抛栈
+        return [
+            _report(
+                "跨进程文件锁",
+                False,
+                f"{type(exc).__name__}: {exc}",
+            )
+        ]
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+    if degraded:
+        _warn(
+            "跨进程文件锁",
+            "OS 锁不可用：审计/steering/journal 只有线程互斥（多进程保护降级）",
+        )
+        return []
+    return [_report("跨进程文件锁", True, "OS 文件锁可用")]
+
+
 @app.command()
 def doctor() -> None:
     """检查运行环境：Python、依赖、API Key、WSL 沙箱。"""
@@ -192,6 +242,17 @@ def doctor() -> None:
         )
     )
     results.extend(_check_langsmith(settings))
+    results.extend(_check_file_locks(settings))
+    profile = str(settings.security_profile or "local").strip().lower()
+    results.append(
+        _report(
+            "安全 profile",
+            True,
+            f"{profile} · network={'on' if settings.shell_network else 'off'} · "
+            f"repo_instructions={settings.trust_repo_instructions} · "
+            f"repo_memory={settings.trust_repo_memory}",
+        )
+    )
 
     distros = WslSandbox.list_distros()
     has_wsl = settings.wsl_distro in distros
@@ -205,6 +266,11 @@ def doctor() -> None:
 
     if has_wsl:
         sandbox = WslSandbox(settings)
+        workspace = resolve_workspace(settings, sandbox)
+        # bwrap 的 workdir 读 sandbox.settings；配置留空时写回推导值。
+        sandbox.settings = settings.model_copy(
+            update={"wsl_workspace": workspace}
+        )
 
         healthy = sandbox.health(force=True)
         results.append(
@@ -215,15 +281,17 @@ def doctor() -> None:
             )
         )
 
-        probe = sandbox.run("echo agent-sandbox-ok && uname -r")
+        probe = sandbox.run(
+            "echo agent-sandbox-ok && uname -r", cwd=workspace
+        )
         results.append(_report("沙箱执行探针", probe.ok, probe.stdout.strip().replace("\n", " | ")))
 
-        user = sandbox.run("whoami").stdout.strip()
+        user = sandbox.run("whoami", cwd=workspace).stdout.strip()
         results.append(
             _report("沙箱运行用户", user not in {"", "root"}, f"{user or '未知'}（不应为 root）")
         )
 
-        backend = sandbox.run("command -v rg").ok
+        backend = sandbox.run("command -v rg", cwd=workspace).ok
         results.append(
             _report(
                 "检索后端",
@@ -232,8 +300,10 @@ def doctor() -> None:
             )
         )
 
-        workspace = resolve_workspace(settings, sandbox)
-        exists = sandbox.run(f"test -d {shlex.quote(workspace)} && echo yes")
+        exists = sandbox.run(
+            f"test -d {shlex.quote(workspace)} && echo yes",
+            cwd=workspace,
+        )
         found = "yes" in exists.stdout
         results.append(
             _report(
@@ -471,6 +541,9 @@ def _make_renderer() -> Callable[[Event], None]:
             if event.skipped:
                 console.print("[dim]← 已跳过（环境未配置）[/]")
                 return
+            if event.interrupted:
+                console.print("[yellow]← 结果未知（执行中断，未自动重放）[/]")
+                return
             if event.ok:
                 mark, style = "✓", "dim"
             elif event.exit_code is not None:
@@ -530,8 +603,15 @@ def _make_renderer() -> Callable[[Event], None]:
     return render
 
 
+def _is_danger_level(level: str) -> bool:
+    return str(level).strip().startswith("L3")
+
+
 def _ask_approval(requests: list[ApprovalRequested], *, assume_yes: bool) -> dict[str, bool]:
-    """逐条询问审批结果。非交互环境下默认拒绝（fail closed）。"""
+    """逐条询问审批结果。非交互环境下默认拒绝（fail closed）。
+
+    `--yes` 只自动批准 L2；L3（危险）始终要求人工确认。
+    """
     decisions: dict[str, bool] = {}
     for request in requests:
         console.print()
@@ -540,10 +620,12 @@ def _ask_approval(requests: list[ApprovalRequested], *, assume_yes: bool) -> dic
         if request.reason:
             console.print(f"  [dim]理由：{escape(request.reason)}[/]")
 
-        if assume_yes:
+        if assume_yes and not _is_danger_level(request.level):
             console.print("  [green]→ 已按 --yes 自动批准[/]")
             decisions[request.request_id] = True
             continue
+        if assume_yes:
+            console.print("  [yellow]→ L3 危险命令始终需要确认，--yes 不自动批准[/]")
 
         try:
             answer = console.input("  执行？[y/N] ").strip().lower()
@@ -601,16 +683,32 @@ def run(
         help="工作区：/mnt/d/proj、wsl:/home/u/proj 或 D:\\\\proj；Git Bash 建议用 wsl: 前缀",
     ),
     write: bool = typer.Option(False, "--write", help="放开 L1 低风险写命令与文件工具写入"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="对 L2/L3 命令一律自动批准（跳过确认）"),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="自动批准 L2 命令；L3 危险命令始终需要人工确认",
+    ),
     thread_id: str = typer.Option("", "--thread-id", help="复用已有会话 id"),
 ) -> None:
     """走 LangGraph 图执行一轮任务。
 
     默认只读；变更类命令（L2/L3）会先停下来请求你确认。
+    `--yes` 只跳过 L2，L3 危险命令始终逐条确认。
     """
+    settings = apply_security_profile(get_settings())
+    if (
+        str(settings.security_profile or "").strip().lower()
+        in PRODUCTION_PROFILES
+        and (write or yes)
+    ):
+        console.print(
+            "[yellow]production/ops profile 是只读审计档："
+            "--write 与 --yes 不会生效，L2/L3 一律拒绝。[/]"
+        )
     asyncio.run(
         _run_events(
-            get_settings(),
+            settings,
             prompt,
             write,
             thread_id or uuid.uuid4().hex[:8],
@@ -626,24 +724,57 @@ def steer(
     action: str = typer.Argument(..., help="pause / cancel / add / replan"),
     text: str = typer.Option("", "--text", help="add/replan 的说明文本"),
     role: str = typer.Option("explore", "--role", help="add 的角色：explore / test / review"),
+    steering_dir: str = typer.Option(
+        "",
+        "--steering-dir",
+        help=(
+            "与运行中 agent 一致的队列目录；"
+            "留空用 AGENT_STEERING_DIR 或 <当前目录>/.agent/steering"
+        ),
+    ),
+    workspace: str = typer.Option(
+        "",
+        "--workspace",
+        "-C",
+        help="写入审计记录的工作区（应与运行中会话一致；不影响队列目录）",
+    ),
 ) -> None:
     """向正在运行的会话注入一条实时干预指令。
 
-    指令写入 `.agent/steering/`，运行中的进程会在下一个节点边界消费。
-    跨进程 resume 仍请用 TUI 或 Web。
+    指令写入 `--steering-dir`（默认 `.agent/steering/`）并**先落审计**，
+    运行中的进程会在下一个节点边界消费。队列目录必须与运行中的 agent
+    一致：两者从不同目录启动时，请显式传 `--steering-dir` 或设置
+    `AGENT_STEERING_DIR`。跨进程 resume 仍请用 TUI 或 Web。
     """
     try:
         command = SteeringCommand(
-            action=action, text=text, role=role, source="cli"
+            action=action,
+            text=text,
+            role=role,
+            source="cli",
+            ts=now_iso(),
         )
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(code=2) from exc
 
-    controller = SteeringController(get_settings().resolved_steering_dir)
-    controller.submit(thread_id, command)
+    settings = apply_security_profile(get_settings())
+    if steering_dir:
+        settings = settings.model_copy(update={"steering_dir": steering_dir})
+    try:
+        submit_steering_command(
+            settings,
+            thread_id,
+            command,
+            workspace=workspace or None,
+        )
+    except (AuditError, OSError) as exc:
+        console.print(f"[red]提交 steering 失败：{exc}[/red]")
+        raise typer.Exit(code=1) from exc
+
     console.print(
         f"[green]已提交 steering[/green] {action} → {thread_id}；"
+        f"队列目录 {settings.resolved_steering_dir}，"
         "运行中的 agent 会在下一个边界消费。"
     )
 
@@ -951,20 +1082,31 @@ def audit(
     limit: int = typer.Option(20, "--limit", "-n", help="显示最近多少条记录"),
     thread_id: str = typer.Option("", "--thread-id", help="只显示指定会话"),
     path: str = typer.Option("", "--path", help="审计文件路径，默认用配置推导"),
+    verify: bool = typer.Option(False, "--verify", help="验证审计哈希链"),
 ) -> None:
-    """查看审计日志。"""
+    """查看或验证审计日志。"""
     settings = get_settings()
 
     if path:
+        paths = [Path(path)]
         label = str(Path(path))
-        records = read_records(Path(path), thread_id=thread_id or None, limit=limit)
     else:
         # 默认看当天全部片段（轮转后一天可能不止一个文件）
         logger = AuditLogger(settings.resolved_audit_dir)
+        paths = logger.files_today()
         label = f"{settings.resolved_audit_dir}（{datetime.now(UTC):%Y-%m-%d}*.jsonl）"
-        records = read_records_many(
-            logger.files_today(), thread_id=thread_id or None, limit=limit
-        )
+
+    if verify:
+        ok, message = verify_audit_files(paths)
+        style = "green" if ok else "red"
+        console.print(f"[{style}]审计哈希链：{escape(message)}[/]")
+        if not ok:
+            raise typer.Exit(code=1)
+        return
+
+    records = read_records_many(
+        paths, thread_id=thread_id or None, limit=limit
+    )
 
     if not records:
         console.print(f"[dim]没有审计记录：{label}[/]")
@@ -1020,13 +1162,45 @@ def _audit_outcome(record) -> str:
     return ""
 
 
+def _is_loopback_bind(host: str) -> bool:
+    text = str(host or "").strip().lower()
+    if text in {"localhost", "localhost."}:
+        return True
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return False
+
+
 @app.command()
 def web(
     host: str = typer.Option("127.0.0.1", "--host", help="监听地址"),
     port: int = typer.Option(8765, "--port", help="监听端口"),
     workspace: str = _WORKSPACE_OPTION,
+    security_profile: str = typer.Option(
+        "untrusted",
+        "--security-profile",
+        help="local | untrusted（Web 默认 untrusted：bwrap + 禁网 + ask）",
+    ),
+    ssl_keyfile: str = typer.Option("", "--ssl-keyfile", help="TLS 私钥路径"),
+    ssl_certfile: str = typer.Option("", "--ssl-certfile", help="TLS 证书路径"),
+    allow_remote: bool = typer.Option(
+        False, "--allow-remote", help="允许非 loopback 监听（必须配置 token）"
+    ),
+    behind_proxy: bool = typer.Option(
+        False, "--behind-proxy", help="TLS/认证由可信反向代理终止"
+    ),
+    allow_insecure_remote: bool = typer.Option(
+        False,
+        "--allow-insecure-remote",
+        help="显式允许无 TLS 的远程监听（不推荐）",
+    ),
 ) -> None:
-    """启动最小 Web 验证界面（流式对话 + 多会话 + API 联通测试）。"""
+    """启动 Web 界面。
+
+    默认只监听 loopback 且使用不可信仓库 profile。公网部署必须配置
+    `AGENT_WEB_AUTH_TOKENS`，并通过 TLS（本进程或反向代理）。
+    """
     try:
         import uvicorn
     except ImportError as exc:
@@ -1035,12 +1209,94 @@ def web(
         raise typer.Exit(code=2) from exc
 
     from coding_agent.web import create_app
+    from coding_agent.web.auth import AuthConfig
 
     settings = get_settings()
     if workspace:
         settings = settings.model_copy(update={"wsl_workspace": workspace})
-    console.print(f"[dim]打开 http://{host}:{port}（Ctrl+C 停止）[/]")
-    uvicorn.run(create_app(settings), host=host, port=port, log_level="warning")
+    settings = apply_security_profile(
+        settings.model_copy(update={"security_profile": security_profile})
+    )
+
+    try:
+        auth = AuthConfig.from_settings(settings)
+    except ValueError as exc:
+        console.print(f"[red]{escape(str(exc))}[/]")
+        raise typer.Exit(code=2) from exc
+
+    if behind_proxy and not auth.enabled:
+        console.print(
+            "[red]--behind-proxy 必须配置 AGENT_WEB_AUTH_TOKENS。[/] "
+            "否则反向代理转发来的请求会被当成 127.0.0.1 匿名访问。"
+        )
+        raise typer.Exit(code=2)
+
+    loopback = _is_loopback_bind(host)
+    if not loopback:
+        if not allow_remote:
+            console.print(
+                "[red]拒绝监听非 loopback 地址。[/] "
+                "公网部署请显式加 --allow-remote，并配置 AGENT_WEB_AUTH_TOKENS。"
+            )
+            raise typer.Exit(code=2)
+        if not auth.enabled:
+            console.print(
+                "[red]远程监听必须配置 AGENT_WEB_AUTH_TOKENS"
+                "（或 AGENT_WEB_AUTH_TOKENS_FILE）。[/]"
+            )
+            raise typer.Exit(code=2)
+        has_tls = bool(ssl_keyfile and ssl_certfile)
+        if not has_tls and not behind_proxy and not allow_insecure_remote:
+            console.print(
+                "[red]远程监听需要 TLS：[/] 提供 --ssl-keyfile/--ssl-certfile，"
+                "或声明 --behind-proxy，或显式 --allow-insecure-remote。"
+            )
+            raise typer.Exit(code=2)
+
+    if bool(ssl_keyfile) != bool(ssl_certfile):
+        console.print("[red]--ssl-keyfile 与 --ssl-certfile 必须同时提供。[/]")
+        raise typer.Exit(code=2)
+
+    data_root = (
+        Path(settings.web_data_root)
+        if settings.web_data_root
+        else Path.cwd() / ".agent" / "web" / "users"
+    )
+    lock = WorkspaceLock(data_root, f"web-server:{data_root.resolve()}")
+    try:
+        acquired = lock.acquire()
+    except OSError as exc:
+        console.print(f"[red]无法创建 Web 单进程锁：{escape(str(exc))}[/]")
+        raise typer.Exit(code=2) from exc
+    if not acquired:
+        console.print(
+            "[red]已有一个 Web 进程在使用同一数据目录。[/] "
+            "当前 Web 按单进程共享资源池运行；请先停止另一个进程，"
+            "或通过 AGENT_WEB_DATA_ROOT 指定不同目录。"
+        )
+        raise typer.Exit(code=2)
+
+    mode = "Bearer Token" if auth.enabled else "loopback 匿名"
+    console.print(
+        f"[dim]打开 http://{host}:{port}（profile={security_profile}，"
+        f"认证={mode}，Ctrl+C 停止）[/]"
+    )
+    try:
+        uvicorn.run(
+            create_app(
+                settings,
+                auth,
+                hsts=bool(ssl_keyfile or behind_proxy),
+            ),
+            host=host,
+            port=port,
+            log_level="warning",
+            ssl_keyfile=ssl_keyfile or None,
+            ssl_certfile=ssl_certfile or None,
+            proxy_headers=behind_proxy,
+        )
+    finally:
+        lock.release()
 
 
 @app.command()

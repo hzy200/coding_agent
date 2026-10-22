@@ -8,6 +8,7 @@ from coding_agent.graph.nodes.replan import ReplanDecision, make_replan_node
 from coding_agent.graph.nodes.respond import make_respond_node
 from coding_agent.graph.nodes.review import make_review_node
 from coding_agent.graph.nodes.steering import (
+    make_steering_cancel_node,
     make_steering_dispatch_node,
     make_steering_final_node,
     make_steering_plan_node,
@@ -26,6 +27,7 @@ __all__ = [
     "make_replan_node",
     "make_respond_node",
     "make_review_node",
+    "make_steering_cancel_node",
     "make_steering_dispatch_node",
     "make_steering_final_node",
     "make_steering_plan_node",

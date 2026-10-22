@@ -72,6 +72,54 @@ def test_usage_is_accumulated_across_processes(tmp_path) -> None:
     assert usage["cost_usd"] == pytest.approx(0.03)
 
 
+def test_start_run_can_reset_the_previous_run(tmp_path) -> None:
+    """同一 thread 的第二轮 run 不能继承上一轮的用量。"""
+    first, second = _pair(tmp_path)
+
+    first.start_run("thread-1")
+    first.record_usage(
+        "provider-a", input_tokens=100, output_tokens=10, cost_usd=0.01,
+        run_id="thread-1",
+    )
+    first.start_run("thread-1", reset=True)
+
+    usage = second.run_usage("thread-1")
+    assert usage["input_tokens"] == 0
+    assert usage["output_tokens"] == 0
+    assert usage["cost_usd"] == 0.0
+    assert usage["started_at"] > 0
+
+    first.record_usage(
+        "provider-a", input_tokens=7, output_tokens=3, cost_usd=0.001,
+        run_id="thread-1",
+    )
+    assert first.run_usage("thread-1")["input_tokens"] == 7
+
+
+def test_resume_without_reset_keeps_the_usage(tmp_path) -> None:
+    first, _second = _pair(tmp_path)
+    first.start_run("thread-1")
+    first.record_usage(
+        "provider-a", input_tokens=100, output_tokens=10, run_id="thread-1"
+    )
+
+    first.start_run("thread-1")  # resume
+
+    assert first.run_usage("thread-1")["input_tokens"] == 100
+
+
+def test_old_runs_are_pruned(tmp_path, monkeypatch) -> None:
+    import coding_agent.llm.ratelimit as module
+
+    monkeypatch.setattr(module, "MAX_RUNS", 3)
+    coordinator = RateLimitCoordinator(path=tmp_path / "rate.json")
+    for index in range(6):
+        coordinator.start_run(f"run-{index}")
+
+    assert len(coordinator._runs) <= 3
+    assert "run-5" in coordinator._runs
+
+
 def test_run_usage_is_reconciled_per_provider(tmp_path) -> None:
     first, second = _pair(tmp_path)
 

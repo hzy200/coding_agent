@@ -20,6 +20,8 @@ import threading
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from coding_agent.filelock import FileLock, NullLock
+
 # resume 不走队列：它必须把挂起的图唤醒（Command(resume=...)），
 # 放进队列只会在恢复之后才被消费，语义不对。
 STEERING_ACTIONS = frozenset({"pause", "cancel", "add", "replan"})
@@ -58,6 +60,8 @@ class SteeringController:
         self._paused: set[str] = set()
         self._directory = Path(directory) if directory else None
         self._loaded: set[str] = set()
+        # 每 thread 最近一次看到的文件状态；未变化时跳过整文件读取。
+        self._disk_state: dict[str, tuple[int, int] | None] = {}
         self._lock = threading.Lock()
         if self._directory is not None:
             self._directory.mkdir(parents=True, exist_ok=True)
@@ -69,15 +73,40 @@ class SteeringController:
         digest = hashlib.sha1(thread_id.encode("utf-8")).hexdigest()[:24]
         return self._directory / f"{digest}.json"
 
-    def _ensure_loaded(self, thread_id: str) -> None:
+    @staticmethod
+    def _file_state(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
+
+    def _file_lock(self, thread_id: str) -> FileLock | NullLock:
+        if self._directory is None:
+            return NullLock()
+        path = self._path(thread_id)
+        return FileLock(path.with_suffix(path.suffix + ".lock"))
+
+    def _ensure_loaded(self, thread_id: str, *, force: bool = False) -> None:
         """从磁盘刷新该 thread 的状态。
 
-        每次公开操作都重新读：这样另一个进程（例如 `agent steer`）写入的
-        指令能被正在运行的 agent 在下一个边界看到；文件很小，成本可忽略。
+        文件内容变化后重新读：这样另一个进程（例如 `agent steer`）写入的
+        指令能被正在运行的 agent 在下一个边界看到。未变化时只做一次 stat；
+        scheduler 的取消轮询会高频调用这里，整文件读取没有必要。
+
+        `force=True` 用于写操作：拿到文件锁后必须重读，才能把别的进程刚写的
+        指令合并进来，而不是用本地旧快照覆盖掉它。
         """
         if self._directory is None:
             return
         path = self._path(thread_id)
+        state = self._file_state(path)
+        if (
+            not force
+            and thread_id in self._loaded
+            and self._disk_state.get(thread_id) == state
+        ):
+            return
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -86,12 +115,15 @@ class SteeringController:
                 self._queues.pop(thread_id, None)
                 self._paused.discard(thread_id)
             self._loaded.add(thread_id)
+            self._disk_state[thread_id] = None
             return
         except (OSError, json.JSONDecodeError):
             self._loaded.add(thread_id)
+            self._disk_state[thread_id] = state
             return
 
         self._loaded.add(thread_id)
+        self._disk_state[thread_id] = state
         if str(payload.get("thread_id", "")) != thread_id:
             return
         commands: list[SteeringCommand] = []
@@ -120,6 +152,7 @@ class SteeringController:
                 path.unlink()
             except FileNotFoundError:
                 pass
+            self._disk_state[thread_id] = None
             return
         payload = {
             "thread_id": thread_id,
@@ -132,6 +165,7 @@ class SteeringController:
                 json.dumps(payload, ensure_ascii=False), encoding="utf-8"
             )
             os.replace(temp, path)
+            self._disk_state[thread_id] = self._file_state(path)
         except OSError:
             # 持久化失败不能拖垮当前进程；内存队列仍然可用。
             try:
@@ -142,8 +176,8 @@ class SteeringController:
     # ---------------- 队列 ----------------
 
     def submit(self, thread_id: str, command: SteeringCommand) -> None:
-        with self._lock:
-            self._ensure_loaded(thread_id)
+        with self._lock, self._file_lock(thread_id):
+            self._ensure_loaded(thread_id, force=True)
             self._queues.setdefault(thread_id, []).append(command)
             self._persist(thread_id)
 
@@ -155,8 +189,8 @@ class SteeringController:
 
     def consume(self, thread_id: str) -> list[SteeringCommand]:
         """取走当前全部指令。节点恢复后重跑时只会看到新指令。"""
-        with self._lock:
-            self._ensure_loaded(thread_id)
+        with self._lock, self._file_lock(thread_id):
+            self._ensure_loaded(thread_id, force=True)
             commands = self._queues.pop(thread_id, [])
             self._persist(thread_id)
             return commands
@@ -169,8 +203,8 @@ class SteeringController:
         """
         if not commands:
             return
-        with self._lock:
-            self._ensure_loaded(thread_id)
+        with self._lock, self._file_lock(thread_id):
+            self._ensure_loaded(thread_id, force=True)
             queue = self._queues.setdefault(thread_id, [])
             queue[:0] = list(commands)
             self._persist(thread_id)
@@ -182,14 +216,14 @@ class SteeringController:
         )
 
     def mark_paused(self, thread_id: str) -> None:
-        with self._lock:
-            self._ensure_loaded(thread_id)
+        with self._lock, self._file_lock(thread_id):
+            self._ensure_loaded(thread_id, force=True)
             self._paused.add(thread_id)
             self._persist(thread_id)
 
     def clear_paused(self, thread_id: str) -> None:
-        with self._lock:
-            self._ensure_loaded(thread_id)
+        with self._lock, self._file_lock(thread_id):
+            self._ensure_loaded(thread_id, force=True)
             self._paused.discard(thread_id)
             self._persist(thread_id)
 
@@ -200,7 +234,7 @@ class SteeringController:
 
     def clear(self, thread_id: str) -> None:
         """一轮结束（或全新 run 开始）时清空。"""
-        with self._lock:
+        with self._lock, self._file_lock(thread_id):
             self._queues.pop(thread_id, None)
             self._paused.discard(thread_id)
             self._loaded.add(thread_id)

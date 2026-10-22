@@ -238,8 +238,14 @@ def collect_python_sources(
     *,
     max_files: int = 2_000,
     max_bytes: int = 1_000_000,
+    max_total_bytes: int = 32_000_000,
 ) -> dict[str, str]:
-    """一次沙箱调用收集 .py 源码；失败返回空 dict。"""
+    """一次沙箱调用收集 .py 源码；失败返回空 dict。
+
+    `max_total_bytes` 是硬上限：源码内容会整体经 stdout 回到宿主内存，超大
+    仓库若只按单文件限制，仍可能物化出数百 MB。达到上限时返回部分索引，
+    影响分析会偏保守，但不会把进程拖垮。
+    """
     ignored = json.dumps(sorted(_IGNORED_DIRS))
     script = f"""\
 python3 - <<'__AGENT_INDEX__'
@@ -247,6 +253,7 @@ import json, os
 ignored = set({ignored})
 out = {{}}
 count = 0
+total = 0
 for base, dirs, files in os.walk('.'):
     dirs[:] = [d for d in dirs if d not in ignored]
     for name in files:
@@ -255,16 +262,20 @@ for base, dirs, files in os.walk('.'):
         path = os.path.relpath(os.path.join(base, name), '.')
         path = path.replace(os.sep, '/')
         try:
-            if os.path.getsize(path) > {int(max_bytes)}:
+            size = os.path.getsize(path)
+            if size > {int(max_bytes)}:
                 continue
+            if total + size > {int(max_total_bytes)}:
+                break
             with open(path, 'r', encoding='utf-8', errors='replace') as fh:
                 out[path] = fh.read()
         except OSError:
             continue
+        total += size
         count += 1
         if count >= {int(max_files)}:
             break
-    if count >= {int(max_files)}:
+    if count >= {int(max_files)} or total >= {int(max_total_bytes)}:
         break
 print('AGENT_INDEX_JSON:' + json.dumps(out))
 __AGENT_INDEX__

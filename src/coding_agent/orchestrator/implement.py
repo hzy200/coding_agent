@@ -47,7 +47,6 @@ from coding_agent.sandbox.wsl_exec import WslSandbox
 from coding_agent.tools.artifacts import unpack
 from coding_agent.tools.files import (
     COPY_TOOL_NAME,
-    DELETE_TOOL_NAME,
     EDIT_MANY_TOOL_NAME,
     EDIT_TOOL_NAME,
     LIST_TOOL_NAME,
@@ -60,6 +59,9 @@ from coding_agent.tools.registry import build_tools
 from coding_agent.tools.search import FIND_FILES, SEARCH_CODE
 from coding_agent.tools.testrun import related_test_paths, run_verification
 
+# 注意：**不含 file_delete**。删除在主管道路径是 L2（逐条确认），而 worker
+# 直接调用工具、不经过 approval_gate；把它留给主 agent，避免并发写 worker
+# 成为无审批的删除通道。移动/覆盖仍有快照兜底。
 IMPLEMENT_TOOL_NAMES = frozenset(
     {
         READ_TOOL_NAME,
@@ -68,7 +70,6 @@ IMPLEMENT_TOOL_NAMES = frozenset(
         EDIT_MANY_TOOL_NAME,
         MOVE_TOOL_NAME,
         COPY_TOOL_NAME,
-        DELETE_TOOL_NAME,
         MKDIR_TOOL_NAME,
         LIST_TOOL_NAME,
         SEARCH_CODE,

@@ -10,6 +10,16 @@ from coding_agent.config import Settings
 from coding_agent.memory.longterm import LongTermMemory
 
 
+def test_memory_state_root_can_be_outside_the_workspace() -> None:
+    """不可信仓库下记忆放在仓库之外，路径必须使用 state_root。"""
+    memory = LongTermMemory(
+        object(), "/repo", state_root="/home/tester/agent-memory"
+    )  # type: ignore[arg-type]
+
+    assert memory.path == "/home/tester/agent-memory/.agent/memory.md"
+    assert memory.meta_path == "/home/tester/agent-memory/.agent/memory.meta.json"
+
+
 class _FakeFs:
     """只实现 LongTermMemory 用到的读写接口。"""
 

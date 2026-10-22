@@ -21,7 +21,12 @@ class _FakeSandbox:
         self.timeouts: list[int | None] = []
 
     def run(
-        self, command: str, *, cwd: str | None = None, timeout: int | None = None
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: int | None = None,
+        capture_limit: int | None = None,
     ) -> ExecResult:
         self.runs += 1
         self.timeouts.append(timeout)
@@ -157,6 +162,53 @@ def test_a_verify_step_runs_without_new_changes() -> None:
     assert sandbox.runs >= 1
 
 
+def test_pending_verification_runs_even_without_dirty() -> None:
+    """编排合并过补丁：主 agent 只读也必须验证合并结果。"""
+    sandbox = _FakeSandbox()
+    node = make_verify_node(sandbox)  # type: ignore[arg-type]
+    out = node(
+        {
+            "dirty": False,
+            "pending_verification": True,
+            "plan": ["收尾"],
+            "plan_kinds": ["explore"],
+            "step_idx": 0,
+        },
+        None,
+    )
+    assert out["verification"]["status"] == "not_configured"
+    assert out["pending_verification"] is False
+    assert sandbox.runs >= 1
+
+
+def test_pending_verification_waits_for_the_final_step() -> None:
+    """非最终步仍应延后全量验证，但 pending 要留到最终步。"""
+    sandbox = _FakeSandbox()
+    node = make_verify_node(sandbox)  # type: ignore[arg-type]
+    out = node(
+        {
+            "dirty": False,
+            "pending_verification": True,
+            "plan": ["实现1", "实现2"],
+            "plan_kinds": ["implement", "implement"],
+            "step_idx": 0,
+        },
+        None,
+    )
+    assert out == {"verification": {}}
+    assert sandbox.runs == 0
+
+
+def test_disabling_verification_clears_pending() -> None:
+    sandbox = _FakeSandbox()
+    sandbox.settings = Settings(
+        _env_file=None, wsl_workspace="/ws", verify_enabled=False
+    )
+    node = make_verify_node(sandbox)  # type: ignore[arg-type]
+    out = node({"dirty": False, "pending_verification": True}, None)
+    assert out == {"verification": {}, "pending_verification": False}
+
+
 def test_verify_only_final_can_be_disabled() -> None:
     sandbox = _FakeSandbox()
     sandbox.settings = Settings(
@@ -190,7 +242,12 @@ class _ScriptedSandbox(_FakeSandbox):
         self.commands: list[str] = []
 
     def run(
-        self, command: str, *, cwd: str | None = None, timeout: int | None = None
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: int | None = None,
+        capture_limit: int | None = None,
     ) -> ExecResult:
         self.commands.append(command)
         if command.startswith("for f in"):

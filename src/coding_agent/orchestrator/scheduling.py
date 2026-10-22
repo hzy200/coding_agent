@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 # 角色默认优先级（越大越先启动）。任务可用 `priority` 覆盖。
@@ -129,6 +129,37 @@ class RateLimitState:
     def wait_remaining(self, now: float | None = None) -> float:
         now = time.monotonic() if now is None else now
         return max(0.0, self.not_before - now)
+
+    def snapshot(self) -> dict[str, float]:
+        """可写入 checkpoint 的状态。
+
+        `not_before` 内部用 monotonic；跨 scheduler 节点调用（甚至跨进程
+        resume）必须换成墙钟，否则新进程里的 monotonic 基准没有意义。
+        """
+        remaining = max(0.0, self.not_before - time.monotonic())
+        return {
+            "current_limit": float(self.current_limit),
+            "streak": float(self.streak),
+            "not_before_wall": time.time() + remaining,
+        }
+
+    def restore(self, data: Mapping[str, Any] | None) -> None:
+        if not isinstance(data, Mapping):
+            return
+        try:
+            limit = int(data.get("current_limit", self.max_limit))
+        except (TypeError, ValueError):
+            limit = self.max_limit
+        self.current_limit = max(1, min(self.max_limit, limit))
+        try:
+            self.streak = max(0, int(data.get("streak", 0)))
+        except (TypeError, ValueError):
+            self.streak = 0
+        try:
+            wall = float(data.get("not_before_wall", 0.0))
+        except (TypeError, ValueError):
+            wall = 0.0
+        self.not_before = time.monotonic() + max(0.0, wall - time.time())
 
 
 class TokenBudget:

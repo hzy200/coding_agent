@@ -28,7 +28,9 @@ from coding_agent.graph.routing import (
     STEERING_DISPATCH,
     STEERING_PLAN,
     SYNTHESIZE,
+    route_after_steering_plan,
 )
+from coding_agent.graph.routing import WRITE_GATE as WRITE_GATE_NODE
 from coding_agent.orchestrator.fanin import make_fan_in_node
 from coding_agent.orchestrator.plan import make_plan_tasks_node
 from coding_agent.orchestrator.routing import route_after_select
@@ -121,7 +123,13 @@ def build_orchestrator_subgraph(
         {PLAN_TASKS: PLAN_TASKS, "planner": END},
     )
     graph.add_edge(PLAN_TASKS, STEERING_PLAN)
-    graph.add_edge(STEERING_PLAN, WRITE_GATE)
+    # 取消必须在这里截断：cancel 已被 steering_plan 消费，若继续进 scheduler，
+    # 同批追加的任务仍会被派发（scheduler 只轮询队列，看不到已消费的 cancel）。
+    graph.add_conditional_edges(
+        STEERING_PLAN,
+        route_after_steering_plan,
+        {WRITE_GATE_NODE: WRITE_GATE, SYNTHESIZE: SYNTHESIZE},
+    )
     graph.add_edge(WRITE_GATE, SCHEDULER)
     graph.add_edge(SCHEDULER, STEERING_DISPATCH)
     graph.add_conditional_edges(

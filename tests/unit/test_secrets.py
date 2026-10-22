@@ -32,6 +32,36 @@ def test_redacts_assigned_password_but_keeps_key_name() -> None:
     assert "password" in redacted
 
 
+def test_redacts_database_url_credentials() -> None:
+    text = "DATABASE_URL=postgres://app:hunter2hunter2@db.internal:5432/app"
+
+    redacted = redact_secrets(text)
+
+    assert "hunter2hunter2" not in redacted
+    assert "postgres://app:" in redacted
+    assert "@db.internal" in redacted
+
+
+def test_does_not_redact_environment_references() -> None:
+    """引用不是密钥：把 settings.api_key / ${VAR} 抹掉会破坏正常代码阅读。"""
+    text = (
+        "api_key = settings.api_key\n"
+        "password = os.environ['PASSWORD']\n"
+        "token = ${DB_TOKEN}\n"
+    )
+
+    assert redact_secrets(text) == text
+
+
+def test_redacts_slack_and_google_tokens() -> None:
+    text = "xoxb-1234567890-abcdefghij AIza" + "a" * 35
+
+    redacted = redact_secrets(text)
+
+    assert "xoxb-" not in redacted
+    assert "AIza" not in redacted
+
+
 def test_audit_args_are_redacted_and_truncated() -> None:
     args = {
         "content": 'token = "abcdefgh12345678"\n' + "x" * 1_000,

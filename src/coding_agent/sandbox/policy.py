@@ -20,6 +20,11 @@ from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
 
+from coding_agent.security.read_policy import (
+    is_protected_read_path,
+    might_reference_secret,
+)
+
 
 class CommandLevel(IntEnum):
     """命令风险等级，数值越大越危险。"""
@@ -83,11 +88,16 @@ class SessionPolicy:
 
     `allow_rules` 是显式配置的持久放行规则（`tool:glob`）。它只覆盖
     **L2 询问**，不能绕过 L3/DANGER 或 `approval_mode=deny`。
+
+    `approval_mode=approve` 只自动放行 L2；**L3 永远要求人工确认**。危险命令
+    的唯一硬闸不能交给一个通用的“自动批准”开关。
     """
 
     allow_write: bool = False
     approval_mode: str = APPROVAL_ASK
     allow_rules: frozenset[str] = frozenset()
+    # 会话配置里追加的秘密 glob；只影响 shell 命令的“显式引用升级”判断。
+    read_deny_globs: str = ""
 
     def decide(self, level: CommandLevel) -> str:
         if level <= CommandLevel.READ:
@@ -97,7 +107,12 @@ class SessionPolicy:
             # L1 由 --write 一次性授权，不逐条询问
             return AUTO if self.allow_write else DENY
 
-        # L2/L3
+        # L3 是唯一不可被“自动批准”覆盖的等级：即使 approval_mode=approve，
+        # 也要挂起等人工确认（deny 模式仍然直接拒绝）。
+        if level >= CommandLevel.DANGER:
+            return DENY if self.approval_mode == APPROVAL_DENY else ASK
+
+        # L2
         if self.approval_mode == APPROVAL_APPROVE:
             return AUTO
         if self.approval_mode == APPROVAL_DENY:
@@ -147,8 +162,18 @@ READ_ONLY_COMMANDS = frozenset({
     "file", "stat", "du", "df", "tree", "which", "whoami", "id", "date",
     "sort", "uniq", "cut", "tr", "basename", "dirname", "realpath", "readlink",
     "diff", "cmp", "comm", "jq", "yq", "xxd", "od", "md5sum", "sha256sum",
-    "printenv", "uname", "hostname", "nproc", "free", "type", "command",
+    "uname", "hostname", "nproc", "free", "type", "command",
 })
+
+# 直接输出进程环境：即使子进程已用 `env -i` 清空，也把它当作必须人工确认的
+# 敏感操作（approve 模式也不能自动放行）—— 环境里可能有 CI 注入的凭据。
+SENSITIVE_OUTPUT_COMMANDS = frozenset({"printenv", "env"})
+
+# 递归检索里出现这些词，很可能是在找凭据/密码：升级到人工确认，
+# 引导模型改用会过滤秘密文件的 search_code。
+_SECRET_SEARCH_RE = re.compile(
+    r"(?i)password|passwd|secret|token|api[_-]?key|credential|private[_-]?key"
+)
 
 # 故意不含 cp / ln / mv：它们能覆盖或替换文件，会绕过文件工具的
 # 精确替换、diff 与写前备份。这类操作走 file_* 工具，或降级为 L2 等人工确认。
@@ -268,6 +293,15 @@ def _classify_segment(segment: str) -> Verdict:
 
     if name == "git":
         return _classify_git(sub, segment)
+
+    # 环境输出即使已经 `env -i` 也按危险处理：CI 注入的凭据、后续新增的
+    # 环境变量都不该由模型自行 dump。L3 永远要求人工确认。
+    if name in SENSITIVE_OUTPUT_COMMANDS:
+        return Verdict(
+            CommandLevel.DANGER,
+            f"{name} 可能输出进程环境变量（含凭据）",
+            segment,
+        )
 
     if name in READ_ONLY_COMMANDS:
         return Verdict(CommandLevel.READ, f"{name} 属于只读命令", segment)
@@ -450,7 +484,9 @@ def _ansi_quoted_path(token: str) -> str | None:
     return token if _is_external_path_token(body) else None
 
 
-def _escalate_auto_command(command: str) -> Verdict | None:
+def _escalate_auto_command(
+    command: str, read_deny_globs: str = ""
+) -> Verdict | None:
     """对会直接放行的命令做越界检查；命中返回升级后的 Verdict，否则 None。"""
     if _HIDDEN_EXPANSION_RE.search(command):
         return Verdict(
@@ -476,6 +512,17 @@ def _escalate_auto_command(command: str) -> Verdict | None:
                 f"git add 整树暂存可能把 {_AGENT_STATE_DIR}/ 纳入，需要人工确认",
                 segment,
             )
+        # 递归检索的秘密词最容易把 .env / 凭据文件内容整段带进上下文。
+        # 专用 search_code 会过滤秘密文件；这里引导模型改用它。
+        if name in {"grep", "rg", "ag", "ack"} and _SECRET_SEARCH_RE.search(
+            segment
+        ):
+            return Verdict(
+                CommandLevel.MUTATE,
+                "检索式疑似指向凭据/密码，可能命中秘密文件；"
+                "请改用会过滤秘密文件的 search_code（需要确认才能继续）",
+                segment,
+            )
         for word in words[1:]:
             # 选项值也可能带路径，例如 --file=/etc/shadow
             candidate = word.split("=", 1)[1] if word.startswith("-") and "=" in word else word
@@ -493,6 +540,20 @@ def _escalate_auto_command(command: str) -> Verdict | None:
                     f"引用了 agent 内部目录 {_AGENT_STATE_DIR}/（备份与审计），需要人工确认",
                     segment,
                 )
+            if is_protected_read_path(candidate, read_deny_globs):
+                return Verdict(
+                    CommandLevel.MUTATE,
+                    f"只读命令引用了受保护的秘密文件：{candidate}（需要确认）",
+                    segment,
+                )
+            # `cat .env*` / `cat *.key` 在 shell 展开前不会精确命中某个 glob，
+            # 但前缀/扩展名已经暴露了意图，按保守方向升级。
+            if might_reference_secret(candidate):
+                return Verdict(
+                    CommandLevel.MUTATE,
+                    f"只读命令的参数疑似指向秘密文件：{candidate}（需要确认）",
+                    segment,
+                )
             if _is_external_path_token(candidate):
                 return Verdict(
                     CommandLevel.MUTATE,
@@ -502,8 +563,12 @@ def _escalate_auto_command(command: str) -> Verdict | None:
     return None
 
 
-def classify(command: str) -> Verdict:
-    """对整条命令给出风险判定，取所有片段中的最高级别。"""
+def classify(command: str, *, read_deny_globs: str = "") -> Verdict:
+    """对整条命令给出风险判定，取所有片段中的最高级别。
+
+    `read_deny_globs` 是会话配置追加的秘密文件 glob；只影响参数升级判断，
+    不影响命令名分级。
+    """
     if not command or not command.strip():
         return Verdict(CommandLevel.READ, "空命令")
 
@@ -528,7 +593,7 @@ def classify(command: str) -> Verdict:
             return worst
 
     # 本来会直接放行的命令，再看参数是否越界（命令名只读 ≠ 参数安全）
-    escalated = _escalate_auto_command(command)
+    escalated = _escalate_auto_command(command, read_deny_globs)
     if escalated is not None and escalated.level > worst.level:
         return escalated
     return worst

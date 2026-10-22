@@ -313,6 +313,25 @@ def test_planner_uses_model_steps() -> None:
     assert out["dirty"] is False
 
 
+def test_planner_keeps_orchestrator_merges_visible_to_verify_and_review() -> None:
+    """编排合并过补丁时，主 agent 的第一步必须带上 dirty。
+
+    否则 planner 一重置，verify/review 都会因 dirty=False 短路，合并进来的
+    代码就绕过了两道质量关。
+    """
+    structured = _FakeStructured(TaskPlan(steps=["收尾"]))
+    node = _sync(make_planner_node(_FakeStructuredLLM(structured), max_steps=5, allow_write=False))
+
+    out = node(
+        {**_plan_state(), "run_dirty": True, "pending_verification": True},
+        None,
+    )
+
+    assert out["dirty"] is True
+    # pending 标志由 verify 消费，planner 不能顺手清掉。
+    assert "pending_verification" not in out
+
+
 def test_planner_injects_the_worker_context() -> None:
     structured = _FakeStructured(TaskPlan(steps=["实现"]))
     node = _sync(

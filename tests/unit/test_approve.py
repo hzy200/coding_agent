@@ -50,7 +50,8 @@ def _run(coro) -> None:
         (False, APPROVAL_ASK, CommandLevel.DANGER, ASK),
         (True, APPROVAL_ASK, CommandLevel.DANGER, ASK),
         (False, APPROVAL_APPROVE, CommandLevel.MUTATE, AUTO),
-        (False, APPROVAL_APPROVE, CommandLevel.DANGER, AUTO),
+        # L3 的唯一硬闸不能被通用「自动批准」覆盖。
+        (False, APPROVAL_APPROVE, CommandLevel.DANGER, ASK),
         (False, APPROVAL_DENY, CommandLevel.MUTATE, DENY),
         (True, APPROVAL_DENY, CommandLevel.DANGER, DENY),
     ],

@@ -74,9 +74,15 @@ def discover_instruction_paths(
 
 
 def load_project_instructions(
-    sandbox: WslSandbox, root: str
+    sandbox: WslSandbox, root: str, *, trusted: bool = True
 ) -> str:
-    """读取并合并分层指令；没有文件时返回空串。"""
+    """读取并合并分层指令；没有文件时返回空串。
+
+    `trusted=False` 用于不可信仓库：AGENTS.md/CLAUDE.md 是**仓库内容**，
+    不能当成宿主指令注入，否则提示注入可以直接改写 agent 行为。
+    """
+    if not trusted:
+        return ""
     fs = SandboxFs(sandbox, root)
     sections: list[str] = []
     total = 0

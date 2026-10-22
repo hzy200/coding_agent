@@ -119,6 +119,8 @@ class ToolCallFinished(Event):
     rejected: bool = False
     # 环境不具备该能力（例如未配置 LSP）：不是成功，也不该计入失败率。
     skipped: bool = False
+    # 有副作用的调用执行到一半、结果未知：既不是成功也不是普通失败。
+    interrupted: bool = False
     # auto / approved / denied / rejected —— 审计据此区分「谁拒的」
     decision: str = "auto"
     exit_code: int | None = None

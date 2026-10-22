@@ -86,10 +86,18 @@ _MUTATE_TOOLS = frozenset(
 )
 
 
-def tool_level(name: str, args: dict[str, Any]) -> _Level:
-    """各工具对应的风险等级；新工具必须在这里登记，否则 fail-closed 按最危险处理。"""
+def tool_level(
+    name: str, args: dict[str, Any], read_deny_globs: str = ""
+) -> _Level:
+    """各工具对应的风险等级；新工具必须在这里登记，否则 fail-closed 按最危险处理。
+
+    `read_deny_globs` 由会话策略传入，供 shell 命令识别配置追加的秘密 glob。
+    """
     if name == SHELL_TOOL_NAME:
-        return _classify(str(args.get("command", ""))).level
+        return _classify(
+            str(args.get("command", "")),
+            read_deny_globs=read_deny_globs,
+        ).level
     if name in _READ_TOOLS:
         return _Level.READ
     if name in _WRITE_TOOLS:
@@ -137,7 +145,7 @@ def make_approval_gate_node(
         for call in calls:
             name = str(call.get("name", ""))
             args = dict(call.get("args") or {})
-            level = tool_level(name, args)
+            level = tool_level(name, args, policy.read_deny_globs)
             decision = policy.decide_call(name, args, level)
 
             if decision == ASK:

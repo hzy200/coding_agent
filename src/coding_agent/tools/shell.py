@@ -16,9 +16,11 @@ from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, Field
 
 from coding_agent.config import Settings
+from coding_agent.sandbox.fs import SandboxFs, SandboxFsError
 from coding_agent.sandbox.pathguard import SandboxPathError, ensure_inside
 from coding_agent.sandbox.policy import CommandLevel, classify
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
+from coding_agent.security.secrets import redact_secrets
 from coding_agent.tools.artifacts import ShellArtifact, pack
 
 SHELL_TOOL_NAME = "shell_exec"
@@ -55,11 +57,20 @@ def build_shell_tool(
 
     def _run(command: str, reason: str, cwd: str | None = None) -> str:
         # 等级只用于回报（前端着色、审计记账），不在这里拦
-        level = classify(command).level
+        level = classify(
+            command, read_deny_globs=settings.read_deny_globs
+        ).level
 
         try:
             workdir = ensure_inside(cwd, workspace) if cwd else workspace
-        except SandboxPathError as exc:
+            if cwd:
+                # 词法校验管不住符号链接：`cwd` 指向工作区外的链接时，
+                # `cd` 会跟过去。显式 cwd 的场景不多，值得多付一次 stat。
+                _lexical, info = SandboxFs(sandbox, workspace).probe(cwd)
+                if not info.exists:
+                    raise SandboxPathError(f"工作目录不存在：{cwd}")
+                workdir = _lexical
+        except (SandboxPathError, SandboxFsError) as exc:
             artifact = ShellArtifact(
                 command=command,
                 ok=False,
@@ -70,13 +81,23 @@ def build_shell_tool(
             )
             return pack(f"工作目录非法：{exc}", artifact)
 
-        result = sandbox.run(command, cwd=workdir)
+        result = sandbox.run(
+            command,
+            cwd=workdir,
+            capture_limit=settings.max_capture_bytes,
+        )
         # shell 是读缓存的盲区：它绕过 SandboxFs，宿主无法知道改了哪些文件。
         # 只要不是纯只读命令，就保守地清空整份 run 级缓存，避免后续
         # file_read 读到 shell 修改前的旧内容。
         if read_cache is not None and level > CommandLevel.READ:
             read_cache.clear()
-        text = f"[{level.label}] {reason}\n{result.render(settings.max_output_chars)}"
+        # 输出会直接进入模型上下文；即使命令本身没引用秘密路径，也可能
+        # （例如 `tail -n +1 log`、构建日志、`docker inspect`）带出凭据。
+        # 这里在回灌前统一做一次 best-effort 脱敏。
+        rendered = redact_secrets(
+            result.render(settings.max_output_chars)
+        )
+        text = f"[{level.label}] {reason}\n{rendered}"
         artifact = ShellArtifact(
             command=command,
             ok=result.ok,

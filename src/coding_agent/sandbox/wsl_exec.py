@@ -6,6 +6,8 @@ Windows 命令行层的引号/转义规则，命令内容不会被二次解释�
 
 from __future__ import annotations
 
+import os
+import re
 import shlex
 import subprocess
 import threading
@@ -28,6 +30,33 @@ from coding_agent.sandbox.pathguard import normalize_root
 OUTER_TIMEOUT_GRACE = 10
 # kill() 之后回收输出最多再等这么久：清理不该比一次命令本身更久
 KILL_GRACE = 5
+
+# `_argv()` 用 `env -i` 清空了宿主环境，HOME 也随之丢失。登录 bash 在
+# 非交互模式下不会自动从 passwd 补 HOME，所以每次执行前补一次（只补一次，
+# 常驻会话后续脚本会继承）。刻意不让 bash 在启动时读到 HOME，避免它
+# source `~/.bash_profile` 再把宿主凭据导回来。
+# 允许显式放行的构建变量名；即使误配，这些名字也不会带出去。
+_SENSITIVE_ENV_NAME = re.compile(
+    r"(?i)(?:^|_)(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL"
+    r"|AUTH|COOKIE|SESSION)(?:_|$)"
+)
+_ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+_ENV_PREAMBLE = """\
+if [ -z "${HOME:-}" ]; then
+  HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)"
+fi
+if [ -z "${HOME:-}" ]; then
+  HOME="$(eval echo "~$(id -un)" 2>/dev/null)"
+fi
+[ -n "${HOME:-}" ] && export HOME
+"""
+
+
+def _with_env_preamble(script: str) -> str:
+    if script.startswith(_ENV_PREAMBLE):
+        return script
+    return _ENV_PREAMBLE + script
 
 _T = TypeVar("_T")
 
@@ -149,6 +178,121 @@ def _parse_session_output(
     )
 
 
+def _emit_function(capture_limit: int) -> str:
+    """生成常驻会话里回传 stdout/stderr 的 bash 函数。
+
+    `capture_limit<=0` 保持旧行为（完整 cat）；否则只回传 head+tail，
+    中间用一行省略标记代替。这样大输出不会先进入宿主内存再被截断。
+    """
+    if capture_limit <= 0:
+        return "__agent_emit() { printf '\\n%s\\n' \"$2\"; cat \"$1\"; }"
+    half = max(1, capture_limit // 2)
+    return (
+        "__agent_emit() {\n"
+        "  local f=\"$1\"; local marker=\"$2\"; local size\n"
+        "  printf '\\n%s\\n' \"$marker\"\n"
+        "  size=$(wc -c < \"$f\" | tr -d ' ')\n"
+        f"  if [ \"$size\" -le {capture_limit} ]; then cat \"$f\"; else\n"
+        f"    head -c {half} \"$f\"\n"
+        f"    printf '\\n...<省略 %s 字节>...\\n' \"$((size - {capture_limit}))\"\n"
+        f"    tail -c {half} \"$f\"\n"
+        "  fi\n"
+        "}"
+    )
+
+
+def _communicate_limited(
+    proc: subprocess.Popen,
+    input_bytes: bytes,
+    *,
+    timeout: float,
+    limit: int,
+) -> tuple[bytes, bytes, bool, bool, bool]:
+    """带超时与字节上限的 communicate。
+
+    返回 `(stdout, stderr, timed_out, stdout_truncated, stderr_truncated)`。
+    超过上限后仍然继续读取并丢弃，避免子进程因管道写满而卡死。
+    """
+    out_parts: list[bytes] = []
+    err_parts: list[bytes] = []
+    truncated = [False, False]
+
+    def reader(stream, parts: list[bytes], index: int) -> None:
+        total = 0
+        while True:
+            try:
+                chunk = stream.read(65_536)
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            if limit <= 0:
+                parts.append(chunk)
+            elif total < limit:
+                take = min(len(chunk), limit - total)
+                parts.append(chunk[:take])
+                total += take
+                if take < len(chunk):
+                    truncated[index] = True
+            else:
+                truncated[index] = True
+
+    def writer() -> None:
+        try:
+            if proc.stdin is not None:
+                proc.stdin.write(input_bytes)
+                proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+    readers: list[threading.Thread] = []
+    for stream, parts, index in (
+        (proc.stdout, out_parts, 0),
+        (proc.stderr, err_parts, 1),
+    ):
+        if stream is None:
+            continue
+        thread = threading.Thread(
+            target=reader, args=(stream, parts, index), daemon=True
+        )
+        thread.start()
+        readers.append(thread)
+    writer_thread = threading.Thread(target=writer, daemon=True)
+    writer_thread.start()
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            pass
+        # 子进程被杀后，管道可能仍被后代进程持有；关闭读端让 reader 退出。
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
+
+    for thread in readers:
+        thread.join(KILL_GRACE)
+    writer_thread.join(KILL_GRACE)
+    return (
+        b"".join(out_parts),
+        b"".join(err_parts),
+        timed_out,
+        truncated[0],
+        truncated[1],
+    )
+
+
 class _ShellSession:
     """一个常驻的 WSL bash 进程；命令通过 stdin 发送并用 sentinel 分帧。"""
 
@@ -188,20 +332,28 @@ class _ShellSession:
             except OSError:
                 pass
 
-    def run(self, script: str, *, wall: int, command: str) -> ExecResult:
+    def run(
+        self,
+        script: str,
+        *,
+        wall: int,
+        command: str,
+        capture_limit: int = 0,
+    ) -> ExecResult:
         token = uuid4().hex
         end_line = f"__AGENT_END_{token}__:".encode()
+        # 在沙箱内就把输出截到上限：命令写入临时文件，回传时只 cat
+        # head+tail。否则宿主必须先收完整份输出再在 render() 里截断。
         framed = f"""\
+{_emit_function(capture_limit)}
 __agent_out=$(mktemp)
 __agent_err=$(mktemp)
 (
 {script}
 ) >"$__agent_out" 2>"$__agent_err"
 __agent_rc=$?
-printf '\\n__AGENT_OUT_{token}__\\n'
-cat "$__agent_out"
-printf '\\n__AGENT_ERR_{token}__\\n'
-cat "$__agent_err"
+__agent_emit "$__agent_out" "__AGENT_OUT_{token}__"
+__agent_emit "$__agent_err" "__AGENT_ERR_{token}__"
 printf '\\n__AGENT_END_{token}__:%s\\n' "$__agent_rc"
 rm -f "$__agent_out" "$__agent_err"
 """
@@ -267,7 +419,12 @@ rm -f "$__agent_out" "$__agent_err"
 
 
 class _ShellSessionPool:
-    """小型会话池：保留并发能力，同时避免每条命令启动一次 wsl.exe。"""
+    """小型会话池：保留并发能力，同时避免每条命令启动一次 wsl.exe。
+
+    创建/关闭可能来自不同线程（一个 worker 的会话失败会触发整体回退），
+    所以池本身也必须是有状态的：`closed` 之后不再接受新命令，`close()`
+    同时清理 idle 与正在执行的会话。
+    """
 
     def __init__(
         self,
@@ -280,35 +437,66 @@ class _ShellSessionPool:
         self._semaphore = threading.BoundedSemaphore(max(1, size))
         self._lock = threading.Lock()
         self._idle: list[_ShellSession] = []
+        self._active: set[_ShellSession] = set()
+        self._closed = False
 
-    def run(self, script: str, *, wall: int, command: str) -> ExecResult:
+    def run(
+        self,
+        script: str,
+        *,
+        wall: int,
+        command: str,
+        capture_limit: int = 0,
+    ) -> ExecResult:
         with self._semaphore:
             session = self._take()
             try:
-                return session.run(script, wall=wall, command=command)
+                return session.run(
+                    script,
+                    wall=wall,
+                    command=command,
+                    capture_limit=capture_limit,
+                )
             finally:
                 if session.alive():
                     self._put(session)
                 else:
+                    with self._lock:
+                        self._active.discard(session)
                     session.close()
 
     def _take(self) -> _ShellSession:
         with self._lock:
+            if self._closed:
+                raise _SessionError("persistent shell 池已关闭")
             if self._idle:
-                return self._idle.pop()
+                session = self._idle.pop()
+                self._active.add(session)
+                return session
         session = _ShellSession(self._argv)
+        with self._lock:
+            if self._closed:
+                session.close()
+                raise _SessionError("persistent shell 池已关闭")
+            self._active.add(session)
         if self._on_start is not None:
             self._on_start()
         return session
 
     def _put(self, session: _ShellSession) -> None:
         with self._lock:
-            self._idle.append(session)
+            self._active.discard(session)
+            if self._closed:
+                session.close()
+            else:
+                self._idle.append(session)
 
     def close(self) -> None:
         with self._lock:
-            sessions = list(self._idle)
+            self._closed = True
+            sessions = [*self._idle, *self._active]
             self._idle.clear()
+            self._active.clear()
         for session in sessions:
             session.close()
 
@@ -334,19 +522,30 @@ def build_bwrap_script(
     workdir: str,
     workspace: str = "",
     network: bool = True,
+    extra_binds: tuple[str, ...] = (),
 ) -> str:
     """把一条命令包进 bubblewrap，返回可直接交给 bash 的脚本片段。
 
     工作区（及其工作目录）以原路径可写挂回；其余只读或隐藏。`workdir` 必须存在，
-    否则 bwrap 会因为 `--chdir` 目标缺失而失败。`network=False` 时额外
-    `--unshare-net`，命令看不到任何网络接口。
+    否则 bwrap 会因为 `--chdir` 目标缺失而失败。`extra_binds` 用于仓库外的
+    per-user 记忆目录等宿主管理路径。`network=False` 时额外 `--unshare-net`。
     """
     rw: list[str] = []
-    for path in (workdir, workspace):
+    for path in (workdir, workspace, *extra_binds):
         if path and path not in rw:
             rw.append(path)
 
-    args = ["bwrap", "--die-with-parent", "--unshare-user", "--unshare-pid"]
+    args = [
+        "bwrap",
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-user",
+        "--unshare-pid",
+        # IPC 也隔离：System V 共享内存/信号量不应跨沙箱可见。
+        "--unshare-ipc",
+        "--cap-drop",
+        "ALL",
+    ]
     if not network:
         args.append("--unshare-net")
     for src, dest in _BWRAP_RO_BINDS:
@@ -408,6 +607,12 @@ class WslSandbox:
         self._command_count = 0
         self._session_pool: _ShellSessionPool | None = None
         self._session_disabled = False
+        # 会话池的创建/关闭可能来自不同线程；指标更新也有复合操作。
+        self._session_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        # bwrap 只绑定工作区；仓库外的 per-user 记忆目录需要显式可写绑定。
+        self._bind_lock = threading.Lock()
+        self._extra_binds: set[str] = set()
         # 健康检查与熔断状态。所有跨线程访问都走 `_breaker_lock`。
         self._breaker_lock = threading.Lock()
         self._breaker_failures = 0
@@ -419,16 +624,20 @@ class WslSandbox:
     @property
     def command_count(self) -> int:
         """本实例启动过多少次 wsl.exe（供评测/调试统计）。"""
-        return self._command_count
+        with self._stats_lock:
+            return self._command_count
 
     def _bump_command_count(self) -> None:
-        self._command_count += 1
+        with self._stats_lock:
+            self._command_count += 1
 
     def close(self) -> None:
         """关闭常驻会话；进程退出时也会随之结束。"""
-        if self._session_pool is not None:
-            self._session_pool.close()
+        with self._session_lock:
+            pool = self._session_pool
             self._session_pool = None
+        if pool is not None:
+            pool.close()
 
     def __del__(self) -> None:  # pragma: no cover - 解释器退出时的兜底清理
         try:
@@ -576,7 +785,13 @@ class WslSandbox:
         return self.cached_probe("home", self._probe_home)
 
     def _probe_home(self) -> str:
-        result = self.run('printf "%s" "$HOME"')
+        # 探测 $HOME 必须绕过 bwrap：bwrap 需要已知 workdir，而 workdir 的
+        # 默认值正是这里要探测的 $HOME/agent-ws。用 _exec 直接跑一次性 bash。
+        result = self._exec(
+            'printf "%s" "$HOME"',
+            wall=max(1, int(self.settings.shell_timeout or 60)),
+            command='printf "%s" "$HOME"',
+        )
         home = result.stdout.strip()
         if not result.ok or not home:
             raise WslUnavailableError(
@@ -585,15 +800,34 @@ class WslSandbox:
         return home
 
     def _argv(self) -> list[str]:
-        return [
+        # `env -i` 清空从 Windows 继承的环境：CI token、云凭据、甚至
+        # `apply_tracing_env()` 写回的 LANGSMITH_API_KEY 都会随 wsl.exe
+        # 进入 Linux 进程，而 `printenv` 曾经是 L0 自动放行。
+        # 只保留最小的、与业务无关的运行环境；HOME 由登录 bash 从 passwd 推导。
+        args = [
             "wsl.exe",
             "-d",
             self.settings.wsl_distro,
             "--",
-            "/bin/bash",
-            "-l",
-            "-s",
+            "/usr/bin/env",
+            "-i",
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "LANG=C.UTF-8",
+            "LC_ALL=C.UTF-8",
+            "TERM=dumb",
         ]
+        # 显式允许的构建变量（默认空）。敏感名称即使写进 allowlist 也忽略。
+        for raw in str(self.settings.shell_env_allowlist or "").split(","):
+            name = raw.strip()
+            if not name or not _ENV_NAME.fullmatch(name):
+                continue
+            if _SENSITIVE_ENV_NAME.search(name):
+                continue
+            value = os.environ.get(name)
+            if value is not None:
+                args.append(f"{name}={value}")
+        args += ["/bin/bash", "-l", "-s"]
+        return args
 
     @property
     def limits(self) -> ResourceLimits:
@@ -604,6 +838,33 @@ class WslSandbox:
             max_file_mb=settings.shell_max_file_mb,
             max_processes=settings.shell_max_processes,
         )
+
+    @property
+    def capture_limit(self) -> int:
+        """单条命令 stdout/stderr 各自允许捕获的字节数；0 = 不限制。"""
+        return max(0, int(getattr(self.settings, "max_capture_bytes", 0) or 0))
+
+    def add_extra_bind(self, path: str) -> None:
+        """把仓库外路径加入 bwrap 可写绑定（仅 off 模式无影响）。"""
+        try:
+            normalized = normalize_root(path)
+        except Exception:  # noqa: BLE001 - 非法路径不加入绑定
+            return
+        with self._bind_lock:
+            self._extra_binds.add(normalized)
+
+    def ensure_directory(self, path: str) -> None:
+        """在沙箱内创建目录（绕过 bwrap，供宿主初始化仓库外状态目录）。"""
+        normalized = normalize_root(path)
+        result = self._exec(
+            f"mkdir -p {shlex.quote(normalized)}",
+            wall=max(1, int(self.settings.shell_timeout or 60)),
+            command="",
+        )
+        if not result.ok:
+            raise WslUnavailableError(
+                f"无法创建目录 {normalized}：{result.render(300)}"
+            )
 
     def bwrap_available(self) -> bool:
         """沙箱内是否可用 bubblewrap（探测结果缓存）。
@@ -621,8 +882,16 @@ class WslSandbox:
         *,
         cwd: str | None = None,
         timeout: int | None = None,
+        capture_limit: int | None = None,
     ) -> ExecResult:
+        """执行一条命令。
+
+        `capture_limit` 只应由**用户命令/验证命令**传入。文件工具等内部脚本
+        通过 stdout 传 base64/JSON 协议，截断会直接破坏协议，因此默认 0
+        （不限制），由调用方显式选择上限。
+        """
         wall = timeout if timeout is not None else self.settings.shell_timeout
+        limit = 0 if capture_limit is None else max(0, int(capture_limit))
         if self.settings.shell_sandbox == SHELL_SANDBOX_BWRAP:
             if not self.bwrap_available():
                 raise WslUnavailableError(
@@ -635,11 +904,14 @@ class WslSandbox:
                 raise WslUnavailableError(
                     "AGENT_SHELL_SANDBOX=bwrap 需要明确的工作区路径（AGENT_WSL_WORKSPACE 或 cwd）"
                 )
+            with self._bind_lock:
+                extra_binds = tuple(sorted(self._extra_binds))
             body = build_bwrap_script(
                 command,
                 workdir=workdir,
                 workspace=self.settings.wsl_workspace,
                 network=self.settings.shell_network,
+                extra_binds=extra_binds,
             )
         else:
             body = command if cwd is None else f"cd {shlex.quote(cwd)} && {command}"
@@ -654,15 +926,24 @@ class WslSandbox:
             if self.settings.persistent_shell and not self._session_disabled:
                 try:
                     result = self._run_in_session(
-                        script, wall=wall, command=command
+                        script,
+                        wall=wall,
+                        command=command,
+                        capture_limit=limit,
                     )
                 except Exception:  # noqa: BLE001 - 会话失败退回一次性执行
-                    self._session_disabled = True
+                    with self._session_lock:
+                        self._session_disabled = True
                     self.close()
                 else:
                     self._finish_run(result)
                     return result
-            result = self._exec(script, wall=wall, command=command)
+            result = self._exec(
+                script,
+                wall=wall,
+                command=command,
+                capture_limit=limit,
+            )
         except ResourceTimeout:
             # 本地槽位饱和不是 WSL 故障，不能计入熔断。
             raise
@@ -678,6 +959,9 @@ class WslSandbox:
 
         饱和 + 高延迟 = 争用，降一个槽；饱和 + 低延迟 = 还有余量，升一个。
         非饱和时命令本身就慢，不能据此惩罚并发。
+
+        `_latencies` / `_latency_steps` 会被多个线程同时更新，复合操作必须
+        串行化，否则自适应上限会抖动。
         """
         settings = self.settings
         if (
@@ -689,32 +973,34 @@ class WslSandbox:
         window = max(
             5, int(getattr(settings, "concurrency_wsl_latency_window", 20) or 20)
         )
-        self._latencies.append(int(result.duration_ms or 0))
-        del self._latencies[:-window]
-        if len(self._latencies) < window:
-            return
-        self._latency_steps += 1
-        # 每半个窗口评估一次，避免刚调完又立刻反向调。
-        if self._latency_steps < max(1, window // 2):
-            return
-        self._latency_steps = 0
+        with self._stats_lock:
+            self._latencies.append(int(result.duration_ms or 0))
+            del self._latencies[:-window]
+            if len(self._latencies) < window:
+                return
+            self._latency_steps += 1
+            # 每半个窗口评估一次，避免刚调完又立刻反向调。
+            if self._latency_steps < max(1, window // 2):
+                return
+            self._latency_steps = 0
 
-        ordered = sorted(self._latencies)
-        p95 = ordered[int(0.95 * (len(ordered) - 1))]
-        target = max(
-            100, int(getattr(settings, "concurrency_wsl_target_ms", 1500) or 1500)
-        )
-        floor = self._wsl_limit_floor
-        ceiling = self._wsl_limit_ceiling
-        if ceiling <= 0:
-            return
-        saturated = self._slots.in_flight >= self._slots.limit
-        if not saturated:
-            return
-        if p95 > target * 1.5 and self._slots.limit > floor:
-            self._slots.set_limit(self._slots.limit - 1)
-        elif p95 < target * 0.5 and self._slots.limit < ceiling:
-            self._slots.set_limit(self._slots.limit + 1)
+            ordered = sorted(self._latencies)
+            p95 = ordered[int(0.95 * (len(ordered) - 1))]
+            target = max(
+                100,
+                int(getattr(settings, "concurrency_wsl_target_ms", 1500) or 1500),
+            )
+            floor = self._wsl_limit_floor
+            ceiling = self._wsl_limit_ceiling
+            if ceiling <= 0:
+                return
+            saturated = self._slots.in_flight >= self._slots.limit
+            if not saturated:
+                return
+            if p95 > target * 1.5 and self._slots.limit > floor:
+                self._slots.set_limit(self._slots.limit - 1)
+            elif p95 < target * 0.5 and self._slots.limit < ceiling:
+                self._slots.set_limit(self._slots.limit + 1)
 
     def _finish_run(self, result: ExecResult) -> None:
         """一次真实执行结束后更新熔断状态：有结果 = WSL 活着。"""
@@ -725,20 +1011,33 @@ class WslSandbox:
             self._breaker_success()
 
     def _run_in_session(
-        self, script: str, *, wall: int, command: str
+        self,
+        script: str,
+        *,
+        wall: int,
+        command: str,
+        capture_limit: int = 0,
     ) -> ExecResult:
-        if self._session_pool is None:
-            size = max(1, int(self.settings.persistent_shell_pool))
-            self._session_pool = _ShellSessionPool(
-                self._argv(),
-                size,
-                on_start=self._bump_command_count,
-            )
+        with self._session_lock:
+            pool = self._session_pool
+            if pool is None:
+                size = max(1, int(self.settings.persistent_shell_pool))
+                pool = _ShellSessionPool(
+                    self._argv(),
+                    size,
+                    on_start=self._bump_command_count,
+                )
+                self._session_pool = pool
         timeout = float(
             getattr(self.settings, "concurrency_wsl_timeout_s", 30.0) or 30.0
         )
         with self._slots.lease(timeout=timeout):
-            return self._session_pool.run(script, wall=wall, command=command)
+            return pool.run(
+                _with_env_preamble(script),
+                wall=wall,
+                command=command,
+                capture_limit=capture_limit,
+            )
 
     def _exec(
         self,
@@ -747,19 +1046,30 @@ class WslSandbox:
         wall: int,
         command: str = "",
         reserved: bool = False,
+        capture_limit: int = 0,
     ) -> ExecResult:
         """按统一 WSL 资源池执行；具体逻辑见 `_exec_locked`。"""
         timeout = float(
             getattr(self.settings, "concurrency_wsl_timeout_s", 30.0) or 30.0
         )
         with self._slots.lease(timeout=timeout, reserved=reserved):
-            return self._exec_locked(script, wall=wall, command=command)
+            return self._exec_locked(
+                _with_env_preamble(script),
+                wall=wall,
+                command=command,
+                capture_limit=capture_limit,
+            )
 
     def _exec_locked(
-        self, script: str, *, wall: int, command: str = ""
+        self,
+        script: str,
+        *,
+        wall: int,
+        command: str = "",
+        capture_limit: int = 0,
     ) -> ExecResult:
         """把脚本经 stdin 交给登录 bash 执行（不套隔离包装，供 run/探测复用）。"""
-        self._command_count += 1
+        self._bump_command_count()
         limit = wall + OUTER_TIMEOUT_GRACE
         started = time.perf_counter()
         try:
@@ -772,21 +1082,17 @@ class WslSandbox:
         except FileNotFoundError as exc:
             raise WslUnavailableError("找不到 wsl.exe，请确认已启用 WSL2。") from exc
 
-        timed_out = False
-        try:
-            out, err = proc.communicate(script.encode("utf-8"), timeout=limit)
-            exit_code = proc.returncode
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            # 收尾这一次也必须有 timeout：kill 只保证 wsl.exe 收到信号，
-            # 若它卡在不可中断状态（网络挂载、驱动），无参 communicate() 会永久挂住。
-            try:
-                out, err = proc.communicate(timeout=KILL_GRACE)
-            except subprocess.TimeoutExpired:
-                # 拖不住就放弃回收，照样按超时返回 —— 不能让清理拖垮整轮运行
-                out, err = b"", b""
-            exit_code = TIMEOUT_EXIT_CODE
-            timed_out = True
+        out, err, timed_out, out_cut, err_cut = _communicate_limited(
+            proc,
+            script.encode("utf-8"),
+            timeout=limit,
+            limit=capture_limit,
+        )
+        exit_code = (
+            TIMEOUT_EXIT_CODE
+            if timed_out or proc.returncode is None
+            else proc.returncode
+        )
 
         duration_ms = int((time.perf_counter() - started) * 1000)
         # 沙箱内 timeout 到点返回约定码 124；但命令自身也可能恰好以 124 退出，
@@ -794,11 +1100,18 @@ class WslSandbox:
         if not timed_out and exit_code == TIMEOUT_EXIT_CODE and duration_ms >= wall * 1000 * 0.9:
             timed_out = True
 
+        stdout = out.decode("utf-8", errors="replace")
+        stderr = err.decode("utf-8", errors="replace")
+        if out_cut:
+            stdout += "\n...<输出捕获已截断>..."
+        if err_cut:
+            stderr += "\n...<输出捕获已截断>..."
+
         return ExecResult(
             command=command,
             exit_code=exit_code,
-            stdout=out.decode("utf-8", errors="replace"),
-            stderr=err.decode("utf-8", errors="replace"),
+            stdout=stdout,
+            stderr=stderr,
             duration_ms=duration_ms,
             timed_out=timed_out,
         )

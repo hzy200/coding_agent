@@ -226,6 +226,10 @@ def test_completed_implement_is_not_relaunched_while_waiting_for_merge(
 
     assert calls == {"a": 1, "b": 1}
     assert out["task_status"] == {"a": "success", "b": "success"}
+    # 合并进了主工作区：必须把「待验证」交给父图，而不是只置 dirty。
+    assert out["dirty"] is True
+    assert out["run_dirty"] is True
+    assert out["pending_verification"] is True
 
 
 def test_merge_backpressure_limits_concurrent_implement(monkeypatch) -> None:
@@ -437,6 +441,35 @@ def test_rate_limit_backoff_requeues_the_task() -> None:
 
     assert attempts["a"] == 2
     assert out["task_status"]["a"] == "success"
+
+
+def test_rate_limit_state_is_exposed_for_the_next_boundary() -> None:
+    """429 之后 scheduler 返回的 state 必须带着降并发结果。"""
+    async def runner(task: dict[str, Any], **_kwargs: Any) -> WorkerResult:
+        result = _result(task, status="failed")
+        result.summary = "429 Too Many Requests"
+        return result
+
+    node = make_scheduler_node(
+        worker_runner=runner,
+        settings=_settings(
+            orchestrator_max_concurrent_workers=4,
+            orchestrator_task_retries=0,
+            orchestrator_rate_limit_backoff_s=0.01,
+        ),
+        steering=SteeringController(),
+    )
+    out = asyncio.run(
+        node(
+            _state([_task("a")]),
+            {"configurable": {"thread_id": "t"}},
+        )
+    )
+
+    saved = out["scheduler_rate_limit"]
+    assert saved["current_limit"] < 4
+    assert saved["streak"] >= 1
+    assert saved["not_before_wall"] > 0
 
 
 def test_deadline_does_not_finish_a_worker_that_never_started(

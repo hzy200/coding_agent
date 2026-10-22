@@ -634,6 +634,115 @@ def test_approved_tool_call_keeps_args_across_resume(tmp_path) -> None:
     assert call.level == "L2 变更性"
 
 
+def test_pending_call_args_survive_a_process_restart(tmp_path) -> None:
+    """新进程 resume 时没有内存配对表，必须从 checkpoint 的 tool_calls 恢复。"""
+    request = {"call_id": "c1", "tool": "shell_exec", "command": "pip install x",
+               "level": "L2 变更性", "reason": "装依赖"}
+    run_script = [
+        _updates(act={"messages": [
+            _tool_call("shell_exec", {"command": "pip install x", "reason": "装依赖"}, "c1")
+        ]}),
+        _updates(__interrupt__=(_Interrupt({"requests": [request]}),)),
+    ]
+    resume_script = [
+        _updates(tools={"messages": [ToolMessage(
+            content="installed",
+            tool_call_id="c1",
+            name="shell_exec",
+            artifact=ShellArtifact(
+                command="pip install x", ok=True, decision="approved",
+                exit_code=0, level=2, level_label="L2 变更性",
+            ).model_dump(),
+        )]}),
+        _updates(respond={"messages": [AIMessage(content="好了")]}),
+    ]
+    runtime, _ = _runtime(tmp_path, run_script)
+    _run(_collect(runtime))
+
+    # 模拟进程重启：内存里的配对表不存在了。
+    runtime._pending_calls.clear()
+
+    async def _prior(_thread_id: str) -> dict:
+        return {"messages": [AIMessage(
+            content="",
+            tool_calls=[{
+                "name": "shell_exec",
+                "args": {"command": "pip install x", "reason": "装依赖"},
+                "id": "c1",
+            }],
+        )]}
+
+    runtime._prior_state = _prior  # type: ignore[assignment]
+    runtime._graph = FakeGraph(resume_script)
+    events = _run(_collect_resume(runtime, {"c1": True}))
+
+    started = [e for e in events if isinstance(e, ToolCallStarted)]
+    assert any(
+        e.call_id == "c1" and e.args["command"] == "pip install x" for e in started
+    )
+
+    call = next(r for r in read_records(runtime.audit_path) if r.kind == "tool_call")
+    assert call.args["command"] == "pip install x"
+    assert call.args["reason"] == "装依赖"
+
+
+def test_a_second_concurrent_stream_is_rejected(tmp_path) -> None:
+    """工作区锁可重入，不能挡住同一 runtime 的并发 resume；需要独立闸门。"""
+    runtime, graph = _runtime(
+        tmp_path,
+        [_updates(respond={"messages": [AIMessage(content="完成")]})],
+    )
+    runtime._stream_active = True
+
+    events = _run(_collect_resume(runtime, {"c1": True}))
+
+    assert isinstance(events[0], RunFailed)
+    assert "已有正在执行" in events[0].message
+    assert graph.payloads == []
+
+
+def test_stream_flag_is_released_after_a_run(tmp_path) -> None:
+    runtime, _ = _runtime(
+        tmp_path,
+        [_updates(respond={"messages": [AIMessage(content="完成")]})],
+    )
+
+    _run(_collect(runtime))
+
+    assert runtime._stream_active is False
+
+
+def test_two_real_resumes_cannot_drive_the_same_graph(tmp_path) -> None:
+    """不是标记级测试：第一个流真的卡在 astream 里，第二个 resume 必须被拒绝。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class _BlockingGraph:
+        async def astream(
+            self, payload, config=None, stream_mode=None, subgraphs=None
+        ):  # noqa: ANN001
+            started.set()
+            await release.wait()
+            yield _updates(respond={"messages": [AIMessage(content="完成")]})
+
+    runtime, _ = _runtime(tmp_path, [])
+    runtime._graph = _BlockingGraph()
+
+    async def scenario() -> None:
+        first = asyncio.create_task(_collect(runtime))
+        await asyncio.wait_for(started.wait(), 2)
+
+        second = await _collect_resume(runtime, {"c1": True})
+        assert isinstance(second[0], RunFailed)
+        assert "已有正在执行" in second[0].message
+
+        release.set()
+        events = await asyncio.wait_for(first, 2)
+        assert isinstance(events[-1], RunFinished)
+
+    asyncio.run(scenario())
+
+
 # ---------------- 异常 ----------------
 
 class _BoomMemory:

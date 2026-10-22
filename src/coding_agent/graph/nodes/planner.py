@@ -131,7 +131,11 @@ def make_planner_node(
             "delegate_calls": 0,
             "tool_rounds": 0,
             "budget_exhausted": False,
-            "dirty": False,
+            # 编排合并过补丁时 run_dirty=True：主 agent 的第一步必须被视为
+            # 「有改动」，否则 verify/review 都会因 dirty=False 短路，合并进来的
+            # 代码就绕过了两道质量关。direct 新 run 的 run_dirty 由 runtime 重置
+            # 为 False，行为不变。
+            "dirty": bool(state.get("run_dirty")),
             # run_dirty 是**整轮**的：orchestrator 合并写 worker 的补丁后会置 True，
             # planner 不能把它清掉（新一轮由 runtime.run 的 inputs 重置）。
             "empty_step_nudged": False,

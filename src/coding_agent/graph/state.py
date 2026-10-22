@@ -67,6 +67,12 @@ class AgentState(TypedDict, total=False):
     # 整个任务是否产生过任何改动。与 `dirty` 的区别：后者每步重置，
     # 前者只由 planner 归零。用于收尾时防止「一次都没写却声称已完成」。
     run_dirty: bool
+    # 编排层合并过补丁、但主 agent 还没跑过一次自动验证。
+    #
+    # 合并发生在主 planner 之前，而 planner 会按步重置 `dirty`；若只看 `dirty`，
+    # 「主 agent 只读/只总结」就会让合并进来的改动完全绕过 verify。这个标志
+    # 跨步骤保留，直到 verify 真正执行（或在 verify 被禁用时显式清除）。
+    pending_verification: bool
     # 本步是否已经因「一个改动都没产生」被要求重做过一次（上限一次，防死循环）。
     # 由 planner / advance / repair 复位，nudge 置位。
     empty_step_nudged: bool

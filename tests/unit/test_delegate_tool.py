@@ -259,7 +259,9 @@ def test_build_graph_with_explore_enabled_keeps_the_topology(monkeypatch) -> Non
         command="command -v rg", exit_code=0, stdout="/usr/bin/rg", stderr="", duration_ms=0
     )
     monkeypatch.setattr(
-        WslSandbox, "_exec", lambda self, script, *, wall, command="": probe
+        WslSandbox,
+        "_exec",
+        lambda self, script, *, wall, command="", **kwargs: probe,
     )
     settings = Settings(
         _env_file=None, deepseek_api_key="x", explore_enabled=True, wsl_workspace="/tmp/ws"

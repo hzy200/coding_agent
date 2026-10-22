@@ -47,6 +47,17 @@ def test_discover_filters_unrelated_names() -> None:
     assert instructions.discover_instruction_paths(sandbox, "/work") == []
 
 
+def test_untrusted_repo_instructions_are_not_loaded() -> None:
+    sandbox = _Sandbox("./AGENTS.md\n")
+
+    text = instructions.load_project_instructions(
+        sandbox, "/work", trusted=False
+    )
+
+    assert text == ""
+    assert sandbox.commands == []  # 连发现都不做
+
+
 def test_load_merges_files_with_headers(monkeypatch) -> None:
     sandbox = _Sandbox("./CLAUDE.md\n./src/AGENTS.md\n")
     fs = _Fs(

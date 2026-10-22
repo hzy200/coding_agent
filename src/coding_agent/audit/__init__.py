@@ -4,6 +4,7 @@ from coding_agent.audit.logger import (
     audit_files_by_day,
     read_records,
     read_records_many,
+    verify_audit_files,
 )
 from coding_agent.audit.models import AuditRecord
 
@@ -14,4 +15,5 @@ __all__ = [
     "audit_files_by_day",
     "read_records",
     "read_records_many",
+    "verify_audit_files",
 ]

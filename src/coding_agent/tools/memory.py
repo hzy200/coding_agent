@@ -23,6 +23,7 @@ from coding_agent.memory.longterm import (
     MAX_FACTS,
     LongTermMemory,
     MemoryError,
+    resolve_memory_root,
 )
 from coding_agent.sandbox.fs import SandboxFs
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
@@ -71,8 +72,9 @@ def build_memory_tools(
     read_cache: MutableMapping[str, bytes] | None = None,
 ) -> list[BaseTool]:
     workspace = resolve_workspace(settings, sandbox)
-    fs = SandboxFs(sandbox, workspace, cache=read_cache)
-    memory = LongTermMemory(fs, workspace)
+    memory_root = resolve_memory_root(settings, sandbox, workspace)
+    fs = SandboxFs(sandbox, memory_root, cache=read_cache)
+    memory = LongTermMemory(fs, workspace, state_root=memory_root)
 
     def _search(query: str, limit: int, reason: str) -> str:
         del reason

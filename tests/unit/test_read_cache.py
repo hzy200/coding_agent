@@ -19,7 +19,12 @@ class _FakeSandbox:
         self.settings = settings
 
     def run(
-        self, command: str, *, cwd: str | None = None, timeout: int | None = None
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: int | None = None,
+        capture_limit: int | None = None,
     ) -> ExecResult:
         return ExecResult(
             command=command, exit_code=0, stdout="", stderr="", duration_ms=0
@@ -89,3 +94,24 @@ def test_read_cache_clear_and_stats() -> None:
     cache.clear()
     assert cache.size_bytes == 0
     assert len(cache) == 0
+
+
+def test_read_cache_is_thread_safe() -> None:
+    """并发只读工具共享同一个缓存；混合读写/驱逐不能抛 KeyError。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    cache = ReadCache(max_bytes=1_024)
+
+    def worker(index: int) -> int:
+        for turn in range(500):
+            key = f"{index}-{turn % 20}"
+            cache[key] = b"x" * 40
+            cache.get(key)
+            if turn % 7 == 0:
+                cache.pop(f"{index}-{turn % 3}", None)
+        return index
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        assert sorted(pool.map(worker, range(8))) == list(range(8))
+
+    assert cache.size_bytes <= cache.max_bytes

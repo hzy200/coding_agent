@@ -42,6 +42,10 @@ DECISION_DENIED = "denied"      # W5：人工拒绝
 class AuditRecord(BaseModel):
     ts: str
     kind: str
+    # 哈希链：prev_hash 是上一条记录的 hash；hash 是本条 canonical JSON 的摘要。
+    # 旧日志没有这两个字段（空串），verify 会把它当作 legacy 前缀跳过。
+    prev_hash: str = ""
+    hash: str = ""
 
     thread_id: str = ""
     workspace: str = ""

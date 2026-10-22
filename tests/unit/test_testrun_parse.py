@@ -6,9 +6,13 @@
 
 from __future__ import annotations
 
+from coding_agent.config import Settings
+from coding_agent.sandbox.wsl_exec import ExecResult
+from coding_agent.tools.artifacts import unpack
 from coding_agent.tools.testrun import (
     VerifyResult,
     _selected_command,
+    build_test_tool,
     detect_test_command,
     extract_summary,
     parse_issues,
@@ -205,6 +209,34 @@ def test_override_wins() -> None:
     assert detect_test_command(_UnusedSandbox(), "/x", override="make check") == "make check"
 
 
+def test_run_tests_without_a_command_is_skipped_not_success() -> None:
+    """模型主动跑测试但项目没有测试命令：事件不能记成「成功」。"""
+    class _NoTestsSandbox:
+        settings = Settings(_env_file=None, wsl_workspace="/ws")
+
+        def run(  # noqa: ANN001
+            self, command, *, cwd=None, timeout=None, capture_limit=None
+        ):
+            return ExecResult(
+                command=command, exit_code=0, stdout="", stderr="", duration_ms=1
+            )
+
+        def cached_probe(self, key, producer):  # noqa: ANN001
+            return producer()
+
+        def forget_probe(self, key):  # noqa: ANN001
+            return None
+
+    sandbox = _NoTestsSandbox()
+    tool = build_test_tool(sandbox.settings, sandbox)  # type: ignore[arg-type]
+
+    _text, artifact = unpack(tool.invoke({"reason": "跑测试"}))
+
+    assert artifact is not None
+    assert artifact["skipped"] is True
+    assert artifact["ok"] is False
+
+
 # ---------------- 无测试项目的降级验证 ----------------
 #
 # 识别不出测试命令时原先是 `not_configured` → 路由判为非 failed → 审计记
@@ -219,7 +251,7 @@ class _ProbeSandbox:
         self.runs = 0
         self._cache: dict[str, object] = {}
 
-    def run(self, command: str, *, cwd=None, timeout=None):
+    def run(self, command: str, *, cwd=None, timeout=None, capture_limit=None):
         from coding_agent.sandbox.wsl_exec import ExecResult
 
         self.runs += 1

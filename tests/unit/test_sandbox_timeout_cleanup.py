@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import io
 import subprocess
 from typing import Any
 
@@ -29,28 +30,45 @@ def real_exec(monkeypatch):
 
 
 class _FakeProc:
-    """第一次 communicate 抛超时（模拟外层到点），之后按 `hang` 决定行为。"""
+    """模拟 Popen；`wait` 第一次抛超时（模拟外层到点），之后按 `hang` 决定行为。"""
 
-    def __init__(self, *, hang: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+        hang: bool = False,
+        timeout_first: bool = True,
+    ) -> None:
+        self.stdin = io.BytesIO()
+        self.stdout = io.BytesIO(stdout)
+        self.stderr = io.BytesIO(stderr)
         self.hang = hang
+        self.timeout_first = timeout_first
         self.killed = False
-        self.timeouts: list[Any] = []
-        self.returncode = -9
+        self.waits: list[Any] = []
+        self.returncode = 0
 
     def kill(self) -> None:
         self.killed = True
 
-    def communicate(self, input: bytes | None = None, timeout: float | None = None):  # noqa: A002
-        self.timeouts.append(timeout)
-        if len(self.timeouts) == 1:
-            raise subprocess.TimeoutExpired("wsl.exe", 1)
-        if self.hang:
-            raise subprocess.TimeoutExpired("wsl.exe", 1)
-        return b"partial", b""
+    def wait(self, timeout: float | None = None) -> int:
+        self.waits.append(timeout)
+        if self.hang or (self.timeout_first and not self.killed):
+            raise subprocess.TimeoutExpired("wsl.exe", timeout or 1)
+        self.returncode = -9 if self.killed else 0
+        return self.returncode
 
 
-def _sandbox(monkeypatch, proc: _FakeProc) -> WslSandbox:
-    sandbox = WslSandbox(Settings(_env_file=None))
+def _sandbox(
+    monkeypatch,
+    proc: _FakeProc,
+    *,
+    max_capture_bytes: int = 1_000_000,
+) -> WslSandbox:
+    sandbox = WslSandbox(
+        Settings(_env_file=None, max_capture_bytes=max_capture_bytes)
+    )
     monkeypatch.setattr(
         subprocess, "Popen", lambda *args, **kwargs: proc  # noqa: ARG005
     )
@@ -58,7 +76,7 @@ def _sandbox(monkeypatch, proc: _FakeProc) -> WslSandbox:
 
 
 def test_cleanup_after_timeout_has_a_timeout(monkeypatch, real_exec) -> None:
-    """清理那一次 communicate 也必须带 timeout，不能裸调用。"""
+    """清理那一次 wait 也必须带 timeout，不能裸调用。"""
     proc = _FakeProc()
     sandbox = _sandbox(monkeypatch, proc)
 
@@ -68,8 +86,8 @@ def test_cleanup_after_timeout_has_a_timeout(monkeypatch, real_exec) -> None:
     assert result.timed_out is True
     assert result.exit_code == TIMEOUT_EXIT_CODE
     # 第一次是正式等待（wall + 余量），第二次是清理，两次都得有上限
-    assert proc.timeouts[0] is not None and proc.timeouts[0] > 0
-    assert proc.timeouts[1] is not None and proc.timeouts[1] > 0
+    assert proc.waits[0] is not None and proc.waits[0] > 0
+    assert proc.waits[1] is not None and proc.waits[1] > 0
 
 
 def test_cleanup_gives_up_instead_of_hanging_forever(monkeypatch, real_exec) -> None:
@@ -86,11 +104,7 @@ def test_cleanup_gives_up_instead_of_hanging_forever(monkeypatch, real_exec) -> 
 
 
 def test_normal_run_is_not_marked_as_timed_out(monkeypatch, real_exec) -> None:
-    def ok_communicate(input=None, timeout=None):  # noqa: ANN001
-        return b"done", b""
-
-    proc = _FakeProc()
-    proc.communicate = ok_communicate  # type: ignore[method-assign]
+    proc = _FakeProc(stdout=b"done", timeout_first=False)
     sandbox = _sandbox(monkeypatch, proc)
 
     result = sandbox.run("echo done", timeout=5)
@@ -98,6 +112,16 @@ def test_normal_run_is_not_marked_as_timed_out(monkeypatch, real_exec) -> None:
     assert result.timed_out is False
     assert result.stdout == "done"
     assert proc.killed is False
+
+
+def test_capture_is_bounded_before_it_reaches_the_host(monkeypatch, real_exec) -> None:
+    proc = _FakeProc(stdout=b"x" * 10_000, timeout_first=False)
+    sandbox = _sandbox(monkeypatch, proc, max_capture_bytes=100)
+
+    result = sandbox.run("cat big.log", timeout=5, capture_limit=100)
+
+    assert "截断" in result.stdout
+    assert len(result.stdout) < 300
 
 
 if __name__ == "__main__":  # pragma: no cover

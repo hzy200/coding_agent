@@ -5,6 +5,7 @@ import json
 from coding_agent.tools.artifacts import (
     CallArtifact,
     FileArtifact,
+    InterruptedArtifact,
     ShellArtifact,
     pack,
     parse_artifact,
@@ -76,6 +77,13 @@ def test_parse_artifact_dispatches_on_kind() -> None:
     assert isinstance(call, CallArtifact)
     assert call.tool == "git_commit"
     assert call.rejected is True
+
+    interrupted = parse_artifact(
+        InterruptedArtifact(tool="shell_exec").model_dump()
+    )
+    assert isinstance(interrupted, InterruptedArtifact)
+    assert interrupted.ok is None
+    assert interrupted.interrupted is True
 
 
 def test_parse_artifact_rejects_unknown_and_malformed() -> None:

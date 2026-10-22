@@ -228,6 +228,11 @@ class AgentTuiApp(App[None]):
                     allow_write=self._allow_write,
                 )
             )
+            # production/ops profile 会在 runtime 里强制关闭写能力；界面必须
+            # 显示实际值，不能继续按命令行传入的 --write 显示"可写"。
+            self._allow_write = bool(
+                getattr(self._runtime, "allow_write", self._allow_write)
+            )
             workspace = self._runtime.workspace
         except Exception as exc:  # noqa: BLE001 - 环境问题要在界面里说清楚，而不是崩掉
             self._write(f"初始化失败：{type(exc).__name__}: {exc}", "red")
@@ -371,6 +376,8 @@ class AgentTuiApp(App[None]):
                 self._write("← 已被安全策略拒绝", "red")
             elif event.skipped:
                 self._write("← 已跳过（环境未配置）", "dim")
+            elif event.interrupted:
+                self._write("← 结果未知（执行中断，未自动重放）", "yellow")
             elif event.ok:
                 elapsed = f" {event.duration_ms / 1000:.2f}s" if event.duration_ms else ""
                 self._write(f"← ✓{elapsed}", "dim")

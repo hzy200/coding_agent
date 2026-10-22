@@ -87,6 +87,23 @@ class CallArtifact(ToolArtifact):
     # 批量操作（file_edit_many）涉及的文件与合并 diff。
     files: list[str] = Field(default_factory=list)
     diff: str = ""
+    # 批量操作里每个文件的独立改动，供事件层逐条发 FileChanged、审计层逐条落账。
+    # 每项：path / action / added / removed / diff / snapshot_id。
+    file_changes: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class InterruptedArtifact(ToolArtifact):
+    """有副作用的调用执行到一半、结果未知时使用。
+
+    与普通失败不同：`ok=None` 表示“不知道成没成”。事件层与审计层必须保留
+    这个三态，不能退化成“成功”或“失败”。
+    """
+
+    kind: Literal["interrupted"] = "interrupted"
+    tool: str = ""
+    ok: bool | None = None
+    interrupted: bool = True
+    replayed: bool = False
 
 
 class SubAgentArtifact(ToolArtifact):
@@ -127,6 +144,7 @@ _ARTIFACT_TYPES: dict[str, type[ToolArtifact]] = {
     "shell": ShellArtifact,
     "file": FileArtifact,
     "call": CallArtifact,
+    "interrupted": InterruptedArtifact,
     "subagent": SubAgentArtifact,
 }
 

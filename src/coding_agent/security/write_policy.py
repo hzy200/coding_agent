@@ -23,6 +23,29 @@ DEFAULT_WRITE_DENY_GLOBS: tuple[str, ...] = (
     ".ssh/**",
     ".git/**",
     ".agent/**",
+    # 常见凭据/基础设施状态文件：写坏它们比读走更难恢复
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".git-credentials",
+    "credentials",
+    "**/credentials",
+    "credentials.json",
+    "**/credentials.json",
+    "*service-account*.json",
+    "*service_account*.json",
+    ".aws/**",
+    "**/.aws/**",
+    ".kube/**",
+    "**/.kube/**",
+    ".config/gcloud/**",
+    "**/.config/gcloud/**",
+    ".docker/config.json",
+    "**/.docker/config.json",
+    "*.tfstate",
+    "*.tfstate.backup",
+    "*.jks",
+    "*.keystore",
 )
 
 # 这些是“给人看的模板”，命中 `.env.*` 时放行。
@@ -41,9 +64,7 @@ def _normalize(path: str) -> str:
 
 
 def _matches(path: str, glob: str) -> bool:
-    if glob.endswith("/**"):
-        prefix = glob[:-3].rstrip("/")
-        return path == prefix or path.startswith(prefix + "/")
+    # 与 read_policy 保持一致：fnmatch 的 `*` 可跨 `/`，`**/x` 直接可用。
     if "/" in glob:
         return fnmatch.fnmatch(path, glob)
     return fnmatch.fnmatch(path.rsplit("/", 1)[-1], glob)

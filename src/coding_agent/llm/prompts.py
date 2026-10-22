@@ -241,7 +241,12 @@ REVIEW_PROMPT = """\
 - 逻辑错误、边界条件、异常路径；
 - 需求是否真的实现（不要只看测试是否变绿）；
 - 测试是否被改弱、被跳过，或断言是否被架空；
-- 调试残留、错误处理缺失、明显的性能/安全风险。
+- 调试残留、错误处理缺失、明显的性能/安全风险；
+- 命名是否符合目标语言的通行约定与项目约定：Python 函数/变量
+  snake_case、类 PascalCase；Go 导出标识符 PascalCase、未导出 camelCase；
+  JS/TS 函数/变量 camelCase、类/组件 PascalCase；Rust 函数/变量 snake_case、
+  类型 CamelCase。项目有明确强制规范（AGENTS.md 或 lint 配置）时不一致记为
+  [blocking]，否则记为 [warning]。
 
 硬性约束：
 1. 你只能读，不能修改文件，也不能执行命令。

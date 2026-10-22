@@ -26,6 +26,33 @@ def test_script_hides_home_and_keeps_system_readonly() -> None:
     assert "--tmpfs /root" in script
     assert "--unshare-user" in script
     assert "--unshare-pid" in script
+    # 能力与 IPC/会话也一起隔离
+    assert "--cap-drop ALL" in script
+    assert "--unshare-ipc" in script
+    assert "--new-session" in script
+
+
+def test_wsl_argv_clears_the_host_environment(monkeypatch) -> None:
+    """宿主 env 不能原样带进 Linux：否则 `printenv` 就能读走 CI 凭据。"""
+    monkeypatch.setenv("JAVA_HOME", "/opt/jdk")
+    monkeypatch.setenv("DB_PASSWORD", "hunter2hunter2")
+    sandbox = WslSandbox(
+        Settings(
+            _env_file=None,
+            wsl_distro="Ubuntu",
+            wsl_workspace="/ws",
+            shell_env_allowlist="JAVA_HOME,DB_PASSWORD",
+        )
+    )
+    argv = sandbox._argv()
+
+    assert argv[0] == "wsl.exe"
+    assert "/usr/bin/env" in argv
+    assert "-i" in argv
+    assert argv[-3:] == ["/bin/bash", "-l", "-s"]
+    # 显式放行的构建变量可以带过去，但敏感名称即使写了也忽略
+    assert "JAVA_HOME=/opt/jdk" in argv
+    assert not any("DB_PASSWORD" in item for item in argv)
 
 
 def test_workspace_is_bound_readwrite_and_deduplicated() -> None:
@@ -39,6 +66,17 @@ def test_binding_extra_workspace_when_cwd_is_a_subdir() -> None:
     assert "--bind /ws /ws" in script
     assert "--bind /ws/sub /ws/sub" in script
     assert "--chdir /ws/sub" in script
+
+
+def test_extra_binds_are_mounted_writable() -> None:
+    """仓库外的 per-user 记忆目录必须显式可写绑定。"""
+    script = build_bwrap_script(
+        "true",
+        workdir="/ws",
+        workspace="/ws",
+        extra_binds=("/home/u/agent-memory/alice",),
+    )
+    assert "--bind /home/u/agent-memory/alice /home/u/agent-memory/alice" in script
 
 
 def test_network_can_be_unshared() -> None:

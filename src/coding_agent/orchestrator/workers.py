@@ -15,8 +15,9 @@ from typing import Any
 from langchain_core.runnables import RunnableConfig
 
 from coding_agent.agents.explore import DelegateRunner
+from coding_agent.config import Settings
 from coding_agent.instructions import load_project_instructions
-from coding_agent.memory.longterm import LongTermMemory
+from coding_agent.memory.longterm import LongTermMemory, resolve_memory_root
 from coding_agent.orchestrator.contracts import WorkerResult
 from coding_agent.orchestrator.implement import ImplementRunner
 from coding_agent.orchestrator.retry import format_retry_context
@@ -35,9 +36,14 @@ def make_worker_runner(
     sandbox: WslSandbox,
     root: str,
     memory_top_k: int = 8,
+    settings: Settings | None = None,
 ) -> WorkerRunner:
-    # 并发 worker 共享同一份记忆读取；只读文件，不持有业务状态
-    memory = LongTermMemory(SandboxFs(sandbox, root), root)
+    # 并发 worker 共享同一份记忆读取；只读文件，不持有业务状态。
+    effective = settings or Settings(_env_file=None)
+    memory_root = resolve_memory_root(effective, sandbox, root)
+    memory = LongTermMemory(
+        SandboxFs(sandbox, memory_root), root, state_root=memory_root
+    )
     # 指令加载要起一次 WSL `find`：延迟到第一次真正跑 worker 时再做，
     # 纯 direct 会话不为编排功能付启动成本。
     instructions_cache: list[str] = []
@@ -45,7 +51,11 @@ def make_worker_runner(
     def _instructions() -> str:
         if not instructions_cache:
             try:
-                text = load_project_instructions(sandbox, root)
+                text = load_project_instructions(
+                    sandbox,
+                    root,
+                    trusted=effective.trust_repo_instructions,
+                )
             except Exception:  # noqa: BLE001 - 指令读取失败不阻断 worker
                 text = ""
             instructions_cache.append(text)

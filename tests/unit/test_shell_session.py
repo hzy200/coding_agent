@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import threading
+
+import pytest
+
 from coding_agent.sandbox import wsl_exec
 from coding_agent.sandbox.wsl_exec import (
     ExecResult,
     _parse_session_output,
+    _SessionError,
     _ShellSessionPool,
 )
 
@@ -41,7 +46,14 @@ class _FakeSession:
     def alive(self) -> bool:
         return self._alive
 
-    def run(self, script: str, *, wall: int, command: str) -> ExecResult:
+    def run(
+        self,
+        script: str,
+        *,
+        wall: int,
+        command: str,
+        capture_limit: int = 0,
+    ) -> ExecResult:
         return ExecResult(
             command=command,
             exit_code=0,
@@ -83,3 +95,51 @@ def test_pool_discards_a_dead_session(monkeypatch) -> None:
     pool.run("script", wall=1, command="b")
 
     assert _DeadSession.created == 2
+
+
+def test_pool_rejects_commands_after_close() -> None:
+    pool = _ShellSessionPool(["bash"], 1)
+    pool.close()
+
+    with pytest.raises(_SessionError, match="已关闭"):
+        pool.run("script", wall=1, command="a")
+
+
+def test_pool_close_also_closes_active_sessions(monkeypatch) -> None:
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingSession(_FakeSession):
+        def run(
+            self,
+            script: str,
+            *,
+            wall: int,
+            command: str,
+            capture_limit: int = 0,
+        ) -> ExecResult:
+            started.set()
+            release.wait(2)
+            return super().run(
+                script,
+                wall=wall,
+                command=command,
+                capture_limit=capture_limit,
+            )
+
+    monkeypatch.setattr(wsl_exec, "_ShellSession", _BlockingSession)
+    pool = _ShellSessionPool(["bash"], 1)
+    outcome: list[ExecResult] = []
+
+    def worker() -> None:
+        outcome.append(pool.run("script", wall=1, command="a"))
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert started.wait(2)
+    pool.close()
+    release.set()
+    thread.join(2)
+
+    assert not thread.is_alive()
+    assert outcome and outcome[0].stdout == "a"

@@ -23,6 +23,8 @@ from coding_agent.config import Settings
 from coding_agent.sandbox.pathguard import SandboxPathError, ensure_inside
 from coding_agent.sandbox.policy import CommandLevel
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
+from coding_agent.security.read_policy import is_protected_read_path
+from coding_agent.security.secrets import redact_secrets
 from coding_agent.tools.artifacts import ShellArtifact, pack
 
 SEARCH_CODE = "search_code"
@@ -33,6 +35,18 @@ MAX_RESULTS_CAP = 500
 
 # grep 不会读 .gitignore，这些目录必须显式排除，否则在带 .venv 的仓库里会扫到天荒地老
 EXCLUDED_DIRS = (".git", ".venv", "venv", "node_modules", ".agent", "__pycache__", "dist", "build")
+# 秘密文件即使被搜索命中也不回显；与 read_policy 的默认规则保持一致。
+# 这里按**文件名**排除（rg/grep 的 exclude 参数语义不同），路径型规则
+# （`.aws/**`、`.kube/**`）由输出侧的 `is_protected_read_path` 兜底。
+SECRET_EXCLUDES = (
+    ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx",
+    "id_rsa*", "id_ed25519*", "id_ecdsa*",
+    ".netrc", ".npmrc", ".pypirc", ".git-credentials",
+    "credentials", "credentials.json",
+    "*service-account*.json", "*service_account*.json",
+    "*.tfstate", "*.tfstate.backup", "*.jks", "*.keystore", "*.gpg",
+)
+SECRET_DIRS = (".aws", ".kube")
 
 _NO_MATCH_EXIT = 1
 
@@ -64,6 +78,10 @@ def _code_command(rg: bool, args: SearchCodeInput, target: str) -> str:
         parts.append("--ignore-case")
     if args.fixed:
         parts.append("--fixed-strings")
+    for name in SECRET_EXCLUDES:
+        parts.append(f"--glob=!{name}")
+    for name in SECRET_DIRS:
+        parts.append(f"--glob=!**/{name}/**")
     if args.glob:
         parts.append(f"--glob={args.glob}")
     parts += ["-e", args.pattern, "--", target]
@@ -77,20 +95,32 @@ def _grep_command(args: SearchCodeInput, target: str) -> str:
     parts = ["grep", "-rn", "--color=never", "-I", "-F" if args.fixed else "-E"]
     if args.ignore_case:
         parts.append("-i")
-    for name in EXCLUDED_DIRS:
+    for name in (*EXCLUDED_DIRS, *SECRET_DIRS):
         parts.append(f"--exclude-dir={name}")
+    # GNU grep 的 include/exclude 是「最后一个匹配的规则胜出」：必须先给
+    # include，再给 secret exclude，否则 include 会把 exclude 覆盖掉。
     if args.glob:
         parts.append(f"--include={args.glob}")
+    for name in SECRET_EXCLUDES:
+        parts.append(f"--exclude={name}")
     parts += ["-e", args.pattern, "--", target]
     return " ".join(shlex.quote(p) for p in parts)
 
 
 def _files_command(rg: bool, args: FindFilesInput, target: str) -> str:
     if rg:
-        parts = ["rg", "--files", "--glob", args.pattern, "--", target]
+        parts = ["rg", "--files"]
+        for name in SECRET_EXCLUDES:
+            parts.append(f"--glob=!{name}")
+        for name in SECRET_DIRS:
+            parts.append(f"--glob=!**/{name}/**")
+        parts += ["--glob", args.pattern, "--", target]
     else:
-        parts = ["find", target, "-type", "f", "-name", args.pattern]
-        for name in EXCLUDED_DIRS:
+        parts = ["find", target, "-type", "f"]
+        for name in SECRET_EXCLUDES:
+            parts += ["-not", "-name", name]
+        parts += ["-name", args.pattern]
+        for name in (*EXCLUDED_DIRS, *SECRET_DIRS):
             parts += ["-not", "-path", f"*/{name}/*"]
     return " ".join(shlex.quote(p) for p in parts)
 
@@ -103,8 +133,9 @@ def _trim_to_workspace(lines: list[str], root: str) -> list[str]:
 
 def build_search_tools(settings: Settings, sandbox: WslSandbox) -> list[BaseTool]:
     workspace = resolve_workspace(settings, sandbox)
-    # 探测一次就记住：每次调用都探一遍纯属浪费
-    has_rg = sandbox.run("command -v rg").ok
+    # 探测一次就记住：每次调用都探一遍纯属浪费。
+    # 显式 cwd：bwrap 模式下 workdir 不能为空。
+    has_rg = sandbox.run("command -v rg", cwd=workspace).ok
 
     def _resolve(path: str | None) -> tuple[str, str | None]:
         if not path:
@@ -130,8 +161,14 @@ def build_search_tools(settings: Settings, sandbox: WslSandbox) -> list[BaseTool
         if result.timed_out:
             return f"检索超时：{command}", artifact
         if result.exit_code not in (0, _NO_MATCH_EXIT):
-            return f"检索失败（exit={result.exit_code}）：\n{result.render(2000)}", artifact
-        return result.stdout, artifact
+            return (
+                f"检索失败（exit={result.exit_code}）：\n"
+                f"{redact_secrets(result.render(2000))}",
+                artifact,
+            )
+        # 命中内容可能来自未被文件名规则覆盖的配置（例如 config/database.yml）；
+        # 回灌模型前统一做一次 secret 脱敏。
+        return redact_secrets(result.stdout), artifact
 
     def _search_code(
         pattern: str,
@@ -154,6 +191,12 @@ def build_search_tools(settings: Settings, sandbox: WslSandbox) -> list[BaseTool
         stdout, artifact = _execute(command, reason)
 
         hits = _trim_to_workspace([line for line in stdout.splitlines() if line.strip()], workspace)
+        hits = [
+            line for line in hits
+            if not is_protected_read_path(
+                line.split(":", 1)[0], settings.read_deny_globs
+            )
+        ]
         shown = hits[:max_results]
         header = f"命中 {len(hits)} 条" + (
             f"，显示前 {len(shown)} 条" if len(hits) > len(shown) else ""
@@ -177,6 +220,10 @@ def build_search_tools(settings: Settings, sandbox: WslSandbox) -> list[BaseTool
 
         listing = [line for line in stdout.splitlines() if line.strip()]
         files = _trim_to_workspace(listing, workspace)
+        files = [
+            path for path in files
+            if not is_protected_read_path(path, settings.read_deny_globs)
+        ]
         # rg --files 的输出顺序不保证；排一下让结果稳定可复现
         files.sort()
         shown = files[:max_results]
@@ -207,4 +254,9 @@ def build_search_tools(settings: Settings, sandbox: WslSandbox) -> list[BaseTool
 
 def search_backend(sandbox: WslSandbox) -> str:
     """当前会用到哪个后端，供 doctor / 测试观察。"""
-    return "ripgrep" if sandbox.run("command -v rg").ok else "grep"
+    workspace = resolve_workspace(sandbox.settings, sandbox)
+    return (
+        "ripgrep"
+        if sandbox.run("command -v rg", cwd=workspace).ok
+        else "grep"
+    )

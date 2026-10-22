@@ -60,7 +60,9 @@ _META_NODES = {"__start__", "__end__"}
 def real_graph(monkeypatch: pytest.MonkeyPatch):
     """真实编译的图，只有沙箱探测被替换掉。"""
     monkeypatch.setattr(
-        WslSandbox, "_exec", lambda self, script, *, wall, command="": _FAKE_PROBE
+        WslSandbox,
+        "_exec",
+        lambda self, script, *, wall, command="", **kwargs: _FAKE_PROBE,
     )
     settings = Settings(
         _env_file=None,
@@ -173,3 +175,23 @@ def test_review_sits_between_verify_and_advance(real_graph) -> None:
     assert ("advance", "review") not in edges
     # 也不能绕开审查直接步进
     assert ("verify", "advance") not in edges
+
+
+def test_act_tools_loop_goes_through_the_cancel_checkpoint(real_graph) -> None:
+    """act/tools 的每一段都必须经过 steering_cancel。
+
+    否则 direct 模式下一步内部循环多轮工具时，/cancel 只能等整步结束；
+    反向断言防止有人把某条边接回旧拓扑，绕过检查点。
+    """
+    edges = _edges(real_graph)
+
+    assert ("act", "steering_cancel") in edges
+    assert ("tools", "steering_cancel") in edges
+    assert ("steering_cancel", "approval_gate") in edges
+    assert ("steering_cancel", "verify") in edges
+    assert ("steering_cancel", "act") in edges
+    assert ("steering_cancel", "steering_final") in edges
+    # 不能再有绕过检查点的直连
+    assert ("act", "approval_gate") not in edges
+    assert ("act", "verify") not in edges
+    assert ("tools", "act") not in edges

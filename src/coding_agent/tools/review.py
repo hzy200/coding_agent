@@ -196,6 +196,52 @@ WARNING_ANY = (
 )
 
 
+def inspect_markdown(rel, current):
+    """零依赖的文档检查：代码块闭合、相对链接、标题层级。"""
+    in_fence = False
+    previous_heading = 0
+    for lineno, line in enumerate(current.splitlines(), 1):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        heading = re.match(r"^(#{1,6})\s+", line)
+        if heading:
+            level = len(heading.group(1))
+            if previous_heading and level > previous_heading + 1:
+                add(
+                    "warning",
+                    "markdown-heading",
+                    "%s:%d" % (rel, lineno),
+                    "标题层级从 H%d 跳到 H%d" % (previous_heading, level),
+                )
+            previous_heading = level
+        for raw in re.findall(r"\[[^\]]*\]\(([^)]+)\)", line):
+            target = raw.strip()
+            if not target:
+                continue
+            target = target.split()[0].strip("<>")
+            if target.startswith(("#", "http://", "https://", "mailto:")):
+                continue
+            target = target.split("#", 1)[0]
+            if not target:
+                continue
+            resolved = os.path.normpath(
+                os.path.join(os.path.dirname(rel), target)
+            )
+            if not os.path.exists(os.path.join(ROOT, resolved)):
+                add(
+                    "warning",
+                    "markdown-link",
+                    "%s:%d" % (rel, lineno),
+                    "相对链接目标不存在：%s" % target,
+                )
+    if in_fence:
+        add("blocking", "markdown-code-fence", rel, "Markdown 代码块未闭合")
+
+
 def inspect(rel, before, current):
     if rel == ".agent" or rel.startswith(".agent/"):
         add("blocking", "agent-state", rel, "改动落在 agent 自己的状态目录 .agent/ 下")
@@ -211,6 +257,9 @@ def inspect(rel, before, current):
                 "%s:%s" % (rel, exc.lineno or 0),
                 "语法错误：%s" % exc.msg,
             )
+
+    if rel.endswith((".md", ".markdown")):
+        inspect_markdown(rel, current)
 
     in_test = is_test_file(rel)
     for lineno, text in added_lines(before, current):
@@ -286,6 +335,9 @@ if newest < WATERMARK:
 print("«MARKER»" + json.dumps({
     "findings": findings,
     "checked_files": checked,
+    # 供 linter 结果按「本次改动文件」过滤/提升级别；上限避免超大提交把
+    # 输出撑爆。
+    "changed_files": sorted(earliest)[:1000],
     "watermark": newest,
 }))
 '''
@@ -327,13 +379,33 @@ def build_script(root: str, *, watermark: str = "") -> str:
 
 # 命令文本**全部由宿主写死**：review 与自动 verify 一样不过审批，不能执行
 # 任何来自工作区文件的命令（理由见 graph/nodes/verify.py）。
+#
+# 刻意不接 eslint/prettier：它们的配置文件可以加载并执行插件，等于把
+# "审查"变成一条无审批的代码执行路径。gofmt/rustfmt 只做语法树格式化，无插件。
 _LINTERS: tuple[tuple[str, str, str], ...] = (
     ("ruff", "command -v ruff", "ruff check --output-format=concise ."),
-    ("mypy", "python3 -c 'import mypy'", "python3 -m mypy --no-color-output ."),
+    (
+        "mypy",
+        "python3 -c 'import mypy'",
+        # mypy 配置支持 `plugins=`，加载即执行工作区代码；审查不走审批，
+        # 所以强制空配置并禁用增量缓存（缓存也不该写进工作区）。
+        "python3 -m mypy --no-color-output --no-incremental "
+        "--cache-dir=/tmp/agent-mypy-cache --config-file=/dev/null .",
+    ),
+    ("gofmt", "command -v gofmt", "gofmt -l ."),
+    (
+        "rustfmt",
+        "command -v rustfmt",
+        "find . -name '*.rs' -not -path './.git/*' "
+        "-not -path './target/*' -not -path './.agent/*' -print0 "
+        "| xargs -0 -r rustfmt --check --edition 2021",
+    ),
 )
 
 # ruff concise 与 mypy 都是 `路径:行[:列]: 消息`
 _LINT_LINE = re.compile(r"^(?P<path>[^\s:][^:]*):(?P<line>\d+)(?::\d+)?:\s*(?P<msg>.+)$")
+# rustfmt --check 的输出形如 `Diff in /ws/src/main.rs at line 3:`
+_RUSTFMT_LINE = re.compile(r"^Diff in (?P<path>.+?) at line (?P<line>\d+):")
 
 
 def available_linters(sandbox: WslSandbox) -> list[str]:
@@ -345,24 +417,105 @@ def available_linters(sandbox: WslSandbox) -> list[str]:
     ]
 
 
-def _lint_findings(sandbox: WslSandbox, root: str, names: list[str]) -> list[ReviewFinding]:
-    """跑一遍探测到的 linter，输出按 warning 收（不阻断 repair 循环）。"""
+def _normalize_rel(path: str) -> str:
+    text = str(path).strip().replace("\\", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return posixpath.normpath(text).lstrip("/")
+
+
+def _lint_findings(
+    sandbox: WslSandbox,
+    root: str,
+    names: list[str],
+    *,
+    changed_files: set[str] | None = None,
+    blocking: bool = False,
+) -> list[ReviewFinding]:
+    """跑一遍探测到的 linter。
+
+    只把**本次改动文件**的发现提升为 blocking：仓库里已有的历史 lint 错误
+    不该让每一步都卡死。没有 changed_files 时退回 warning（兼容旧输出）。
+    """
     findings: list[ReviewFinding] = []
+    changed = {_normalize_rel(path) for path in (changed_files or ())}
+    root_norm = _normalize_rel(root).rstrip("/")
+
+    def rel_of(path: str) -> str:
+        rel = _normalize_rel(path)
+        if root_norm and rel.startswith(root_norm + "/"):
+            rel = rel[len(root_norm) + 1 :]
+        return rel
+
+    def add(
+        rel: str,
+        line: int | None,
+        rule: str,
+        message: str,
+        *,
+        block: bool = True,
+    ) -> None:
+        location = f"{rel}:{line}" if line is not None else rel
+        severity = (
+            BLOCKING
+            if block and blocking and changed and rel in changed
+            else WARNING
+        )
+        findings.append(
+            ReviewFinding(
+                severity=severity,
+                rule=rule,
+                location=location,
+                message=message,
+            )
+        )
+
     for name, _probe, command in _LINTERS:
         if name not in names:
             continue
         result = sandbox.run(command, cwd=root)
-        for line in (result.stdout + "\n" + result.stderr).splitlines():
+        output = (result.stdout + "\n" + result.stderr).splitlines()
+        if name == "gofmt":
+            for line in output:
+                rel = rel_of(line)
+                if not rel or not rel.endswith(".go"):
+                    continue
+                add(rel, None, "format:gofmt", "gofmt 检测到未格式化的代码")
+                if len(findings) >= MAX_FINDINGS:
+                    return findings
+            continue
+        if name == "rustfmt":
+            for line in output:
+                match = _RUSTFMT_LINE.match(line.strip())
+                if not match:
+                    continue
+                rel = rel_of(match.group("path"))
+                if changed and rel not in changed:
+                    continue
+                add(
+                    rel,
+                    int(match.group("line")),
+                    "format:rustfmt",
+                    "rustfmt 检测到未格式化的代码",
+                )
+                if len(findings) >= MAX_FINDINGS:
+                    return findings
+            continue
+        for line in output:
             match = _LINT_LINE.match(line.strip())
             if not match:
                 continue
-            findings.append(
-                ReviewFinding(
-                    severity=WARNING,
-                    rule=f"lint:{name}",
-                    location=f"{match.group('path')}:{match.group('line')}",
-                    message=match.group("msg").strip(),
-                )
+            rel = rel_of(match.group("path"))
+            if changed and rel not in changed:
+                continue
+            add(
+                rel,
+                int(match.group("line")),
+                f"lint:{name}",
+                match.group("msg").strip(),
+                # mypy 在空配置下容易因缺少 stub/项目设置产生噪声，只作告警；
+                # ruff/gofmt/rustfmt 的发现按改动文件阻断。
+                block=name != "mypy",
             )
             if len(findings) >= MAX_FINDINGS:
                 return findings
@@ -379,6 +532,7 @@ def run_review(
     *,
     watermark: str = "",
     enable_linters: bool = True,
+    lint_blocking: bool = False,
 ) -> ReviewResult:
     """审一遍自上次水位线以来的改动。
 
@@ -386,8 +540,12 @@ def run_review(
     审查没跑起来和审查通过是两件事，混为一谈等于把质量关变成摆设。
     """
     return parse_review(
-        sandbox, root, sandbox.run(build_script(root, watermark=watermark), cwd=root),
-        watermark=watermark, enable_linters=enable_linters,
+        sandbox,
+        root,
+        sandbox.run(build_script(root, watermark=watermark), cwd=root),
+        watermark=watermark,
+        enable_linters=enable_linters,
+        lint_blocking=lint_blocking,
     )
 
 
@@ -398,6 +556,7 @@ def parse_review(
     *,
     watermark: str = "",
     enable_linters: bool = True,
+    lint_blocking: bool = False,
 ) -> ReviewResult:
     """把脚本输出解析成 `ReviewResult`（与执行分开，便于单测）。"""
     payload: dict | None = None
@@ -428,7 +587,19 @@ def parse_review(
     if enable_linters:
         linters = available_linters(sandbox)
         if linters:
-            findings.extend(_lint_findings(sandbox, root, linters))
+            changed = {
+                _normalize_rel(path)
+                for path in (payload.get("changed_files") or [])
+            }
+            findings.extend(
+                _lint_findings(
+                    sandbox,
+                    root,
+                    linters,
+                    changed_files=changed,
+                    blocking=lint_blocking,
+                )
+            )
 
     blocking = sum(1 for f in findings if f.severity == BLOCKING)
     checked = int(payload["checked_files"])

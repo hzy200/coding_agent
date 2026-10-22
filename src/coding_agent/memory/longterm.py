@@ -20,9 +20,10 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from coding_agent.sandbox.fs import SandboxFs, SandboxFsError
-from coding_agent.sandbox.pathguard import SandboxPathError
+from coding_agent.sandbox.pathguard import SandboxPathError, normalize_root
 from coding_agent.sandbox.snapshots import AGENT_STATE_DIRNAME
 from coding_agent.security.secrets import secret_kinds
 
@@ -90,20 +91,41 @@ def _conflicts(new: str, old: str) -> bool:
     return len(a & b) / len(a | b) >= CONFLICT_SIMILARITY
 
 
+def resolve_memory_root(
+    settings: Any, sandbox: Any, workspace: str
+) -> str:
+    """记忆根目录：显式配置 > 仓库内（可信）> 沙箱家目录下（不可信）。
+
+    不可信仓库不能把 `.agent/memory.md` 当成可信事实注入，所以必须换到
+    仓库之外的路径；Web 租户会显式配置 per-user memory_root。
+    """
+    configured = str(getattr(settings, "memory_root", "") or "").strip()
+    if configured:
+        return normalize_root(configured)
+    if getattr(settings, "trust_repo_memory", True):
+        return workspace
+    home = sandbox.home()
+    return f"{home}/.agent-memory"
+
+
 class LongTermMemory:
-    def __init__(self, fs: SandboxFs, root: str) -> None:
+    def __init__(
+        self, fs: SandboxFs, root: str, *, state_root: str | None = None
+    ) -> None:
         self._fs = fs
+        # `root` 保留为展示用工作区根；实际文件与锁在 state_root。
         self.root = root
+        self.state_root = state_root or root
         # 最近一次 add 因冲突而被替换掉的旧事实（供 CLI/工具如实提示）
         self.last_replaced: list[str] = []
 
     @property
     def path(self) -> str:
-        return posixpath.join(self.root, MEMORY_RELPATH)
+        return posixpath.join(self.state_root, MEMORY_RELPATH)
 
     @property
     def meta_path(self) -> str:
-        return posixpath.join(self.root, MEMORY_META_RELPATH)
+        return posixpath.join(self.state_root, MEMORY_META_RELPATH)
 
     @contextmanager
     def _write_lock(self, timeout_s: float = 3.0) -> Iterator[None]:
@@ -120,7 +142,7 @@ class LongTermMemory:
             yield  # 测试用的假 fs：单进程，无竞争
             return
         lock_dir = posixpath.join(
-            self.root, AGENT_STATE_DIRNAME, "memory.lock.d"
+            self.state_root, AGENT_STATE_DIRNAME, "memory.lock.d"
         )
         quoted = shlex.quote(lock_dir)
         parent = shlex.quote(posixpath.dirname(lock_dir))

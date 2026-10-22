@@ -11,11 +11,15 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import secrets as _secrets
 from datetime import UTC, datetime
 from pathlib import Path
 
 from coding_agent.audit.models import AuditRecord
+from coding_agent.filelock import FileLock
 from coding_agent.security.secrets import redact_secrets
 
 MAX_ARG_CHARS = 400
@@ -88,6 +92,117 @@ def truncate(text: str, max_chars: int = MAX_DETAIL_CHARS) -> str:
     )
 
 
+def _canonical_record(record: AuditRecord) -> str:
+    payload = record.model_dump(
+        exclude={"prev_hash", "hash"}, exclude_none=True
+    )
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+def record_hash(record: AuditRecord, prev_hash: str) -> str:
+    material = f"{prev_hash}\n{_canonical_record(record)}"
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _read_last_hash(path: Path) -> str:
+    """读取一个片段最后一条有效记录的 hash；空/不存在返回空串。"""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            if size <= 0:
+                return ""
+            handle.seek(max(0, size - 65_536))
+            data = handle.read()
+    except OSError:
+        return ""
+    for raw in reversed(data.splitlines()):
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(payload, dict):
+            return str(payload.get("hash", "") or "")
+    return ""
+
+
+def _previous_piece(path: Path) -> Path | None:
+    match = _PIECE_RE.match(path.name)
+    if match is None:
+        return None
+    index = int(match.group(2) or 0)
+    if index <= 0:
+        return None
+    if index == 1:
+        return path.with_name(f"{match.group(1)}.jsonl")
+    return path.with_name(f"{match.group(1)}.{index - 1}.jsonl")
+
+
+def _chain_head(path: Path) -> str:
+    """当前片段若为空，链头来自上一片；不扫整个目录。"""
+    head = _read_last_hash(path)
+    if head:
+        return head
+    previous = _previous_piece(path)
+    while previous is not None:
+        head = _read_last_hash(previous)
+        if head:
+            return head
+        previous = _previous_piece(previous)
+    return ""
+
+
+def verify_audit_files(paths: list[Path]) -> tuple[bool, str]:
+    """验证审计哈希链。
+
+    返回 `(ok, message)`。旧日志没有 hash 字段：在遇到第一条 hashed 记录
+    之前按 legacy 跳过；一旦进入链，后续任何缺 hash/断链/内容改动都失败。
+    """
+    expected_prev = ""
+    started = False
+    checked = 0
+    for path in paths:
+        try:
+            handle = path.open("r", encoding="utf-8")
+        except OSError as exc:
+            return False, f"无法读取 {path}：{exc}"
+        with handle:
+            for lineno, line in enumerate(handle, start=1):
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    record = AuditRecord.model_validate_json(text)
+                except ValueError:
+                    return False, f"{path.name}:{lineno} 无法解析"
+                if not record.hash:
+                    if started:
+                        return (
+                            False,
+                            f"{path.name}:{lineno} 链中断：缺少 hash",
+                        )
+                    continue
+                if record.prev_hash != expected_prev:
+                    return (
+                        False,
+                        f"{path.name}:{lineno} 链中断：prev_hash 不匹配",
+                    )
+                computed = record_hash(record, expected_prev)
+                if not _secrets.compare_digest(record.hash, computed):
+                    return (
+                        False,
+                        f"{path.name}:{lineno} 内容哈希不匹配（可能被篡改）",
+                    )
+                expected_prev = record.hash
+                started = True
+                checked += 1
+    if not started:
+        return True, "仅包含 legacy 记录，没有可验证的哈希链"
+    return True, f"哈希链完整（{checked} 条带 hash 的记录）"
+
+
 def now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
@@ -150,14 +265,29 @@ class AuditLogger:
         if not self.enabled:
             return
         target: Path | None = None
+        day = self._day()
         try:
             if not self._dir_ready:
                 self.directory.mkdir(parents=True, exist_ok=True)
                 self._dir_ready = True
-            target = self._active_path()
-            line = record.model_dump_json(exclude_none=True)
-            with target.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+            # 多个进程可能写同一个审计目录；按天串行化「选片 + 追加」，
+            # 避免轮转判断与追加交错导致记录落进旧片或重复换片。
+            with FileLock(self.directory / f"{day}.lock"):
+                target = self._active_path()
+                # 写盘前统一脱敏，再计算哈希；两者必须基于同一份内容。
+                record.detail = redact_secrets(record.detail)
+                if record.steps:
+                    record.steps = [
+                        redact_secrets(step) for step in record.steps
+                    ]
+                if record.task:
+                    record.task = redact_secrets(record.task)
+                prev_hash = _chain_head(target)
+                record.prev_hash = prev_hash
+                record.hash = record_hash(record, prev_hash)
+                line = record.model_dump_json(exclude_none=True)
+                with target.open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
         except OSError as exc:
             raise AuditError(f"审计日志写入失败（{target or self.path}）：{exc}") from exc
 

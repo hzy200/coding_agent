@@ -51,6 +51,9 @@ class OrchestratorState(TypedDict, total=False):
     # 与父图同名：implement 补丁合并后需要把本次运行标记为「改过文件」。
     dirty: bool
     run_dirty: bool
+    # 合并过补丁、但主 agent 尚未执行自动验证；由 scheduler 置位，
+    # 父图 planner/verify 接手后消费。
+    pending_verification: bool
     worker_results: list[dict[str, Any]]
     task_extensions_seen: int
     task_extensions_applied: list[dict[str, Any]]
@@ -76,6 +79,8 @@ class OrchestratorState(TypedDict, total=False):
     scheduler_done: bool
     scheduler_continue: bool
     scheduler_deadline: float
+    # 自适应并发/退避状态（墙钟 + 计数），跨 checkpoint 边界保留。
+    scheduler_rate_limit: dict[str, float]
     token_budget_limit: int
     token_budget_spent: int
     token_budget_reserved: int

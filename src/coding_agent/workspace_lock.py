@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import threading
@@ -19,6 +20,30 @@ from pathlib import Path
 
 _ACTIVE: set[str] = set()
 _ACTIVE_LOCK = threading.Lock()
+
+# 锁被占用时各平台实际返回的 errno：
+# - Windows（msvcrt.locking）：EACCES
+# - POSIX（fcntl.flock）：EAGAIN / EWOULDBLOCK / EACCES
+# 必须与「文件系统不支持锁」区分开，否则第二个进程会把占用当成降级信号。
+_LOCK_BUSY_ERRNOS = frozenset(
+    {
+        errno.EACCES,
+        errno.EPERM,
+        errno.EAGAIN,
+        errno.EWOULDBLOCK,
+        errno.EDEADLK,
+    }
+)
+_LOCK_UNSUPPORTED_ERRNOS = frozenset(
+    value
+    for value in (
+        getattr(errno, "ENOTSUP", None),
+        getattr(errno, "EOPNOTSUPP", None),
+        errno.ENOSYS,
+        errno.ENOLCK,
+    )
+    if value is not None
+)
 
 
 class WorkspaceLock:
@@ -52,12 +77,25 @@ class WorkspaceLock:
                 raise OSError(f"无法创建/打开工作区锁：{self.path}") from exc
 
             os_locked = self._lock_os(handle)
+            if os_locked is False:
+                # 锁已被另一个进程持有：这是明确的「忙」，不能当成降级继续跑。
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+                return False
             _ACTIVE.add(self._key)
             self._handle = handle
-            self._os_locked = os_locked
+            self._os_locked = os_locked is True
             return True
 
-    def _lock_os(self, handle: object) -> bool:
+    def _lock_os(self, handle: object) -> bool | None:
+        """尝试加 OS 锁。
+
+        返回 `True` 已获得、`False` 被其他进程占用、`None` 不支持文件锁
+        （此时只能退化为进程内互斥）。把「忙」和「不支持」混为一谈会让
+        跨进程互斥在真正需要时恰好失效。
+        """
         try:
             if os.name == "nt":
                 import msvcrt
@@ -68,9 +106,15 @@ class WorkspaceLock:
 
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
             return True
-        except (OSError, ImportError):
-            # 网络盘/特殊文件系统可能不支持锁：退化为进程内互斥。
-            return False
+        except ImportError:
+            return None
+        except OSError as exc:
+            if exc.errno in _LOCK_BUSY_ERRNOS:
+                return False
+            if exc.errno in _LOCK_UNSUPPORTED_ERRNOS:
+                return None
+            # 未知的 OS 错误不冒充「被占用」，也不阻断启动：保持原来的可用性优先。
+            return None
 
     def release(self) -> None:
         with _ACTIVE_LOCK:

@@ -13,66 +13,17 @@ import json
 import os
 import threading
 import time
-from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from coding_agent.filelock import FileLock, NullLock
+
 DEFAULT_COOLDOWN_S = 2.0
 MAX_COOLDOWN_S = 60.0
-
-
-class _FileLock(AbstractContextManager["_FileLock"]):
-    """跨平台排他锁；不可用时退化为 no-op（仍能工作，只是少一层并发保护）。"""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self._file: Any = None
-
-    def __enter__(self) -> _FileLock:
-        try:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._file = open(self.path, "a+b")
-            self._file.seek(0)
-            if self._file.read(1) == b"":
-                self._file.write(b"0")
-                self._file.flush()
-            self._file.seek(0)
-            try:
-                import msvcrt
-
-                msvcrt.locking(self._file.fileno(), msvcrt.LK_LOCK, 1)
-            except ImportError:
-                import fcntl
-
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_EX)
-            except OSError:
-                pass
-        except OSError:
-            self._file = None
-        return self
-
-    def __exit__(self, *exc_info: Any) -> None:
-        if self._file is None:
-            return
-        try:
-            self._file.seek(0)
-            try:
-                import msvcrt
-
-                msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
-            except ImportError:
-                import fcntl
-
-                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-        finally:
-            try:
-                self._file.close()
-            except OSError:
-                pass
-            self._file = None
+# run 用量是诊断数据，不是长期账本：只保留最近这么多个 run，避免
+# 长期使用后 `.agent/rate_limits.json` 无限增长。
+MAX_RUNS = 200
 
 
 @dataclass
@@ -221,15 +172,21 @@ class RateLimitCoordinator:
             for run_id, raw_run in runs.items():
                 if not isinstance(raw_run, dict):
                     continue
-                current = self._runs.setdefault(
-                    str(run_id),
-                    {
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "cost_usd": 0.0,
-                        "providers": {},
-                    },
-                )
+                key = str(run_id)
+                raw_started = float(raw_run.get("started_at", 0.0) or 0.0)
+                current = self._runs.setdefault(key, self._empty_run())
+                current_started = float(current.get("started_at", 0.0) or 0.0)
+
+                if raw_started > current_started + 1e-6:
+                    # 共享文件里是更新的一代（例如别的进程刚 start_run(reset=True)）：
+                    # 整体替换，不能和旧计数取 max，否则 reset 会被立刻抵消。
+                    current.clear()
+                    current.update(self._empty_run(started_at=raw_started))
+                    current_started = raw_started
+                elif raw_started + 1e-6 < current_started:
+                    # 本地已经进入更新的一代，旧快照不应把计数抬回去。
+                    continue
+
                 for field_name in (
                     "input_tokens",
                     "output_tokens",
@@ -244,11 +201,7 @@ class RateLimitCoordinator:
                     float(current.get("cost_usd", 0.0) or 0.0),
                     float(raw_run.get("cost_usd", 0.0) or 0.0),
                 )
-                raw_started = float(raw_run.get("started_at", 0.0) or 0.0)
-                current_started = float(current.get("started_at", 0.0) or 0.0)
-                if raw_started and (
-                    not current_started or raw_started < current_started
-                ):
+                if raw_started and not current_started:
                     current["started_at"] = raw_started
                 raw_providers = raw_run.get("providers")
                 if not isinstance(raw_providers, dict):
@@ -276,9 +229,33 @@ class RateLimitCoordinator:
                         float(raw_usage.get("cost_usd", 0.0) or 0.0),
                     )
 
+    @staticmethod
+    def _empty_run(*, started_at: float = 0.0) -> dict[str, Any]:
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cost_usd": 0.0,
+            "cache_hit_tokens": 0,
+            "cache_miss_tokens": 0,
+            "started_at": started_at,
+            "providers": {},
+        }
+
+    def _prune_runs_locked(self) -> None:
+        """按开始时间保留最近 MAX_RUNS 个 run，避免共享文件无限增长。"""
+        if len(self._runs) <= MAX_RUNS:
+            return
+        ordered = sorted(
+            self._runs.items(),
+            key=lambda item: float(item[1].get("started_at", 0.0) or 0.0),
+        )
+        for run_id, _ in ordered[: max(0, len(self._runs) - MAX_RUNS)]:
+            self._runs.pop(run_id, None)
+
     def _write_shared_locked(self, *, acquire_lock: bool = True) -> None:
         if self.path is None:
             return
+        self._prune_runs_locked()
         payload = {
             "global_until": self._global_until,
             "runs": self._runs,
@@ -301,9 +278,9 @@ class RateLimitCoordinator:
         }
         lock_path = self.lock_path
         context = (
-            _FileLock(lock_path)
+            FileLock(lock_path)
             if acquire_lock and lock_path is not None
-            else _NoLock()
+            else NullLock()
         )
         with context:
             try:
@@ -348,7 +325,7 @@ class RateLimitCoordinator:
         with self._lock:
             lock_path = self.lock_path
             context = (
-                _FileLock(lock_path) if lock_path is not None else _NoLock()
+                FileLock(lock_path) if lock_path is not None else NullLock()
             )
             with context:
                 if self.path is not None:
@@ -375,21 +352,21 @@ class RateLimitCoordinator:
                 "cache_miss_tokens": state.cache_miss_tokens,
             }
 
-    def start_run(self, run_id: str) -> None:
+    def start_run(self, run_id: str, *, reset: bool = False) -> None:
+        """登记一次运行。
+
+        `reset=True` 用于**全新一轮 run**：`run_id`（runtime 用 thread_id）会在
+        同一会话里被复用，若只 setdefault，第二轮的成本与预算会继承第一轮。
+        resume 必须传 `reset=False`，否则挂起前的用量会被清零。
+        """
         with self._lock:
             self._sync_from_shared_locked()
-            run = self._runs.setdefault(
-                run_id,
-                {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cost_usd": 0.0,
-                    "cache_hit_tokens": 0,
-                    "cache_miss_tokens": 0,
-                    "providers": {},
-                },
-            )
-            run.setdefault("started_at", time.time())
+            now = time.time()
+            if reset:
+                self._runs[run_id] = self._empty_run(started_at=now)
+            else:
+                run = self._runs.setdefault(run_id, self._empty_run())
+                run.setdefault("started_at", now)
             self._write_shared_locked()
 
     def run_usage(self, run_id: str) -> dict[str, Any]:
@@ -429,9 +406,9 @@ class RateLimitCoordinator:
         with self._lock:
             lock_path = self.lock_path
             context = (
-                _FileLock(lock_path)
+                FileLock(lock_path)
                 if lock_path is not None
-                else _NoLock()
+                else NullLock()
             )
             with context:
                 if self.path is not None:
@@ -559,14 +536,6 @@ class RateLimitCoordinator:
                     self.path.unlink()
                 except OSError:
                     pass
-
-
-class _NoLock(AbstractContextManager["_NoLock"]):
-    def __enter__(self) -> _NoLock:
-        return self
-
-    def __exit__(self, *exc_info: Any) -> None:
-        return None
 
 
 GLOBAL_LIMITER = RateLimitCoordinator()

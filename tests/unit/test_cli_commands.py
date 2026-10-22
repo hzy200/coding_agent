@@ -13,9 +13,10 @@ import typer
 from rich.console import Console
 from typer.testing import CliRunner
 
-from coding_agent.audit import AuditLogger, AuditRecord
+from coding_agent.audit import AuditLogger, AuditRecord, read_records
 from coding_agent.cli import app as cli_app
 from coding_agent.config import Settings
+from coding_agent.events import ApprovalRequested
 from coding_agent.steering import SteeringController
 
 runner = CliRunner()
@@ -134,6 +135,17 @@ def test_audit_filters_by_thread(tmp_path, monkeypatch) -> None:
     assert "最近 1 条" in _text()
 
 
+def test_audit_verify_cli(tmp_path, monkeypatch) -> None:
+    settings = _scoped(tmp_path)
+    _write_records(settings)
+    _use_settings(monkeypatch, settings)
+
+    result = runner.invoke(cli_app.app, ["audit", "--verify"])
+
+    assert result.exit_code == 0
+    assert "哈希链" in _text()
+
+
 def test_audit_reads_an_explicit_path(tmp_path, monkeypatch) -> None:
     settings = _scoped(tmp_path)
     logger = _write_records(settings)
@@ -194,6 +206,7 @@ def test_doctor_reports_environment(tmp_path, monkeypatch) -> None:
     assert "环境自检" in text
     assert "Python 版本" in text
     assert "依赖 langgraph" in text
+    assert "跨进程文件锁" in text
     assert "WSL 发行版" in text
     # 退出码取决于真实环境（WSL/工作区是否就绪），只要求是 0 或 1
     assert result.exit_code in (0, 1)
@@ -283,6 +296,87 @@ def test_steer_command_writes_the_persistent_queue(monkeypatch, tmp_path) -> Non
     assert [item.action for item in commands] == ["add"]
     assert commands[0].text == "检查边界"
     assert commands[0].role == "review"
+
+    # CLI 通道也必须留审计：提交时落账，source 标明来源。
+    records = read_records(AuditLogger(settings.resolved_audit_dir).path)
+    assert records[-1].kind == "steering"
+    assert records[-1].source == "cli"
+    assert records[-1].thread_id == "t1"
+    assert "add: 检查边界" in records[-1].detail
+
+
+def test_steer_command_honours_an_explicit_queue_dir(monkeypatch, tmp_path) -> None:
+    settings = _scoped(
+        tmp_path, steering_dir=str(tmp_path / "default-steering")
+    )
+    _use_settings(monkeypatch, settings)
+    explicit = tmp_path / "shared-steering"
+
+    result = runner.invoke(
+        cli_app.app,
+        [
+            "steer",
+            "--thread-id",
+            "t1",
+            "pause",
+            "--steering-dir",
+            str(explicit),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert [item.action for item in SteeringController(explicit).peek("t1")] == [
+        "pause"
+    ]
+    # 默认目录不应被写入
+    assert SteeringController(settings.resolved_steering_dir).peek("t1") == []
+
+
+# ---------------- Web 公网守卫 ----------------
+
+def test_loopback_bind_detection() -> None:
+    assert cli_app._is_loopback_bind("127.0.0.1")
+    assert cli_app._is_loopback_bind("::1")
+    assert cli_app._is_loopback_bind("localhost")
+    assert not cli_app._is_loopback_bind("0.0.0.0")
+    assert not cli_app._is_loopback_bind("203.0.113.10")
+
+
+def test_remote_web_without_tokens_is_refused(tmp_path, monkeypatch) -> None:
+    _use_settings(monkeypatch, _scoped(tmp_path, web_auth_tokens=""))
+
+    result = runner.invoke(
+        cli_app.app, ["web", "--host", "0.0.0.0", "--allow-remote"]
+    )
+
+    assert result.exit_code == 2
+    assert "AUTH_TOKENS" in _text()
+
+
+def test_behind_proxy_without_tokens_is_refused(tmp_path, monkeypatch) -> None:
+    _use_settings(monkeypatch, _scoped(tmp_path, web_auth_tokens=""))
+
+    result = runner.invoke(cli_app.app, ["web", "--behind-proxy"])
+
+    assert result.exit_code == 2
+    assert "behind-proxy" in _text()
+
+
+# ---------------- 审批交互 ----------------
+
+def test_yes_does_not_auto_approve_danger(monkeypatch) -> None:
+    """--yes 只跳过 L2：L3 危险命令仍要人工回答。"""
+    monkeypatch.setattr(
+        type(cli_app.console), "input", lambda self, *args, **kwargs: "n"
+    )
+    requests = [
+        ApprovalRequested(request_id="l2", level="L2 变更性", command="pip install x"),
+        ApprovalRequested(request_id="l3", level="L3 危险", command="rm -rf /"),
+    ]
+
+    decisions = cli_app._ask_approval(requests, assume_yes=True)
+
+    assert decisions == {"l2": True, "l3": False}
 
 
 # ---------------- main 入口 ----------------

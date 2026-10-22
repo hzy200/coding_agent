@@ -25,6 +25,8 @@ from coding_agent.sandbox.fs import SandboxFs, SandboxFsError, SandboxFsTooLarge
 from coding_agent.sandbox.pathguard import SandboxPathError
 from coding_agent.sandbox.snapshots import MAX_OPERATIONAL_BYTES, SnapshotStore
 from coding_agent.sandbox.wsl_exec import WslSandbox, resolve_workspace
+from coding_agent.security.read_policy import protected_read_reason
+from coding_agent.security.secrets import redact_secrets
 from coding_agent.security.write_policy import protected_write_reason
 from coding_agent.tools.artifacts import CallArtifact, FileArtifact, pack
 
@@ -286,6 +288,25 @@ def build_file_tools(
         except SandboxPathError as exc:
             return _reject(path, "read", f"路径被拒绝：{exc}")
 
+        protected = protected_read_reason(
+            _relpath(target, root), settings.read_deny_globs
+        )
+        if protected:
+            return _reject(path, "read", protected)
+
+        # 词法路径可能是工作区内的符号链接（例如 safe.txt -> .env）。
+        # 读保护必须看 realpath，否则链接会绕过保护。
+        try:
+            info = fs.stat(target)
+        except (SandboxFsError, SandboxPathError):
+            info = None
+        if info is not None and info.real_path:
+            real_protected = protected_read_reason(
+                _relpath(info.real_path, root), settings.read_deny_globs
+            )
+            if real_protected:
+                return _reject(path, "read", real_protected)
+
         try:
             text = fs.read_text(target, max_bytes=max_bytes)
         except SandboxPathError as exc:
@@ -303,7 +324,13 @@ def build_file_tools(
         count = limit if limit is not None else DEFAULT_READ_LINES
         window = lines[start : start + count]
 
-        numbered = "\n".join(f"{start + i + 1:>6}\t{line}" for i, line in enumerate(window))
+        # 内容级兜底：路径规则覆盖不到的配置（例如 application.yml 里的
+        # 数据库密码）也要在进入模型上下文前脱敏。file_edit 仍按真实文件
+        # 匹配，所以模型只是看不到值，不会把脱敏占位符写回文件。
+        numbered = "\n".join(
+            f"{start + i + 1:>6}\t{redact_secrets(line)}"
+            for i, line in enumerate(window)
+        )
         header = f"文件 {_relpath(target, root)}（共 {total} 行"
         if window and (start or len(window) < total):
             header += f"，显示第 {start + 1}-{start + len(window)} 行"
@@ -661,6 +688,7 @@ def build_file_tools(
 
         blocks: list[str] = []
         artifact_files: list[str] = []
+        file_changes: list[dict[str, Any]] = []
         total_added = 0
         total_removed = 0
         for target, updated, original, _existed in entries:
@@ -670,14 +698,24 @@ def build_file_tools(
             total_added += added
             total_removed += removed
             artifact_files.append(relpath)
-            blocks.append(
-                f"- {relpath}（备份 {snapshot_ids.get(target, '')}）\n{diff}"
+            snapshot_id = snapshot_ids.get(target, "")
+            file_changes.append(
+                {
+                    "path": relpath,
+                    "action": "edit",
+                    "added": added,
+                    "removed": removed,
+                    "diff": diff,
+                    "snapshot_id": snapshot_id,
+                }
             )
+            blocks.append(f"- {relpath}（备份 {snapshot_id}）\n{diff}")
         artifact = CallArtifact(
             tool=EDIT_MANY_TOOL_NAME,
             ok=True,
             files=artifact_files,
             diff="\n".join(blocks),
+            file_changes=file_changes,
         )
         text = (
             f"[文件] {reason}\n批量修改 {len(entries)} 个文件"

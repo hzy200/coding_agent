@@ -27,6 +27,7 @@ from coding_agent.tools.review import (
     WARNING,
     ReviewFinding,
     ReviewResult,
+    _lint_findings,
     parse_review,
     script_body,
 )
@@ -99,6 +100,24 @@ def test_debug_leftovers_block(workspace: Path) -> None:
     finding = next(f for f in payload["findings"] if f["rule"] == "debug-breakpoint")
     assert finding["severity"] == BLOCKING
     assert finding["location"] == "a.py:2"  # 行号指向**新增**的那一行
+
+
+def test_unclosed_markdown_code_fence_blocks(workspace: Path) -> None:
+    _before(workspace, "docs/guide.md", "# 标题\n\n正文\n")
+    _now(workspace, "docs/guide.md", "# 标题\n\n```python\nprint(1)\n")
+
+    payload = _run(workspace)
+
+    assert "markdown-code-fence" in _rules(payload, BLOCKING)
+
+
+def test_broken_relative_markdown_link_warns(workspace: Path) -> None:
+    _before(workspace, "docs/guide.md", "# 标题\n")
+    _now(workspace, "docs/guide.md", "# 标题\n\n[不存在](missing.md)\n")
+
+    payload = _run(workspace)
+
+    assert "markdown-link" in _rules(payload, WARNING)
 
 
 def test_weakened_tests_block(workspace: Path) -> None:
@@ -330,12 +349,88 @@ def test_an_environment_failure_is_warned_and_does_not_advance_watermark(
     assert out["review_watermark"] == SID_OLD
 
 
+class _LintSandbox:
+    def __init__(self, stdout: str) -> None:
+        self.stdout = stdout
+
+    def run(self, command: str, *, cwd: str | None = None, **kwargs):  # noqa: ANN001
+        return ExecResult(
+            command=command,
+            exit_code=1,
+            stdout=self.stdout,
+            stderr="",
+            duration_ms=1,
+        )
+
+
+def test_lint_findings_block_only_changed_files() -> None:
+    sandbox = _LintSandbox("src/a.py:3: E501 line too long\n")
+
+    changed = _lint_findings(
+        sandbox,  # type: ignore[arg-type]
+        "/ws",
+        ["ruff"],
+        changed_files={"src/a.py"},
+        blocking=True,
+    )
+    unchanged = _lint_findings(
+        sandbox,  # type: ignore[arg-type]
+        "/ws",
+        ["ruff"],
+        changed_files={"src/b.py"},
+        blocking=True,
+    )
+
+    assert changed[0].severity == BLOCKING
+    assert unchanged == []  # 未改动文件的既有问题不进入本次审查
+
+
+def test_gofmt_findings_are_parsed() -> None:
+    sandbox = _LintSandbox("./src/main.go\n")
+
+    findings = _lint_findings(
+        sandbox,  # type: ignore[arg-type]
+        "/ws",
+        ["gofmt"],
+        changed_files={"src/main.go"},
+        blocking=True,
+    )
+
+    assert len(findings) == 1
+    assert findings[0].severity == BLOCKING
+    assert findings[0].rule == "format:gofmt"
+    assert findings[0].location == "src/main.go"
+
+
+def test_rustfmt_findings_are_parsed() -> None:
+    sandbox = _LintSandbox("Diff in /ws/src/main.rs at line 7:\n")
+
+    findings = _lint_findings(
+        sandbox,  # type: ignore[arg-type]
+        "/ws",
+        ["rustfmt"],
+        changed_files={"src/main.rs"},
+        blocking=True,
+    )
+
+    assert len(findings) == 1
+    assert findings[0].severity == BLOCKING
+    assert findings[0].rule == "format:rustfmt"
+    assert findings[0].location == "src/main.rs:7"
+
+
 def test_node_passes_the_watermark_through(monkeypatch: pytest.MonkeyPatch) -> None:
     """水位线从 state 读、推进后写回 —— 这是跨步骤不重复告警的传递链。"""
     captured: dict[str, object] = {}
 
-    def _fake_run(_sandbox, _root, *, watermark="", enable_linters=True):
-        captured.update(watermark=watermark, enable_linters=enable_linters)
+    def _fake_run(
+        _sandbox, _root, *, watermark="", enable_linters=True, lint_blocking=False
+    ):
+        captured.update(
+            watermark=watermark,
+            enable_linters=enable_linters,
+            lint_blocking=lint_blocking,
+        )
         return ReviewResult(status="clean", watermark=SID_NEW, checked_files=1)
 
     monkeypatch.setattr("coding_agent.graph.nodes.review.run_review", _fake_run)
@@ -345,6 +440,7 @@ def test_node_passes_the_watermark_through(monkeypatch: pytest.MonkeyPatch) -> N
         {"dirty": True, "review_watermark": SID_OLD}, None  # type: ignore[arg-type]
     )
     assert captured["watermark"] == SID_OLD
+    assert captured["lint_blocking"] is True
     assert out["review_watermark"] == SID_NEW
     assert out["review"]["status"] == "clean"
 

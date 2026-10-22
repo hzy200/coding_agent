@@ -27,13 +27,27 @@ def _sandbox_with_run(monkeypatch, stdout: str = "", exit_code: int = 0):
     sandbox = WslSandbox(Settings(_env_file=None))
     calls: list[tuple[str, str | None]] = []
 
-    def fake_run(command: str, *, cwd: str | None = None, timeout: int | None = None):
+    def fake_run(
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: int | None = None,
+        capture_limit: int | None = None,
+    ):
         calls.append((command, cwd))
         return ExecResult(
             command=command, exit_code=exit_code, stdout=stdout, stderr="", duration_ms=1
         )
 
+    def fake_exec(script: str, **_kwargs):  # noqa: ANN003
+        calls.append((script, None))
+        return ExecResult(
+            command=script, exit_code=exit_code, stdout=stdout, stderr="", duration_ms=1
+        )
+
     monkeypatch.setattr(sandbox, "run", fake_run)
+    # $HOME 探测走 _exec（绕过 bwrap；bwrap 需要已知 workdir）。
+    monkeypatch.setattr(sandbox, "_exec", fake_exec)
     return sandbox, calls
 
 

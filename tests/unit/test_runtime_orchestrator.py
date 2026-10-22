@@ -627,6 +627,24 @@ def test_estimate_recursion_limit_includes_the_orchestrator_path() -> None:
     assert orch == base + (2 + 1) * (6 + boundaries * 2) + 2
 
 
+def _record_usage_during_stream(graph: FakeGraph, provider: str, **usage: Any) -> None:
+    """在 runtime 完成 start_run(reset=True) 之后再记用量。
+
+    全新 run 现在会清零上一轮；如果测试在 `_collect` 之前预置用量，清零会
+    把它抹掉，测的就不是真实路径了。
+    """
+    original = graph.astream
+
+    async def astream(payload, config=None, stream_mode=None, subgraphs=None):  # noqa: ANN001
+        GLOBAL_LIMITER.record_usage(provider, run_id=THREAD, **usage)
+        async for chunk in original(
+            payload, config, stream_mode=stream_mode, subgraphs=subgraphs
+        ):
+            yield chunk
+
+    graph.astream = astream  # type: ignore[method-assign]
+
+
 def test_cost_report_includes_billing_reconciliation(
     monkeypatch, tmp_path
 ) -> None:
@@ -645,17 +663,17 @@ def test_cost_report_includes_billing_reconciliation(
         billing_enabled=True,
         rate_limit_state_path=":memory:",
     )
-    GLOBAL_LIMITER.reset()
-    GLOBAL_LIMITER.record_usage(
+    graph = FakeGraph(
+        [_updates(respond={"messages": [AIMessage(content="完成")]})]
+    )
+    _record_usage_during_stream(
+        graph,
         "provider-a",
         input_tokens=10,
         output_tokens=5,
         cost_usd=0.5,
-        run_id=THREAD,
     )
-    runtime._graph = FakeGraph(
-        [_updates(respond={"messages": [AIMessage(content="完成")]})]
-    )
+    runtime._graph = graph
 
     events = _collect(runtime)
 
@@ -673,17 +691,17 @@ def test_run_emits_cost_report_and_budget_alert(tmp_path) -> None:
         cost_alert_ratio=0.8,
         rate_limit_state_path=":memory:",
     )
-    GLOBAL_LIMITER.reset()
-    GLOBAL_LIMITER.record_usage(
+    graph = FakeGraph(
+        [_updates(respond={"messages": [AIMessage(content="完成")]})]
+    )
+    _record_usage_during_stream(
+        graph,
         "provider-a",
         input_tokens=100,
         output_tokens=50,
         cost_usd=0.9,
-        run_id=THREAD,
     )
-    runtime._graph = FakeGraph(
-        [_updates(respond={"messages": [AIMessage(content="完成")]})]
-    )
+    runtime._graph = graph
 
     events = _collect(runtime)
 

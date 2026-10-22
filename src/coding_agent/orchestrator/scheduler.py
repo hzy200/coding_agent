@@ -141,6 +141,8 @@ def make_scheduler_node(
         extension_errors: list[str] = []
         dirty = bool(state.get("dirty"))
         run_dirty = bool(state.get("run_dirty"))
+        # 跨多次 scheduler 调用累积：只要合并过、且主 agent 还没验证，就保持。
+        pending_verification = bool(state.get("pending_verification"))
         scheduler_deadline = float(state.get("scheduler_deadline") or 0.0)
         if scheduler_deadline <= 0:
             seconds = int(settings.orchestrator_run_deadline_s or 0)
@@ -212,10 +214,13 @@ def make_scheduler_node(
             getattr(settings, "concurrency_worker_timeout_s", 60.0) or 60.0
         )
         # 429/限流时临时降并发；成功后再逐步恢复到 max_limit。
+        # 状态随 state 跨 checkpoint 边界保留，否则每次回到 scheduler 都会
+        # 忘记上一段学到的并发上限。
         rate_limit = RateLimitState(
             max_limit=max_limit,
             backoff_base=settings.orchestrator_rate_limit_backoff_s,
         )
+        rate_limit.restore(state.get("scheduler_rate_limit"))
         budget = TokenBudget(settings.orchestrator_total_tokens, results)
         merge_queue = MergeQueue()
         token_budget_exhausted = False
@@ -236,6 +241,24 @@ def make_scheduler_node(
         max_pending_merges = max(
             1, int(settings.orchestrator_max_pending_merges or 1)
         )
+
+        # 入口防护：取消已在 steering_plan 被消费，`cancel_requested()` 看不到它。
+        # 这里以 state 为准，禁止任何 pending 任务在取消后仍被派发（防御性：
+        # 正常路径已由 steering_plan 的条件边截断）。
+        if state.get("steering_cancelled"):
+            for task in tasks:
+                if status.get(str(task["id"]), "pending") == "pending":
+                    status[str(task["id"])] = "cancelled"
+            return {
+                "scheduler_done": True,
+                "scheduler_continue": False,
+                "scheduler_deadline": scheduler_deadline,
+                "task_extensions_applied": applied,
+                "task_extension_errors": extension_errors,
+                "task_extensions_seen": seen,
+                "scheduler_rate_limit": rate_limit.snapshot(),
+                "task_status": status,
+            }
 
         def refresh_ready() -> None:
             nonlocal seq
@@ -381,6 +404,7 @@ def make_scheduler_node(
                 "task_extensions_applied": applied,
                 "task_extension_errors": extension_errors,
                 "task_extensions_seen": seen,
+                "scheduler_rate_limit": rate_limit.snapshot(),
             }
 
         async def abandon_inflight(*, reason: str, timed_out: bool) -> None:
@@ -458,7 +482,7 @@ def make_scheduler_node(
 
         async def flush_merges() -> None:
             """没有 implement 在飞/待启动时，原子合并整批补丁。"""
-            nonlocal dirty, run_dirty
+            nonlocal dirty, run_dirty, pending_verification
             merged_any = await merge_queue.flush(
                 sandbox=sandbox,
                 root=root,
@@ -468,6 +492,8 @@ def make_scheduler_node(
             if merged_any:
                 dirty = True
                 run_dirty = True
+                # 合并进了主工作区就必须让主 agent 至少跑一次自动验证。
+                pending_verification = True
 
         def discard_merges(reason: str) -> None:
             merge_queue.discard(reason, finalize)
@@ -703,7 +729,9 @@ def make_scheduler_node(
             "task_extension_errors": extension_errors,
             "dirty": dirty,
             "run_dirty": run_dirty,
+            "pending_verification": pending_verification,
             "scheduler_deadline": scheduler_deadline,
+            "scheduler_rate_limit": rate_limit.snapshot(),
             "token_budget_limit": budget.limit,
             "token_budget_spent": budget.spent,
             "token_budget_reserved": budget.reserved,

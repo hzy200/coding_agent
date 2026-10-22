@@ -99,6 +99,9 @@ def settings(tmp_path) -> Settings:
         audit_dir=str(tmp_path / "audit"),
         checkpoint_path=":memory:",
         deepseek_api_key="sk-test",
+        # 显式 workspace 避免本地匿名模式去探测 WSL $HOME。
+        wsl_workspace="/tmp/ws",
+        web_data_root=str(tmp_path / "web-data"),
     )
 
 
@@ -131,10 +134,15 @@ def test_index_page_is_served(settings) -> None:
 
 
 def test_index_has_no_build_chain(settings) -> None:
-    """刻意不引前端构建链：页面必须自包含。"""
-    html = TestClient(web.create_app(settings)).get("/").text
-    assert "<script src=" not in html
-    assert "import " not in html.split("<script>")[0]
+    """刻意不引前端构建链：静态 JS/CSS 直接由应用提供，没有打包步骤。"""
+    client = TestClient(web.create_app(settings))
+    html = client.get("/").text
+    assert "/static/app.js" in html
+    assert "/static/style.css" in html
+    assert "webpack" not in html.lower()
+    assert "vite" not in html.lower()
+    assert client.get("/static/app.js").status_code == 200
+    assert client.get("/static/style.css").status_code == 200
 
 
 def test_health_reports_configuration(settings) -> None:
@@ -165,7 +173,10 @@ def test_health_survives_broken_sandbox(monkeypatch, settings) -> None:
         async def aclose(self) -> None:
             pass
 
-    monkeypatch.setattr(web.app, "AgentRuntime", _Broken)
+    def _broken(_self, _user):
+        raise RuntimeError("WSL 不可用")
+
+    monkeypatch.setattr(web.app.TenantManager, "for_user", _broken)
     data = TestClient(web.create_app(settings)).get("/api/health").json()
     assert data["reachable"] is True
     assert "WSL 不可用" in data["error"]
@@ -226,7 +237,7 @@ def test_run_assigns_a_thread_id_when_missing(monkeypatch, settings) -> None:
     client = _client(monkeypatch, settings)
     resp = client.post("/api/run", json={"prompt": "hi"})
     assert resp.headers["x-thread-id"]
-    assert len(resp.headers["x-thread-id"]) == 8
+    assert 8 <= len(resp.headers["x-thread-id"]) <= 64
 
 
 def test_run_reuses_given_thread_id(monkeypatch, settings) -> None:
@@ -262,6 +273,40 @@ def test_run_closes_the_runtime(monkeypatch, settings) -> None:
 def test_run_rejects_empty_prompt(monkeypatch, settings) -> None:
     client = _client(monkeypatch, settings)
     assert client.post("/api/run", json={"prompt": ""}).status_code == 422
+
+
+def test_security_headers_are_present(monkeypatch, settings) -> None:
+    client = _client(monkeypatch, settings)
+    response = client.get("/")
+
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["x-frame-options"] == "DENY"
+    assert "default-src 'self'" in response.headers["content-security-policy"]
+
+
+def test_oversized_body_is_rejected(monkeypatch, settings) -> None:
+    settings = settings.model_copy(update={"web_max_body_bytes": 32})
+    client = _client(monkeypatch, settings)
+
+    response = client.post(
+        "/api/run",
+        content=b"x" * 64,
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 413
+
+
+def test_rate_limit_is_per_user(monkeypatch, settings) -> None:
+    settings = settings.model_copy(update={"web_rate_limit_per_min": 1})
+    client = _client(monkeypatch, settings)
+
+    first = client.post("/api/run", json={"prompt": "hi"})
+    second = client.post("/api/run", json={"prompt": "again"})
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert second.headers["retry-after"]
 
 
 def test_run_uses_ask_mode_so_approvals_can_resume(monkeypatch, settings) -> None:
@@ -308,6 +353,26 @@ def test_steering_and_resume_share_the_suspended_runtime(
     assert [f["type"] for f in _frames(resumed.text)][-1] == "run_finished"
     assert runtime.steering_resumed == 1
     assert runtime.closed is True
+
+
+def test_resume_steering_rejects_a_non_paused_session(
+    monkeypatch, settings
+) -> None:
+    """审批挂起不能误用 steering 恢复：payload 不同，会 fail-closed 拒绝工具。"""
+    runtime = FakeRuntime(
+        events=[
+            RunStarted(thread_id="t"),
+            RunFinished(thread_id="t", answer="done"),
+        ]
+    )
+    monkeypatch.setattr(web.app, "AgentRuntime", lambda *a, **k: runtime)
+    client = TestClient(web.create_app(settings))
+
+    client.post("/api/run", json={"prompt": "hi", "thread_id": "t"})
+    resp = client.post("/api/resume_steering/t")
+
+    assert resp.status_code == 409
+    assert runtime.steering_resumed == 0
 
 
 def test_approval_resume_endpoint(monkeypatch, settings) -> None:

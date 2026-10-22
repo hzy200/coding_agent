@@ -50,6 +50,31 @@ def test_global_wait_extends_the_cooldown() -> None:
     assert state.can_launch(now=12.0) is True
 
 
+def test_rate_limit_state_survives_a_checkpoint_boundary() -> None:
+    """scheduler 每次回到节点都会重建状态，学到的东西必须随 state 回来。"""
+    limited = {"status": "failed", "summary": "429 Too Many Requests"}
+    state = RateLimitState(max_limit=4, backoff_base=0.5)
+    state.on_result(limited)
+    state.on_result(limited)
+
+    restored = RateLimitState(max_limit=4, backoff_base=0.5)
+    restored.restore(state.snapshot())
+
+    assert restored.current_limit == 2
+    assert restored.streak == 2
+    assert restored.wait_remaining() > 0
+
+
+def test_rate_limit_restore_clamps_bad_values() -> None:
+    state = RateLimitState(max_limit=3, backoff_base=0.5)
+
+    state.restore({"current_limit": 99, "streak": -1, "not_before_wall": "bad"})
+
+    assert state.current_limit == 3
+    assert state.streak == 0
+    assert state.wait_remaining() == 0
+
+
 def test_token_budget_reserves_then_settles_actual_usage() -> None:
     budget = TokenBudget(100, [{"input_tokens": 40, "output_tokens": 0}])
 
