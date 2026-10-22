@@ -1,0 +1,1367 @@
+{
+  "contract": "coding-agent/config",
+  "version": 1,
+  "source": "src/coding_agent/config.py",
+  "priority": [
+    "构造函数参数",
+    ".env",
+    "环境变量",
+    "默认值"
+  ],
+  "priority_note": "刻意偏离「环境变量 > .env」的通用约定：某些工具链会在进程启动时注入用户看不见也删不掉的陈旧值，导致改 .env 不生效。项目目录里的 .env 是显式写下、看得见、可编辑的意图，因此让它优先。",
+  "count": 150,
+  "env_vars": [
+    "AGENT_ALLOW_RULES",
+    "AGENT_APPROVAL_MODE",
+    "AGENT_AUDIT_DIR",
+    "AGENT_AUDIT_ENABLED",
+    "AGENT_AUDIT_MAX_MB",
+    "AGENT_BILLING_ENABLED",
+    "AGENT_BILLING_TIMEOUT_S",
+    "AGENT_CHECKPOINT_KEEP",
+    "AGENT_CHECKPOINT_PATH",
+    "AGENT_CONCURRENCY_LLM_GLOBAL",
+    "AGENT_CONCURRENCY_LLM_PER_PROVIDER",
+    "AGENT_CONCURRENCY_LLM_TIMEOUT_S",
+    "AGENT_CONCURRENCY_TOOLS",
+    "AGENT_CONCURRENCY_WORKERS",
+    "AGENT_CONCURRENCY_WORKER_TIMEOUT_S",
+    "AGENT_CONCURRENCY_WSL",
+    "AGENT_CONCURRENCY_WSL_ADAPTIVE",
+    "AGENT_CONCURRENCY_WSL_LATENCY_WINDOW",
+    "AGENT_CONCURRENCY_WSL_MAX",
+    "AGENT_CONCURRENCY_WSL_MIN",
+    "AGENT_CONCURRENCY_WSL_RESERVE",
+    "AGENT_CONCURRENCY_WSL_TARGET_MS",
+    "AGENT_CONCURRENCY_WSL_TIMEOUT_S",
+    "AGENT_CONTEXT_KEEP_RECENT",
+    "AGENT_CONTEXT_MAX_CHARS",
+    "AGENT_CONTEXT_MAX_TOKENS",
+    "AGENT_CONTEXT_TOOL_CHARS",
+    "AGENT_COST_ALERT_RATIO",
+    "AGENT_DELEGATE_LARGE_CALLS",
+    "AGENT_DELEGATE_LARGE_FILES",
+    "AGENT_DELEGATE_MEDIUM_CALLS",
+    "AGENT_DELEGATE_MEDIUM_FILES",
+    "AGENT_DELEGATE_MIN_FILES",
+    "AGENT_DEPS_DETECT_TTL_S",
+    "AGENT_EXPLORE_ENABLED",
+    "AGENT_EXPLORE_MAX_REPORT_CHARS",
+    "AGENT_EXPLORE_MAX_ROUNDS",
+    "AGENT_EXPLORE_TIMEOUT",
+    "AGENT_INSTRUCTIONS_ENABLED",
+    "AGENT_LLM_AIMD_MAX",
+    "AGENT_LLM_AIMD_MIN",
+    "AGENT_LLM_FALLBACK_ON_ERROR",
+    "AGENT_LLM_PROVIDERS",
+    "AGENT_LLM_PROVIDER_MAX_WAIT_S",
+    "AGENT_LLM_ROUTING_STRATEGY",
+    "AGENT_LLM_TEMPERATURE",
+    "AGENT_LLM_TIMEOUT",
+    "AGENT_LSP_COMMAND",
+    "AGENT_LSP_DIAGNOSTICS_WAIT_S",
+    "AGENT_LSP_TIMEOUT",
+    "AGENT_MAX_CAPTURE_BYTES",
+    "AGENT_MAX_CONCURRENT_AGENTS",
+    "AGENT_MAX_CONCURRENT_TOOLS",
+    "AGENT_MAX_DELEGATE_CALLS",
+    "AGENT_MAX_FILE_READ_BYTES",
+    "AGENT_MAX_OUTPUT_CHARS",
+    "AGENT_MAX_PLAN_STEPS",
+    "AGENT_MAX_REPAIR_ROUNDS",
+    "AGENT_MAX_REPLANS",
+    "AGENT_MAX_RESUMES",
+    "AGENT_MAX_SAME_FAILURES",
+    "AGENT_MAX_TOOL_ROUNDS",
+    "AGENT_MEMORY_ROOT",
+    "AGENT_MEMORY_TOP_K",
+    "AGENT_NUDGE_EMPTY_STEPS",
+    "AGENT_ORCHESTRATOR_ADD_EXPLORE_TESTS",
+    "AGENT_ORCHESTRATOR_ALLOW_OVERLAP",
+    "AGENT_ORCHESTRATOR_CHECKPOINT_EVERY",
+    "AGENT_ORCHESTRATOR_CONTEXT_CHARS",
+    "AGENT_ORCHESTRATOR_ENABLED",
+    "AGENT_ORCHESTRATOR_FANIN_REDUCER",
+    "AGENT_ORCHESTRATOR_FANOUT_ARTIFACTS",
+    "AGENT_ORCHESTRATOR_MAX_CONCURRENT_WORKERS",
+    "AGENT_ORCHESTRATOR_MAX_PENDING_MERGES",
+    "AGENT_ORCHESTRATOR_MAX_TASKS",
+    "AGENT_ORCHESTRATOR_MIN_FILES",
+    "AGENT_ORCHESTRATOR_RATE_LIMIT_BACKOFF_S",
+    "AGENT_ORCHESTRATOR_RUN_DEADLINE_S",
+    "AGENT_ORCHESTRATOR_TASK_RETRIES",
+    "AGENT_ORCHESTRATOR_TASK_TOKENS",
+    "AGENT_ORCHESTRATOR_TOTAL_TOKENS",
+    "AGENT_ORCHESTRATOR_WORKER_MODEL",
+    "AGENT_ORCHESTRATOR_WORKER_REPAIRS",
+    "AGENT_ORCHESTRATOR_WORKER_ROUNDS",
+    "AGENT_ORCHESTRATOR_WORKER_TIMEOUT",
+    "AGENT_ORCHESTRATOR_WRITE_ENABLED",
+    "AGENT_ORCHESTRATOR_WRITE_PLAN_APPROVAL",
+    "AGENT_ORCHESTRATOR_WRITE_SCOPE_ENFORCE",
+    "AGENT_PERSISTENT_SHELL",
+    "AGENT_PERSISTENT_SHELL_POOL",
+    "AGENT_RATE_LIMIT_STATE_PATH",
+    "AGENT_READ_CACHE_MAX_BYTES",
+    "AGENT_READ_DENY_GLOBS",
+    "AGENT_REPO_MAP_CHARS",
+    "AGENT_RETRY_ATTEMPTS",
+    "AGENT_RETRY_BASE_DELAY_S",
+    "AGENT_RETRY_MAX_DELAY_S",
+    "AGENT_RETRY_MAX_TOTAL_WAIT_S",
+    "AGENT_REVIEW_ENABLED",
+    "AGENT_REVIEW_LINT_BLOCKING",
+    "AGENT_RUN_COST_BUDGET_USD",
+    "AGENT_RUN_DEADLINE_S",
+    "AGENT_SANDBOX_MAX_CONCURRENT_COMMANDS",
+    "AGENT_SECURITY_PROFILE",
+    "AGENT_SESSION_BRIEF_CHARS",
+    "AGENT_SHELL_CPU_SECONDS",
+    "AGENT_SHELL_ENV_ALLOWLIST",
+    "AGENT_SHELL_MAX_FILE_MB",
+    "AGENT_SHELL_MAX_PROCESSES",
+    "AGENT_SHELL_MEMORY_MB",
+    "AGENT_SHELL_NETWORK",
+    "AGENT_SHELL_SANDBOX",
+    "AGENT_SHELL_TIMEOUT",
+    "AGENT_STEERING_DIR",
+    "AGENT_SYMBOL_INDEX_TTL_S",
+    "AGENT_TOOL_JOURNAL_ENABLED",
+    "AGENT_TRUST_REPO_INSTRUCTIONS",
+    "AGENT_TRUST_REPO_MEMORY",
+    "AGENT_VERIFY_COMMAND",
+    "AGENT_VERIFY_ENABLED",
+    "AGENT_VERIFY_ONLY_FINAL",
+    "AGENT_VERIFY_TIMEOUT",
+    "AGENT_WEB_ALLOW_ANONYMOUS_LOCAL",
+    "AGENT_WEB_AUTH_TOKENS",
+    "AGENT_WEB_AUTH_TOKENS_FILE",
+    "AGENT_WEB_DATA_ROOT",
+    "AGENT_WEB_MAX_BODY_BYTES",
+    "AGENT_WEB_MAX_PROMPT_CHARS",
+    "AGENT_WEB_MAX_RUNTIMES",
+    "AGENT_WEB_MAX_RUNTIMES_PER_USER",
+    "AGENT_WEB_MEMORY_ROOT",
+    "AGENT_WEB_RATE_LIMIT_PER_MIN",
+    "AGENT_WEB_RUNTIME_TTL_S",
+    "AGENT_WEB_WORKSPACES_ROOT",
+    "AGENT_WORKSPACE_LOCK",
+    "AGENT_WRITE_DENY_GLOBS",
+    "AGENT_WSL_BREAKER_COOLDOWN_S",
+    "AGENT_WSL_BREAKER_FAILURES",
+    "AGENT_WSL_BREAKER_MAX_COOLDOWN_S",
+    "AGENT_WSL_DISTRO",
+    "AGENT_WSL_HEALTH_CHECK",
+    "AGENT_WSL_HEALTH_TIMEOUT_S",
+    "AGENT_WSL_HEALTH_TTL_S",
+    "AGENT_WSL_WORKSPACE",
+    "DEEPSEEK_API_KEY",
+    "DEEPSEEK_BASE_URL",
+    "DEEPSEEK_MODEL",
+    "LANGSMITH_API_KEY",
+    "LANGSMITH_PROJECT",
+    "LANGSMITH_TRACING"
+  ],
+  "fields": [
+    {
+      "name": "allow_rules",
+      "env": "AGENT_ALLOW_RULES",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "持久放行规则，逗号分隔的 `tool:glob`，例如 `shell_exec:git status*,run_tests:*`。只覆盖原本会 ASK 的 L2。"
+    },
+    {
+      "name": "approval_mode",
+      "env": "AGENT_APPROVAL_MODE",
+      "type": "str",
+      "default": "ask",
+      "section": "通用",
+      "doc": "ask（逐条询问）| approve（自动放行 L2；L3 仍需确认）| deny（一律拒绝）"
+    },
+    {
+      "name": "audit_dir",
+      "env": "AGENT_AUDIT_DIR",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "留空表示自动用 <当前目录>/.agent/audit"
+    },
+    {
+      "name": "audit_enabled",
+      "env": "AGENT_AUDIT_ENABLED",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "audit_max_mb",
+      "env": "AGENT_AUDIT_MAX_MB",
+      "type": "int",
+      "default": 0,
+      "section": "通用",
+      "doc": "单个审计文件超过该大小（MB）就轮转；0 表示不轮转"
+    },
+    {
+      "name": "billing_enabled",
+      "env": "AGENT_BILLING_ENABLED",
+      "type": "bool",
+      "default": false,
+      "section": "通用",
+      "doc": "是否在 run 结束时拉取 provider 账单做对账；默认关闭避免额外网络请求。"
+    },
+    {
+      "name": "billing_timeout_s",
+      "env": "AGENT_BILLING_TIMEOUT_S",
+      "type": "float",
+      "default": 10.0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "checkpoint_keep",
+      "env": "AGENT_CHECKPOINT_KEEP",
+      "type": "int",
+      "default": 200,
+      "section": "通用",
+      "doc": "每个 thread/命名空间保留的 checkpoint 数；0 = 不轮转。 每轮工具调用都会落一个 checkpoint，长期使用需要上限。"
+    },
+    {
+      "name": "checkpoint_path",
+      "env": "AGENT_CHECKPOINT_PATH",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "---------- 持久化与审计 ---------- 留空表示自动用 <当前目录>/.agent/checkpoints.sqlite；填 :memory: 强制不落盘"
+    },
+    {
+      "name": "concurrency_llm_global",
+      "env": "AGENT_CONCURRENCY_LLM_GLOBAL",
+      "type": "int",
+      "default": 6,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "concurrency_llm_per_provider",
+      "env": "AGENT_CONCURRENCY_LLM_PER_PROVIDER",
+      "type": "int",
+      "default": 4,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "concurrency_llm_timeout_s",
+      "env": "AGENT_CONCURRENCY_LLM_TIMEOUT_S",
+      "type": "float",
+      "default": 30.0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "concurrency_tools",
+      "env": "AGENT_CONCURRENCY_TOOLS",
+      "type": "int",
+      "default": 0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "concurrency_workers",
+      "env": "AGENT_CONCURRENCY_WORKERS",
+      "type": "int",
+      "default": 0,
+      "section": "通用",
+      "doc": "---------- 统一并发治理 ---------- 0 = 回退到旧的单项配置（orchestrator_max_concurrent_workers / sandbox_max_concurrent_commands / max_concurrent_tools）。"
+    },
+    {
+      "name": "concurrency_worker_timeout_s",
+      "env": "AGENT_CONCURRENCY_WORKER_TIMEOUT_S",
+      "type": "float",
+      "default": 60.0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "concurrency_wsl",
+      "env": "AGENT_CONCURRENCY_WSL",
+      "type": "int",
+      "default": 0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "concurrency_wsl_adaptive",
+      "env": "AGENT_CONCURRENCY_WSL_ADAPTIVE",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "基于命令 p95 延迟的弹性并发：高延迟降并发，低延迟逐步恢复。"
+    },
+    {
+      "name": "concurrency_wsl_latency_window",
+      "env": "AGENT_CONCURRENCY_WSL_LATENCY_WINDOW",
+      "type": "int",
+      "default": 20,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "concurrency_wsl_max",
+      "env": "AGENT_CONCURRENCY_WSL_MAX",
+      "type": "int",
+      "default": 0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "concurrency_wsl_min",
+      "env": "AGENT_CONCURRENCY_WSL_MIN",
+      "type": "int",
+      "default": 2,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "concurrency_wsl_reserve",
+      "env": "AGENT_CONCURRENCY_WSL_RESERVE",
+      "type": "int",
+      "default": 1,
+      "section": "通用",
+      "doc": "给健康探针/短探测保留的 WSL 槽位；普通命令不能用。"
+    },
+    {
+      "name": "concurrency_wsl_target_ms",
+      "env": "AGENT_CONCURRENCY_WSL_TARGET_MS",
+      "type": "int",
+      "default": 1500,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "concurrency_wsl_timeout_s",
+      "env": "AGENT_CONCURRENCY_WSL_TIMEOUT_S",
+      "type": "float",
+      "default": 30.0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "context_keep_recent",
+      "env": "AGENT_CONTEXT_KEEP_RECENT",
+      "type": "int",
+      "default": 12,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "context_max_chars",
+      "env": "AGENT_CONTEXT_MAX_CHARS",
+      "type": "int",
+      "default": 60000,
+      "section": "通用",
+      "doc": "---------- 上下文裁剪 ---------- 0 表示不裁剪；这些值作用于发给模型的历史，不改写会话状态"
+    },
+    {
+      "name": "context_max_tokens",
+      "env": "AGENT_CONTEXT_MAX_TOKENS",
+      "type": "int",
+      "default": 0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "context_tool_chars",
+      "env": "AGENT_CONTEXT_TOOL_CHARS",
+      "type": "int",
+      "default": 1500,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "cost_alert_ratio",
+      "env": "AGENT_COST_ALERT_RATIO",
+      "type": "float",
+      "default": 0.8,
+      "section": "通用",
+      "doc": "达到预算的该比例时发出告警（0~1）"
+    },
+    {
+      "name": "delegate_large_calls",
+      "env": "AGENT_DELEGATE_LARGE_CALLS",
+      "type": "int",
+      "default": 4,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "delegate_large_files",
+      "env": "AGENT_DELEGATE_LARGE_FILES",
+      "type": "int",
+      "default": 300,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "delegate_medium_calls",
+      "env": "AGENT_DELEGATE_MEDIUM_CALLS",
+      "type": "int",
+      "default": 2,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "delegate_medium_files",
+      "env": "AGENT_DELEGATE_MEDIUM_FILES",
+      "type": "int",
+      "default": 100,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "delegate_min_files",
+      "env": "AGENT_DELEGATE_MIN_FILES",
+      "type": "int",
+      "default": 30,
+      "section": "通用",
+      "doc": "---- 成本感知的委派预算（按仓库文件数分级）---- 小于 min_files：不委派，直接读；[min, medium)：medium_calls； [medium, large)：large_calls；>= large：max_delegate_calls。"
+    },
+    {
+      "name": "deps_detect_ttl_s",
+      "env": "AGENT_DEPS_DETECT_TTL_S",
+      "type": "float",
+      "default": 30.0,
+      "section": "通用",
+      "doc": "包管理器探测缓存时间；安装后会主动失效。"
+    },
+    {
+      "name": "explore_enabled",
+      "env": "AGENT_EXPLORE_ENABLED",
+      "type": "bool",
+      "default": false,
+      "section": "通用",
+      "doc": "---------- 子智能体（Phase 1：只读 Explore）---------- **默认关闭**：它会给主模型多一个工具、改变 agent 行为，打开后旧评测基线 不再可比。评测时显式设置 AGENT_EXPLORE_ENABLED=true 做 A/B。"
+    },
+    {
+      "name": "explore_max_report_chars",
+      "env": "AGENT_EXPLORE_MAX_REPORT_CHARS",
+      "type": "int",
+      "default": 4000,
+      "section": "通用",
+      "doc": "返回给主模型的摘要上限（字符）"
+    },
+    {
+      "name": "explore_max_rounds",
+      "env": "AGENT_EXPLORE_MAX_ROUNDS",
+      "type": "int",
+      "default": 8,
+      "section": "通用",
+      "doc": "子智能体最多几轮「模型 → 工具」；到顶后强制生成报告，状态记 partial。 定位一个跨文件功能通常需要 6–10 轮只读检索；6 轮实测会频繁 partial。"
+    },
+    {
+      "name": "explore_timeout",
+      "env": "AGENT_EXPLORE_TIMEOUT",
+      "type": "int",
+      "default": 120,
+      "section": "通用",
+      "doc": "整个子智能体的墙钟上限（秒）"
+    },
+    {
+      "name": "instructions_enabled",
+      "env": "AGENT_INSTRUCTIONS_ENABLED",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "是否发现并注入仓库内的 AGENTS.md / CLAUDE.md（分层项目指令）。"
+    },
+    {
+      "name": "llm_aimd_max",
+      "env": "AGENT_LLM_AIMD_MAX",
+      "type": "int",
+      "default": 8,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "llm_aimd_min",
+      "env": "AGENT_LLM_AIMD_MIN",
+      "type": "int",
+      "default": 1,
+      "section": "通用",
+      "doc": "LLM 每个 provider 的自适应并发范围。"
+    },
+    {
+      "name": "llm_fallback_on_error",
+      "env": "AGENT_LLM_FALLBACK_ON_ERROR",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "非 429 错误是否也尝试下一个 provider。"
+    },
+    {
+      "name": "llm_providers",
+      "env": "AGENT_LLM_PROVIDERS",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "可选多 provider JSON；空 = 只用 DEEPSEEK_* 单 provider。 [{\"name\":\"deepseek\",\"base_url\":\"...\",\"api_key\":\"...\",\"model\":\"...\", \"priority\":0}, {\"name\":\"backup\",\"api_key_env\":\"BACKUP_API_KEY\",...}]"
+    },
+    {
+      "name": "llm_provider_max_wait_s",
+      "env": "AGENT_LLM_PROVIDER_MAX_WAIT_S",
+      "type": "float",
+      "default": 30.0,
+      "section": "通用",
+      "doc": "所有 provider 都在冷却时，单次调用最多等待多久再放弃。"
+    },
+    {
+      "name": "llm_routing_strategy",
+      "env": "AGENT_LLM_ROUTING_STRATEGY",
+      "type": "str",
+      "default": "cost",
+      "section": "通用",
+      "doc": "cost（按 provider 单价排序）| priority（按配置顺序）"
+    },
+    {
+      "name": "llm_temperature",
+      "env": "AGENT_LLM_TEMPERATURE",
+      "type": "float",
+      "default": 0.0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "llm_timeout",
+      "env": "AGENT_LLM_TIMEOUT",
+      "type": "int",
+      "default": 120,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "lsp_command",
+      "env": "AGENT_LSP_COMMAND",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "可选 language server 命令；空 = 不启用（symbol_search 仍用 AST）。"
+    },
+    {
+      "name": "lsp_diagnostics_wait_s",
+      "env": "AGENT_LSP_DIAGNOSTICS_WAIT_S",
+      "type": "float",
+      "default": 2.0,
+      "section": "通用",
+      "doc": "pull 诊断不可用时，等待 publishDiagnostics 的最长时间。"
+    },
+    {
+      "name": "lsp_timeout",
+      "env": "AGENT_LSP_TIMEOUT",
+      "type": "float",
+      "default": 10.0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "max_capture_bytes",
+      "env": "AGENT_MAX_CAPTURE_BYTES",
+      "type": "int",
+      "default": 1000000,
+      "section": "通用",
+      "doc": "宿主从沙箱捕获单条命令输出的字节上限（stdout/stderr 各自）。 `max_output_chars` 只控制回灌给模型的文本；捕获阶段若不设上限， 一条 `yes`/`cat big.log` 会在截断前先把宿主内存打满。"
+    },
+    {
+      "name": "max_concurrent_agents",
+      "env": "AGENT_MAX_CONCURRENT_AGENTS",
+      "type": "int",
+      "default": 4,
+      "section": "通用",
+      "doc": "同一条消息里的多个 delegate 调用最多同时跑几个。 子智能体只读，所以并发不会产生写冲突；限制主要是控制成本与 wsl.exe 压力。"
+    },
+    {
+      "name": "max_concurrent_tools",
+      "env": "AGENT_MAX_CONCURRENT_TOOLS",
+      "type": "int",
+      "default": 4,
+      "section": "通用",
+      "doc": "同一条消息里的多个只读工具最多同时跑几个；写工具始终串行。"
+    },
+    {
+      "name": "max_delegate_calls",
+      "env": "AGENT_MAX_DELEGATE_CALLS",
+      "type": "int",
+      "default": 6,
+      "section": "通用",
+      "doc": "单个任务最多委派几次探索 —— 与主 agent 的工具轮次预算相互独立。 默认给到 6：提示词鼓励把互不依赖的区域拆成多个并发 delegate， 预算若只有 2 会与这条建议直接冲突（实测 5 个里 3 个被预算拒绝）。"
+    },
+    {
+      "name": "max_file_read_bytes",
+      "env": "AGENT_MAX_FILE_READ_BYTES",
+      "type": "int",
+      "default": 2000000,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "max_output_chars",
+      "env": "AGENT_MAX_OUTPUT_CHARS",
+      "type": "int",
+      "default": 20000,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "max_plan_steps",
+      "env": "AGENT_MAX_PLAN_STEPS",
+      "type": "int",
+      "default": 5,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "max_repair_rounds",
+      "env": "AGENT_MAX_REPAIR_ROUNDS",
+      "type": "int",
+      "default": 3,
+      "section": "通用",
+      "doc": "---------- Agent 循环 ----------"
+    },
+    {
+      "name": "max_replans",
+      "env": "AGENT_MAX_REPLANS",
+      "type": "int",
+      "default": 2,
+      "section": "通用",
+      "doc": "执行中「重建剩余计划」的次数上限。计划可以修正，但不能无限改 —— 边做边改没有收敛点，而每次重规划都要多一次模型调用"
+    },
+    {
+      "name": "max_resumes",
+      "env": "AGENT_MAX_RESUMES",
+      "type": "int",
+      "default": 50,
+      "section": "通用",
+      "doc": "同一会话内「挂起→恢复」的总次数上限，防前端反复 resume 绕开 recursion_limit"
+    },
+    {
+      "name": "max_same_failures",
+      "env": "AGENT_MAX_SAME_FAILURES",
+      "type": "int",
+      "default": 2,
+      "section": "通用",
+      "doc": "连续出现同一失败签名多少次后停止 repair、改走 replan。 24 次相同失败验证的教训：没有这道闸，repair 会把同一类修改重复到额度耗尽。"
+    },
+    {
+      "name": "max_tool_rounds",
+      "env": "AGENT_MAX_TOOL_ROUNDS",
+      "type": "int",
+      "default": 12,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "memory_root",
+      "env": "AGENT_MEMORY_ROOT",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "长期记忆根目录（WSL 绝对路径）；空则按 trust_repo_memory 推导。"
+    },
+    {
+      "name": "memory_top_k",
+      "env": "AGENT_MEMORY_TOP_K",
+      "type": "int",
+      "default": 8,
+      "section": "通用",
+      "doc": "每次运行注入系统提示的长期记忆条数（按与请求的相关度取前 K 条）。 0 表示不限制，整份注入 —— 记忆上限 50 条，但每条都会进入每一轮 system prompt。"
+    },
+    {
+      "name": "nudge_empty_steps",
+      "env": "AGENT_NUDGE_EMPTY_STEPS",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "「一步没有任何改动」时是否给它一次重做的机会。  背景：`dirty=False` 时 verify 与 review 都会短路，控制流直接 advance —— 于是「这一步只读了文件」与「这一步做完了」在图上**无法区分**。实测过一整批 长程任务因此把计划\"读\"完就算完成：10 次运行里 5 次一次写都没尝试过。  默认开启，但**必须可关**：它会改变所有任务的行为，现有基线因此不再可比 （评测的 baseline 里记了这个开关）。"
+    },
+    {
+      "name": "orchestrator_add_explore_tests",
+      "env": "AGENT_ORCHESTRATOR_ADD_EXPLORE_TESTS",
+      "type": "bool",
+      "default": false,
+      "section": "通用",
+      "doc": "只读模式下模型只给一个任务时，是否强行补一个「找测试」explore 任务。 默认关闭：这会增加一次 worker 成本，只有演示并发/确实需要测试画像时才值得。"
+    },
+    {
+      "name": "orchestrator_allow_overlap",
+      "env": "AGENT_ORCHESTRATOR_ALLOW_OVERLAP",
+      "type": "bool",
+      "default": false,
+      "section": "通用",
+      "doc": "允许多个 implement 修改同一文件；合并时用 git apply --3way。 有真实冲突时整批回滚，不会把冲突标记落进主工作区。"
+    },
+    {
+      "name": "orchestrator_checkpoint_every",
+      "env": "AGENT_ORCHESTRATOR_CHECKPOINT_EVERY",
+      "type": "int",
+      "default": 4,
+      "section": "通用",
+      "doc": "scheduler 每完成多少个任务返回一次父图，形成 checkpoint/干预边界。"
+    },
+    {
+      "name": "orchestrator_context_chars",
+      "env": "AGENT_ORCHESTRATOR_CONTEXT_CHARS",
+      "type": "int",
+      "default": 8000,
+      "section": "通用",
+      "doc": "交给主 agent 的 worker 汇总上限（字符）。"
+    },
+    {
+      "name": "orchestrator_enabled",
+      "env": "AGENT_ORCHESTRATOR_ENABLED",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "---------- Orchestrator（Phase 3A）---------- 新架构默认启用：满足规模阈值的仓库走 harness；小仓库仍走 direct 快速路径。"
+    },
+    {
+      "name": "orchestrator_fanin_reducer",
+      "env": "AGENT_ORCHESTRATOR_FANIN_REDUCER",
+      "type": "bool",
+      "default": false,
+      "section": "通用",
+      "doc": "fan-in 超预算/有冲突时才调用一次 reducer LLM；失败回退确定性汇总。"
+    },
+    {
+      "name": "orchestrator_fanout_artifacts",
+      "env": "AGENT_ORCHESTRATOR_FANOUT_ARTIFACTS",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "fan-in 是否落 artifact store 并输出结构化结果。"
+    },
+    {
+      "name": "orchestrator_max_concurrent_workers",
+      "env": "AGENT_ORCHESTRATOR_MAX_CONCURRENT_WORKERS",
+      "type": "int",
+      "default": 4,
+      "section": "通用",
+      "doc": "同一批 ready 任务最多并发几个只读 worker。"
+    },
+    {
+      "name": "orchestrator_max_pending_merges",
+      "env": "AGENT_ORCHESTRATOR_MAX_PENDING_MERGES",
+      "type": "int",
+      "default": 8,
+      "section": "通用",
+      "doc": "在飞 implement + 待合并补丁的上限；超过后暂停启动新的 implement， 先让合并队列排空，避免补丁/快照堆积。"
+    },
+    {
+      "name": "orchestrator_max_tasks",
+      "env": "AGENT_ORCHESTRATOR_MAX_TASKS",
+      "type": "int",
+      "default": 6,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "orchestrator_min_files",
+      "env": "AGENT_ORCHESTRATOR_MIN_FILES",
+      "type": "int",
+      "default": 30,
+      "section": "通用",
+      "doc": "小于该文件数不做编排，直接单 agent。"
+    },
+    {
+      "name": "orchestrator_rate_limit_backoff_s",
+      "env": "AGENT_ORCHESTRATOR_RATE_LIMIT_BACKOFF_S",
+      "type": "float",
+      "default": 2.0,
+      "section": "通用",
+      "doc": "遇到 429/限流时 scheduler 的首次退避秒数；之后指数增长，上限 30s。"
+    },
+    {
+      "name": "orchestrator_run_deadline_s",
+      "env": "AGENT_ORCHESTRATOR_RUN_DEADLINE_S",
+      "type": "int",
+      "default": 900,
+      "section": "通用",
+      "doc": "整个编排阶段（含所有 worker）的墙钟上限，0 表示不限制。"
+    },
+    {
+      "name": "orchestrator_task_retries",
+      "env": "AGENT_ORCHESTRATOR_TASK_RETRIES",
+      "type": "int",
+      "default": 1,
+      "section": "通用",
+      "doc": "单个任务失败后最多重试几次（0 = 不重试）。重试仍失败才把依赖方标 blocked。"
+    },
+    {
+      "name": "orchestrator_task_tokens",
+      "env": "AGENT_ORCHESTRATOR_TASK_TOKENS",
+      "type": "int",
+      "default": 0,
+      "section": "通用",
+      "doc": "单任务 token 上限，0 表示不限制（由 provider 回报的 usage 累计判断）。"
+    },
+    {
+      "name": "orchestrator_total_tokens",
+      "env": "AGENT_ORCHESTRATOR_TOTAL_TOKENS",
+      "type": "int",
+      "default": 0,
+      "section": "通用",
+      "doc": "整个编排阶段的 token 上限，0 = 不限制。scheduler 在派发前按角色预留， 预留 + 已用超过上限时不再启动新任务。"
+    },
+    {
+      "name": "orchestrator_worker_model",
+      "env": "AGENT_ORCHESTRATOR_WORKER_MODEL",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "worker 专用模型；空串表示继承 DEEPSEEK_MODEL。用于 explore/review 降本。"
+    },
+    {
+      "name": "orchestrator_worker_repairs",
+      "env": "AGENT_ORCHESTRATOR_WORKER_REPAIRS",
+      "type": "int",
+      "default": 2,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "orchestrator_worker_rounds",
+      "env": "AGENT_ORCHESTRATOR_WORKER_ROUNDS",
+      "type": "int",
+      "default": 12,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "orchestrator_worker_timeout",
+      "env": "AGENT_ORCHESTRATOR_WORKER_TIMEOUT",
+      "type": "int",
+      "default": 240,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "orchestrator_write_enabled",
+      "env": "AGENT_ORCHESTRATOR_WRITE_ENABLED",
+      "type": "bool",
+      "default": false,
+      "section": "通用",
+      "doc": "---- Phase 3C：并发写 worker（默认关闭）---- 打开后，orchestrator 才可能生成 implement 任务；还要求 --write、工作区是 git 仓库且干净。worker 在独立 git worktree 中修改，完成后由宿主合并补丁。"
+    },
+    {
+      "name": "orchestrator_write_plan_approval",
+      "env": "AGENT_ORCHESTRATOR_WRITE_PLAN_APPROVAL",
+      "type": "bool",
+      "default": false,
+      "section": "通用",
+      "doc": "派发 implement 前一次性展示 write_scope 并等待确认（并发区不弹审批）。"
+    },
+    {
+      "name": "orchestrator_write_scope_enforce",
+      "env": "AGENT_ORCHESTRATOR_WRITE_SCOPE_ENFORCE",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "写 worker 的 write_scope 在 I/O 前强制校验（三重防线之一）。"
+    },
+    {
+      "name": "persistent_shell",
+      "env": "AGENT_PERSISTENT_SHELL",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "常驻 WSL bash 会话池。默认开启：实测读/检索从 ~170ms 降到 ~20ms。 会话异常时会自动退回逐命令 wsl.exe，因此可安全地作为默认值。"
+    },
+    {
+      "name": "persistent_shell_pool",
+      "env": "AGENT_PERSISTENT_SHELL_POOL",
+      "type": "int",
+      "default": 4,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "rate_limit_state_path",
+      "env": "AGENT_RATE_LIMIT_STATE_PATH",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "跨进程限流状态文件；留空 = <当前目录>/.agent/rate_limits.json；:memory: 关闭"
+    },
+    {
+      "name": "read_cache_max_bytes",
+      "env": "AGENT_READ_CACHE_MAX_BYTES",
+      "type": "int",
+      "default": "64 * 1024 * 1024",
+      "section": "通用",
+      "doc": "run 级文件内容缓存的字节上限（LRU）。0 = 关闭缓存。"
+    },
+    {
+      "name": "read_deny_globs",
+      "env": "AGENT_READ_DENY_GLOBS",
+      "type": "str",
+      "default": "DEFAULT_READ_DENY_GLOBS",
+      "section": "通用",
+      "doc": "秘密文件读保护 glob（逗号分隔）；.env.example 等模板自动放行。"
+    },
+    {
+      "name": "repo_map_chars",
+      "env": "AGENT_REPO_MAP_CHARS",
+      "type": "int",
+      "default": 4000,
+      "section": "通用",
+      "doc": "repo map 注入 planner 的字符预算（0 = 关闭）。"
+    },
+    {
+      "name": "retry_attempts",
+      "env": "AGENT_RETRY_ATTEMPTS",
+      "type": "int",
+      "default": 3,
+      "section": "通用",
+      "doc": "节点级瞬时错误重试（超时/连接重置/5xx/429/环境抖动）。 attempts 是**总尝试次数**；1 表示不重试。退避为指数 + 抖动， 且整次重试累计等待不超过 max_total_wait，避免长时间卡住。"
+    },
+    {
+      "name": "retry_base_delay_s",
+      "env": "AGENT_RETRY_BASE_DELAY_S",
+      "type": "float",
+      "default": 1.0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "retry_max_delay_s",
+      "env": "AGENT_RETRY_MAX_DELAY_S",
+      "type": "float",
+      "default": 30.0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "retry_max_total_wait_s",
+      "env": "AGENT_RETRY_MAX_TOTAL_WAIT_S",
+      "type": "float",
+      "default": 60.0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "review_enabled",
+      "env": "AGENT_REVIEW_ENABLED",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "---------- 代码审查 ---------- 一步做完、验证通过后，对本次改动跑一遍确定性静态检查（`tools/review.py`）。 与自动 verify 同一口径：不过审批，所以只跑宿主写死的检查，不读工作区里的 任何\"配置\"。关掉它等于去掉「测试通过 ≠ 代码正确」那第二道关。"
+    },
+    {
+      "name": "review_lint_blocking",
+      "env": "AGENT_REVIEW_LINT_BLOCKING",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "探测到的 linter/formatter 对**本次改动文件**的发现是否阻断。 只把改动文件提升为 blocking：仓库里已有的历史问题不该每一步都卡死。"
+    },
+    {
+      "name": "run_cost_budget_usd",
+      "env": "AGENT_RUN_COST_BUDGET_USD",
+      "type": "float",
+      "default": 0.0,
+      "section": "通用",
+      "doc": "单次 run 的成本预算（USD）；0 = 不告警"
+    },
+    {
+      "name": "run_deadline_s",
+      "env": "AGENT_RUN_DEADLINE_S",
+      "type": "int",
+      "default": 1800,
+      "section": "通用",
+      "doc": "一次完整运行（含审批/暂停后的 resume）的总墙钟上限，0 表示不限制。 与 recursion_limit 互补：后者管步数，这里管时间（例如模型长时间卡住）。"
+    },
+    {
+      "name": "sandbox_max_concurrent_commands",
+      "env": "AGENT_SANDBOX_MAX_CONCURRENT_COMMANDS",
+      "type": "int",
+      "default": 8,
+      "section": "通用",
+      "doc": "同时启动的 wsl.exe 进程上限。并发 worker 会各自调用沙箱，没有这层 背压时 4 个 worker 的一次工具轮次就能同时拉起十几个 WSL 进程。"
+    },
+    {
+      "name": "security_profile",
+      "env": "AGENT_SECURITY_PROFILE",
+      "type": "str",
+      "default": "local",
+      "section": "通用",
+      "doc": "---------- 安全 profile 与不可信仓库 ---------- local（默认，面向可信仓库）| untrusted（bwrap + 禁网 + 强制 ask + 不信任仓库指令/记忆）。"
+    },
+    {
+      "name": "session_brief_chars",
+      "env": "AGENT_SESSION_BRIEF_CHARS",
+      "type": "int",
+      "default": 4000,
+      "section": "通用",
+      "doc": "编排子图/worker 的会话约束摘要上限（字符）。独立子图不复制 messages， 这里从 checkpoint 抽最近若干轮压缩后注入；0 表示关闭。"
+    },
+    {
+      "name": "shell_cpu_seconds",
+      "env": "AGENT_SHELL_CPU_SECONDS",
+      "type": "int",
+      "default": 600,
+      "section": "通用",
+      "doc": "沙箱资源上限，0 表示不限制"
+    },
+    {
+      "name": "shell_env_allowlist",
+      "env": "AGENT_SHELL_ENV_ALLOWLIST",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "WSL 命令默认 `env -i` 清空宿主环境。这里按名称显式放行少量构建变量 （如 JAVA_HOME/GOPATH/VIRTUAL_ENV）。名称含 KEY/TOKEN/SECRET/PASSWORD/CREDENTIAL/AUTH/COOKIE/SESSION 的一律忽略。"
+    },
+    {
+      "name": "shell_max_file_mb",
+      "env": "AGENT_SHELL_MAX_FILE_MB",
+      "type": "int",
+      "default": 512,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "shell_max_processes",
+      "env": "AGENT_SHELL_MAX_PROCESSES",
+      "type": "int",
+      "default": 1024,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "shell_memory_mb",
+      "env": "AGENT_SHELL_MEMORY_MB",
+      "type": "int",
+      "default": 0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "shell_network",
+      "env": "AGENT_SHELL_NETWORK",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "仅 bwrap 模式生效：false 时加 --unshare-net，命令完全无网络。 off 模式没有内核级隔离，词法策略无法禁止 curl/wget 出网。"
+    },
+    {
+      "name": "shell_sandbox",
+      "env": "AGENT_SHELL_SANDBOX",
+      "type": "str",
+      "default": "off",
+      "section": "通用",
+      "doc": "shell 隔离后端：off（默认，仅工作区 cwd 约束）| bwrap（挂载命名空间隔离） bwrap 模式下若沙箱内不可用，会**拒绝执行**（fail closed），不静默降级"
+    },
+    {
+      "name": "shell_timeout",
+      "env": "AGENT_SHELL_TIMEOUT",
+      "type": "int",
+      "default": 60,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "steering_dir",
+      "env": "AGENT_STEERING_DIR",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "未消费 steering 指令的持久化目录；留空 = <当前目录>/.agent/steering"
+    },
+    {
+      "name": "symbol_index_ttl_s",
+      "env": "AGENT_SYMBOL_INDEX_TTL_S",
+      "type": "float",
+      "default": 10.0,
+      "section": "通用",
+      "doc": "AST 符号索引缓存时间；写操作不会主动失效，过期后自动重建。"
+    },
+    {
+      "name": "tool_journal_enabled",
+      "env": "AGENT_TOOL_JOURNAL_ENABLED",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "有副作用工具的执行日志：崩溃后同一 call_id 不自动重放。"
+    },
+    {
+      "name": "trust_repo_instructions",
+      "env": "AGENT_TRUST_REPO_INSTRUCTIONS",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "仓库内的 AGENTS.md / CLAUDE.md 是否作为可信指令注入。"
+    },
+    {
+      "name": "trust_repo_memory",
+      "env": "AGENT_TRUST_REPO_MEMORY",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "是否读取仓库内 `.agent/memory.md`；false 时记忆改存 memory_root。"
+    },
+    {
+      "name": "verify_command",
+      "env": "AGENT_VERIFY_COMMAND",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "留空表示按项目清单自动识别（pytest / cargo / go / npm / make）"
+    },
+    {
+      "name": "verify_enabled",
+      "env": "AGENT_VERIFY_ENABLED",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "---------- 验证 ----------"
+    },
+    {
+      "name": "verify_only_final",
+      "env": "AGENT_VERIFY_ONLY_FINAL",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "多步计划里，非最终的 implement 步不跑全量测试：早期步骤只完成了一部分， 全量套件必然因为后面还没做的步骤而失败，会把 agent 卡死在这一步。 只在 kind=verify 或最后一步验证；单步任务不受影响。"
+    },
+    {
+      "name": "verify_timeout",
+      "env": "AGENT_VERIFY_TIMEOUT",
+      "type": "int",
+      "default": 300,
+      "section": "通用",
+      "doc": "自动验证的独立超时。测试/构建通常比普通 shell 命令长，不能共用 60s； 0 表示回退到 shell_timeout。"
+    },
+    {
+      "name": "web_allow_anonymous_local",
+      "env": "AGENT_WEB_ALLOW_ANONYMOUS_LOCAL",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "未配置 token 时是否允许 loopback 匿名访问（单用户本地模式）。"
+    },
+    {
+      "name": "web_auth_tokens",
+      "env": "AGENT_WEB_AUTH_TOKENS",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "---------- Web 多用户 ---------- JSON：{\"token\": \"user\"}；与 AGENT_WEB_AUTH_TOKENS_FILE 二选一。"
+    },
+    {
+      "name": "web_auth_tokens_file",
+      "env": "AGENT_WEB_AUTH_TOKENS_FILE",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "web_data_root",
+      "env": "AGENT_WEB_DATA_ROOT",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "per-user 宿主侧数据根目录（审计/checkpoint/steering）； 空 = <当前目录>/.agent/web/users。"
+    },
+    {
+      "name": "web_max_body_bytes",
+      "env": "AGENT_WEB_MAX_BODY_BYTES",
+      "type": "int",
+      "default": "256 * 1024",
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "web_max_prompt_chars",
+      "env": "AGENT_WEB_MAX_PROMPT_CHARS",
+      "type": "int",
+      "default": 100000,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "web_max_runtimes",
+      "env": "AGENT_WEB_MAX_RUNTIMES",
+      "type": "int",
+      "default": 8,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "web_max_runtimes_per_user",
+      "env": "AGENT_WEB_MAX_RUNTIMES_PER_USER",
+      "type": "int",
+      "default": 2,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "web_memory_root",
+      "env": "AGENT_WEB_MEMORY_ROOT",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "per-user WSL 侧记忆根目录；空 = 沙箱 $HOME/agent-memory。 记忆在沙箱内、仓库之外，避免不可信仓库预置记忆。"
+    },
+    {
+      "name": "web_rate_limit_per_min",
+      "env": "AGENT_WEB_RATE_LIMIT_PER_MIN",
+      "type": "int",
+      "default": 60,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "web_runtime_ttl_s",
+      "env": "AGENT_WEB_RUNTIME_TTL_S",
+      "type": "int",
+      "default": 1800,
+      "section": "通用",
+      "doc": "挂起 runtime 的空闲保留时间；超时后释放，resume 时从 checkpoint 重建。"
+    },
+    {
+      "name": "web_workspaces_root",
+      "env": "AGENT_WEB_WORKSPACES_ROOT",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "per-user 工作区根目录；空 = 沙箱 $HOME/agent-ws/users。"
+    },
+    {
+      "name": "workspace_lock_enabled",
+      "env": "AGENT_WORKSPACE_LOCK",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "同一工作区只允许一个 runtime 运行；锁文件在审计目录下。"
+    },
+    {
+      "name": "write_deny_globs",
+      "env": "AGENT_WRITE_DENY_GLOBS",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "追加的内容级写保护 glob（逗号分隔）；默认规则始终生效。"
+    },
+    {
+      "name": "wsl_breaker_cooldown_s",
+      "env": "AGENT_WSL_BREAKER_COOLDOWN_S",
+      "type": "float",
+      "default": 15.0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "wsl_breaker_failures",
+      "env": "AGENT_WSL_BREAKER_FAILURES",
+      "type": "int",
+      "default": 3,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "wsl_breaker_max_cooldown_s",
+      "env": "AGENT_WSL_BREAKER_MAX_COOLDOWN_S",
+      "type": "float",
+      "default": 60.0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "wsl_distro",
+      "env": "AGENT_WSL_DISTRO",
+      "type": "str",
+      "default": "Ubuntu",
+      "section": "通用",
+      "doc": "---------- WSL2 沙箱 ----------"
+    },
+    {
+      "name": "wsl_health_check_enabled",
+      "env": "AGENT_WSL_HEALTH_CHECK",
+      "type": "bool",
+      "default": true,
+      "section": "通用",
+      "doc": "WSL 健康检查与熔断。连续失败达到阈值后，短时间内直接 fail fast， 避免每个工具调用都去拉起一个注定失败的 wsl.exe；冷却后放一个探测请求。"
+    },
+    {
+      "name": "wsl_health_timeout_s",
+      "env": "AGENT_WSL_HEALTH_TIMEOUT_S",
+      "type": "int",
+      "default": 10,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "wsl_health_ttl_s",
+      "env": "AGENT_WSL_HEALTH_TTL_S",
+      "type": "float",
+      "default": 30.0,
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "wsl_workspace",
+      "env": "AGENT_WSL_WORKSPACE",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "留空表示自动使用沙箱内 $HOME/agent-ws，避免与真实用户名不匹配"
+    },
+    {
+      "name": "deepseek_api_key",
+      "env": "DEEPSEEK_API_KEY",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": "---------- DeepSeek ----------"
+    },
+    {
+      "name": "deepseek_base_url",
+      "env": "DEEPSEEK_BASE_URL",
+      "type": "str",
+      "default": "https://api.deepseek.com",
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "deepseek_model",
+      "env": "DEEPSEEK_MODEL",
+      "type": "str",
+      "default": "deepseek-chat",
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "langsmith_api_key",
+      "env": "LANGSMITH_API_KEY",
+      "type": "str",
+      "default": "",
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "langsmith_project",
+      "env": "LANGSMITH_PROJECT",
+      "type": "str",
+      "default": "coding-agent",
+      "section": "通用",
+      "doc": ""
+    },
+    {
+      "name": "langsmith_tracing",
+      "env": "LANGSMITH_TRACING",
+      "type": "bool",
+      "default": false,
+      "section": "通用",
+      "doc": "---------- LangSmith ----------"
+    }
+  ]
+}

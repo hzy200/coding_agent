@@ -1,3 +1,16 @@
+---
+layer: L2（第 14 节路线图与历史烟雾属归档）
+doc_id: harness
+title: Harness 化改进方案
+owner: 项目作者
+status: active
+last_reviewed: 2026-10-22
+review_cadence: 编排行为变动时
+note: |
+  事件清单的事实源是 docs/contracts/events.md（代码生成），
+  本文件的事件列表已改为指针，不再手抄。
+---
+
 # Harness 化改进方案：动态工作流 + 并发子智能体
 
 > **状态**：harness 新架构已落地：**独立 orchestrator 子图 + 事件驱动动态
@@ -8,7 +21,7 @@
 > 影响分析、轻量 repo map（survey → planner → explore/implement）、
 > AST 符号检索 `symbol_search`、可选 LSP 客户端（initialize /
 > workspace-symbol / definition / references / pull+publish diagnostics）、
-> 批量快照读写、常驻 WSL shell 会话池（opt-in，自动回退）、
+> 批量快照读写、常驻 WSL shell 会话池（默认开启，异常自动回退）、
 > 共享文件多 worker 的 3-way 合并（临时 index 预演，冲突整批回滚）、
 > steering 队列跨进程持久化、Web/CLI 实时控制入口（SSE 审批 /
 > pause/cancel/add/replan / resume + `agent steer`）、
@@ -62,8 +75,9 @@
 - 编排路径汇总后的**实现执行器**；
 - feature flag 关闭时的完整回退路径。
 
-新能力通过 `AGENT_ORCHESTRATOR_ENABLED`（默认 `false`）逐步启用，
-保证旧基线与旧行为可比。
+`AGENT_ORCHESTRATOR_ENABLED` 默认 `true`，但只对达到
+`AGENT_ORCHESTRATOR_MIN_FILES`（默认 30）的仓库生效；更小的仓库仍走
+`direct`。设成 `false` 可完整回退到旧的单 agent 基线。
 
 ---
 
@@ -357,20 +371,26 @@ class WorkerResult(TypedDict):
 | `/replan` | 重建**剩余**任务图；已完成任务不重跑 |
 | `/approve` / `/deny` | 复用现有审批交互 |
 
-CLI `agent run` 与 Web 不提供实时控制入口，只透传事件。
+Web 提供暂停 / 取消 / add / replan / 恢复按钮（SSE 透传 `SteeringApplied`）；
+CLI 的 `agent steer <action> --thread-id <id>` 可从另一个进程注入同一条指令。
+CLI `agent run` 本身仍是单向事件流，不提供进程内交互入口。
 
 ### 10.2 机制
 
 - `steering.SteeringController`：按 `thread_id` 隔离的指令队列；
   未消费指令与 pause 标记原子落盘到 `.agent/steering/`，跨进程可恢复；
   runtime 通过 `steer()` 入队，图节点在边界消费；
-- 四个消费点：
-  - `steering_plan`（任务图生成后、scheduler 前）；
+- 五个消费点：
+  - `steering_plan`（任务图生成后、scheduler 前；取消直接跳过派发）；
   - `steering_dispatch`（每个 scheduler checkpoint 边界之后）；
   - `steering_step`（direct 模式一步之后、replan 前）；
+  - `steering_cancel`（direct 模式每轮 act/tools 之间；只消费 cancel，
+    add/replan/pause 留给语义边界）；
   - `steering_final`（所有进入 respond 之前，覆盖单步任务）；
 - pause 用 `interrupt()` 挂起、checkpoint 保存图状态；恢复重跑节点时，
-  先回填同批其它命令，避免丢失；
+  先回填同批其它命令，避免丢失；取消成立后收尾不再接受 pause；
+- 同批多条指令按顺序累积处理；**cancel 是终态**，同批后续 add/replan
+  一律不执行，避免“取消后仍派发”；
 - cancel 是**协作式**的：只读/写 worker 在每轮 LLM 与每次工具执行前检查；
   implement worker 取消后清理 worktree、不生成 patch；scheduler 在合并前
   再检查一次，取消时丢弃本批未合并 patch；
@@ -379,20 +399,30 @@ CLI `agent run` 与 Web 不提供实时控制入口，只透传事件。
   implement patch 合并，新任务只允许只读（worktree 基于 HEAD）；
 - 事件：`SteeringApplied(action, task_id, detail)`、`WorkflowRevised(reason, tasks)`；
 - 审计：提交时写 `kind=steering`，含 `source`/动作/目标；worker 内部工具仍逐条落账。
+  TUI/Web 走 `AgentRuntime.steer()`；CLI 走 `submit_steering_command()`，
+  同样先落审计再写队列；
 
 ### 10.3 边界与已知限制
 
 - 干预不能绕过审批与路径守卫：steering 只改控制流/任务图，不执行工具；
-- pause/cancel 在**节点边界**生效；正在跑的 LLM 轮次与同步工具不会被打断；
+- pause/cancel 在**节点边界**生效；正在跑的 LLM 轮次与同步工具不会被打断。
+  direct 模式的 cancel 额外在每轮 act/tools 之间检查，但长工具本身仍不可中断；
 - 取消**不清空本进程已合并**的 implement 改动（明确策略）；未合并 patch 丢弃；
-- steering 队列不持久化：重启后可从 checkpoint 恢复暂停状态，但队列里
-  未消费的 add/replan 会丢失；
+- steering 队列与 pause 标记**原子持久化**到 `.agent/steering/`（或
+  `AGENT_STEERING_DIR` / `--steering-dir`），进程重启后未消费指令仍可恢复；
+  CLI 与运行中 agent 从不同目录启动时必须显式对齐该目录；
+- Web 的 steering 恢复入口会校验暂停标记，审批挂起必须走 `/api/resume`；
 - `/add` 只读；写任务仍必须由 planner 生成并带 write_scope；
 - 并发写 scope 不重叠的约束不变。
 
 ---
 
 ## 11. 事件、审计与可观测性
+
+> **事件的事实源已迁到 [`contracts/events.md`](contracts/events.md)（由
+> `scripts/gen_contracts.py` 从 `events.py` 生成）。**
+> 下面这份清单只作叙述索引，**不要再往这里加/改事件** —— 手写副本必然过期，
+> CI 的契约检查也不会发现它。审计记录类型同理，见 [`contracts/audit.yaml`](contracts/audit.yaml)。
 
 事件（均已实现）：
 
@@ -699,6 +729,7 @@ worker 的脏检查会把它们误判为用户改动。`implement._git_ready` �
 
 - [ARCHITECTURE.md](ARCHITECTURE.md) —— 当前分层、状态、不变量
 - [WORKFLOW.md](WORKFLOW.md) —— 当前运行/开发/使用工作流
-- [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md) —— 缺陷与阶段计划
+- [acceptance/acceptance-criteria.yaml](acceptance/acceptance-criteria.yaml) —— 验收标准（Given-When-Then + 测试 ID）
 - [ACCEPTANCE.md](ACCEPTANCE.md) —— 验收与已知限制
-- [PLAN.md](PLAN.md) —— 早期开发方案（历史坐标）
+- [archive/README.md](archive/README.md) —— 早期 `IMPROVEMENT_PLAN.md` / `PLAN.md` 的内容去向
+  （这两份文件已不存在，断链已归档到此；缺陷与待办见 [tech-debt.yaml](tech-debt.yaml)）

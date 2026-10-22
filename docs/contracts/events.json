@@ -1,0 +1,1049 @@
+{
+  "contract": "coding-agent/events",
+  "version": 1,
+  "source": "src/coding_agent/events.py",
+  "note": "前端唯一可消费的领域事件契约。前端只认识这里的事件，不认识 LangGraph，也拿不到 tools/ 与 sandbox/。",
+  "events": [
+    {
+      "event_type": "approval_requested",
+      "class": "ApprovalRequested",
+      "doc": "图已挂起，等待人工确认。\n\n前端收集答复后调用 `AgentRuntime.resume(thread_id, {request_id: bool})`。\n若事件流以本事件收尾（而不是 RunFinished），即表示处于挂起状态。",
+      "fields": [
+        {
+          "name": "request_id",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "tool",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "command",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "level",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "reason",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "assistant_token",
+      "class": "AssistantToken",
+      "doc": "流式吐字。node 标明来自 act（步骤小结）还是 respond（最终答复）。",
+      "fields": [
+        {
+          "name": "node",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "text",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "context_trimmed",
+      "class": "ContextTrimmed",
+      "doc": "一次 act/respond 的上下文裁剪报告。",
+      "fields": [
+        {
+          "name": "node",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "trimmed",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "before_chars",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "after_chars",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "before_tokens",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "after_tokens",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "escalated",
+          "type": "bool",
+          "default": false,
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "cost_report",
+      "class": "CostReport",
+      "doc": "一次 run 的成本对账与预算告警。",
+      "fields": [
+        {
+          "name": "run_id",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "input_tokens",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "output_tokens",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "cost_usd",
+          "type": "float",
+          "default": 0.0,
+          "doc": ""
+        },
+        {
+          "name": "budget_usd",
+          "type": "float",
+          "default": 0.0,
+          "doc": ""
+        },
+        {
+          "name": "ratio",
+          "type": "float",
+          "default": 0.0,
+          "doc": ""
+        },
+        {
+          "name": "billed_usd",
+          "type": "float",
+          "default": 0.0,
+          "doc": ""
+        },
+        {
+          "name": "billing_delta_usd",
+          "type": "float",
+          "default": 0.0,
+          "doc": ""
+        },
+        {
+          "name": "billing_error",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "alerts",
+          "type": "list[str]",
+          "default": "Field(default_factory=list)",
+          "doc": ""
+        },
+        {
+          "name": "cache_hit_tokens",
+          "type": "int",
+          "default": 0,
+          "doc": "provider prefix cache：命中/未命中 token；未回报的 provider 记 0。"
+        },
+        {
+          "name": "cache_miss_tokens",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "providers",
+          "type": "dict[str, dict[str, float]]",
+          "default": "Field(default_factory=dict)",
+          "doc": ""
+        },
+        {
+          "name": "billing_providers",
+          "type": "dict[str, dict[str, float]]",
+          "default": "Field(default_factory=dict)",
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "file_changed",
+      "class": "FileChanged",
+      "doc": "文件被创建/覆盖/编辑。只有真正改动文件的动作才会发这个事件。",
+      "fields": [
+        {
+          "name": "path",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "action",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "added",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "removed",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "diff",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "snapshot_id",
+          "type": "str | None",
+          "default": null,
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "orchestration_finished",
+      "class": "OrchestrationFinished",
+      "doc": "编排阶段结束，worker 汇总即将交给主 agent。",
+      "fields": [
+        {
+          "name": "completed",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "failed",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "summary",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "plan_created",
+      "class": "PlanCreated",
+      "doc": "planner 完成分解。\n\n`degraded` 为真表示**规划其实失败了**：模型没给出可解析的步骤，\n已退化成「整条请求当成一步」。这时 `steps` 只有一项、就是请求原文，\n后面不会再有真正的多步推进。前端必须把它显示出来 ——\n静默降级的话，一次完全失效的规划看起来和正常工作一模一样。",
+      "fields": [
+        {
+          "name": "steps",
+          "type": "list[str]",
+          "default": "Field(default_factory=list)",
+          "doc": ""
+        },
+        {
+          "name": "kinds",
+          "type": "list[str]",
+          "default": "Field(default_factory=list)",
+          "doc": "与 steps 逐项对齐：explore / implement / verify / unknown"
+        },
+        {
+          "name": "degraded",
+          "type": "bool",
+          "default": false,
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "plan_revised",
+      "class": "PlanRevised",
+      "doc": "执行中重建了剩余计划（planner 只在开局跑一次，之后靠它修正）。\n\n`steps` 是**完整的**新计划（含已完成的部分，它们不会被改动），\n`step_idx` 是当前所处步骤，前端据此重新渲染计划面板。\n修订次数有硬上限（`AGENT_MAX_REPLANS`）。",
+      "fields": [
+        {
+          "name": "steps",
+          "type": "list[str]",
+          "default": "Field(default_factory=list)",
+          "doc": ""
+        },
+        {
+          "name": "kinds",
+          "type": "list[str]",
+          "default": "Field(default_factory=list)",
+          "doc": ""
+        },
+        {
+          "name": "step_idx",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "repair_started",
+      "class": "RepairStarted",
+      "doc": "验证失败后开始第 N 次修复。",
+      "fields": [
+        {
+          "name": "attempt",
+          "type": "int",
+          "default": 1,
+          "doc": ""
+        },
+        {
+          "name": "limit",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "summary",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "issues",
+          "type": "list[str]",
+          "default": "Field(default_factory=list)",
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "review_finished",
+      "class": "ReviewFinished",
+      "doc": "一步做完、验证通过后，代码审查的结果。\n\n与 `Verification` 分开而不是复用：审查回答的不是「行为对不对」，而是\n「代码干不干净」（调试残留、被改弱的断言、语法坏掉的分支、往 `.agent/` 里写）。\n合成一个事件会让「这一步到底卡在哪一关」看不出来。\n\nstatus: clean / warned / blocked / skipped",
+      "fields": [
+        {
+          "name": "status",
+          "type": "str",
+          "default": "skipped",
+          "doc": ""
+        },
+        {
+          "name": "blocked",
+          "type": "bool",
+          "default": false,
+          "doc": ""
+        },
+        {
+          "name": "summary",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "findings",
+          "type": "list[str]",
+          "default": "Field(default_factory=list)",
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "run_failed",
+      "class": "RunFailed",
+      "doc": "编排层自身出错（模型/沙箱不可用等），与「工具执行失败」不同。\n\n同样带上已累计的用量：失败的那一轮**花费可能最多**（反复重试、长上下文），\n把它排除在统计外会让成本口径系统性偏低。",
+      "fields": [
+        {
+          "name": "message",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "input_tokens",
+          "type": "int | None",
+          "default": null,
+          "doc": ""
+        },
+        {
+          "name": "output_tokens",
+          "type": "int | None",
+          "default": null,
+          "doc": ""
+        },
+        {
+          "name": "worker_input_tokens",
+          "type": "int | None",
+          "default": null,
+          "doc": ""
+        },
+        {
+          "name": "worker_output_tokens",
+          "type": "int | None",
+          "default": null,
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "run_finished",
+      "class": "RunFinished",
+      "doc": "一轮运行正常收尾。\n\n`input_tokens` / `output_tokens` 是整轮的用量总计（跨挂起-恢复累加），\n取自 provider 回报的 `usage_metadata`。未回报时为 None —— 与 0 不同，\n消费方（如能力评测）不该把缺失当成\"用了零 token\"。",
+      "fields": [
+        {
+          "name": "thread_id",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "answer",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "input_tokens",
+          "type": "int | None",
+          "default": null,
+          "doc": "主 agent 的 run_total（含委派子智能体，runtime 会并入）。"
+        },
+        {
+          "name": "output_tokens",
+          "type": "int | None",
+          "default": null,
+          "doc": ""
+        },
+        {
+          "name": "worker_input_tokens",
+          "type": "int | None",
+          "default": null,
+          "doc": "编排 worker 的用量。dispatch 不把 worker 并进 run_total，必须单列； 前端要显示总成本时自行相加。"
+        },
+        {
+          "name": "worker_output_tokens",
+          "type": "int | None",
+          "default": null,
+          "doc": ""
+        },
+        {
+          "name": "concurrency",
+          "type": "list[dict] | None",
+          "default": null,
+          "doc": "本次运行的资源池快照（worker/tool/wsl/llm 的并发、排队与等待时间）。"
+        }
+      ]
+    },
+    {
+      "event_type": "run_started",
+      "class": "RunStarted",
+      "doc": "一轮运行开始。前端用它标记事件流的起点（Web SSE 的第一帧）。",
+      "fields": [
+        {
+          "name": "thread_id",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "steering_applied",
+      "class": "SteeringApplied",
+      "doc": "一条用户干预指令被图节点消费。\n\naction: pause | resume | cancel | add | replan。\npause 在 `interrupt()` 时发出（事件流到此收尾，等待\n`AgentRuntime.resume_steering`）；其余动作在节点更新时发出。",
+      "fields": [
+        {
+          "name": "action",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "task_id",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "detail",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "step_finished",
+      "class": "StepFinished",
+      "doc": "当前子任务收尾（模型给出了小结，或工具预算耗尽被强制叫停）。\n\n`cancelled` 表示这一步**根本没机会执行完**：重规划判定它做不成、把剩余步骤\n砍掉了，于是路由直接去收尾。它与 `budget_exhausted` 的区别是——后者是\"试过\n但工具轮次用完\"，前者是\"还没试就被放弃了\"。前端需要区分，否则用户会以为\n模型已经尝试过。",
+      "fields": [
+        {
+          "name": "index",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "budget_exhausted",
+          "type": "bool",
+          "default": false,
+          "doc": ""
+        },
+        {
+          "name": "cancelled",
+          "type": "bool",
+          "default": false,
+          "doc": ""
+        },
+        {
+          "name": "text",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "step_started",
+      "class": "StepStarted",
+      "doc": "进入某个子任务。total == 1 时前端可不渲染步进标题。",
+      "fields": [
+        {
+          "name": "index",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "total",
+          "type": "int",
+          "default": 1,
+          "doc": ""
+        },
+        {
+          "name": "text",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "subagent_finished",
+      "class": "SubAgentFinished",
+      "doc": "子智能体结束。\n\n`status`: success / partial / failed / rejected。partial 表示跑满了轮次、超时，\n或报告生成失败但有兜底摘要 —— 主模型仍拿到可用信息，但不应把它当成完整结论。\nrejected 表示宿主没让它跑（审批拒绝、任务级委派预算耗尽），与「跑了但失败」不同。",
+      "fields": [
+        {
+          "name": "agent_id",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "status",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "summary",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "relevant_files",
+          "type": "list[str]",
+          "default": "Field(default_factory=list)",
+          "doc": ""
+        },
+        {
+          "name": "findings",
+          "type": "list[str]",
+          "default": "Field(default_factory=list)",
+          "doc": ""
+        },
+        {
+          "name": "input_tokens",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "output_tokens",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "duration_ms",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "subagent_started",
+      "class": "SubAgentStarted",
+      "doc": "主智能体把一次只读探索委派给了子智能体。\n\n与 `ToolCallStarted` 同时发出：delegate 本身也是一次工具调用。前端按\n`agent_id` 把后续的 `SubAgentFinished` 配对回来。",
+      "fields": [
+        {
+          "name": "agent_id",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "parent_call_id",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "role",
+          "type": "str",
+          "default": "explore",
+          "doc": ""
+        },
+        {
+          "name": "goal",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "task_graph_created",
+      "class": "TaskGraphCreated",
+      "doc": "编排器生成了任务图（可能已降级为单任务）。",
+      "fields": [
+        {
+          "name": "tasks",
+          "type": "list[dict[str, Any]]",
+          "default": "Field(default_factory=list)",
+          "doc": ""
+        },
+        {
+          "name": "degraded",
+          "type": "bool",
+          "default": false,
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "task_graph_extended",
+      "class": "TaskGraphExtended",
+      "doc": "运行中由 worker 提议、host 校验后追加的只读任务（Phase 4D）。",
+      "fields": [
+        {
+          "name": "added",
+          "type": "list[dict[str, Any]]",
+          "default": "Field(default_factory=list)",
+          "doc": ""
+        },
+        {
+          "name": "rejected",
+          "type": "list[str]",
+          "default": "Field(default_factory=list)",
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "tool_call_finished",
+      "class": "ToolCallFinished",
+      "doc": "工具执行完毕。\n\nok/rejected 语义：rejected 表示被安全策略拦下（此时 exit_code 为 None）；\n两者都为 False 表示执行了但失败。文件工具没有退出码，exit_code 恒为 None。",
+      "fields": [
+        {
+          "name": "call_id",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "name",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "ok",
+          "type": "bool",
+          "default": false,
+          "doc": ""
+        },
+        {
+          "name": "rejected",
+          "type": "bool",
+          "default": false,
+          "doc": ""
+        },
+        {
+          "name": "skipped",
+          "type": "bool",
+          "default": false,
+          "doc": "环境不具备该能力（例如未配置 LSP）：不是成功，也不该计入失败率。"
+        },
+        {
+          "name": "interrupted",
+          "type": "bool",
+          "default": false,
+          "doc": "有副作用的调用执行到一半、结果未知：既不是成功也不是普通失败。"
+        },
+        {
+          "name": "decision",
+          "type": "str",
+          "default": "auto",
+          "doc": "auto / approved / denied / rejected —— 审计据此区分「谁拒的」"
+        },
+        {
+          "name": "exit_code",
+          "type": "int | None",
+          "default": null,
+          "doc": ""
+        },
+        {
+          "name": "duration_ms",
+          "type": "int | None",
+          "default": null,
+          "doc": ""
+        },
+        {
+          "name": "level",
+          "type": "str | None",
+          "default": null,
+          "doc": ""
+        },
+        {
+          "name": "preview",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "tool_call_started",
+      "class": "ToolCallStarted",
+      "doc": "模型请求了一次工具调用，即将执行。\n\nlevel 供前端着色，不是安全判定。call_id 用于和 ToolCallFinished 配对 ——\n同一轮可能有多个并行工具调用，只靠顺序无法可靠对应。",
+      "fields": [
+        {
+          "name": "call_id",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "name",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "args",
+          "type": "dict[str, Any]",
+          "default": "Field(default_factory=dict)",
+          "doc": ""
+        },
+        {
+          "name": "summary",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "level",
+          "type": "str | None",
+          "default": null,
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "verification",
+      "class": "Verification",
+      "doc": "一步做完后自动跑验证的结果。\n\nstatus: ok / failed（跑过）、error（验证环境异常，没跑起来）、\nnot_configured（没有可用的测试命令）、skipped（没跑）。",
+      "fields": [
+        {
+          "name": "status",
+          "type": "str",
+          "default": "skipped",
+          "doc": ""
+        },
+        {
+          "name": "command",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "ok",
+          "type": "bool | None",
+          "default": null,
+          "doc": "三态：True 通过 / False 失败 / **None 没验证**（`not_configured` / `skipped`）。 与审计里的 `ok` 刻意保持同源同形 —— 曾经两边口径不同，同一次「没跑验证」 在事件与审计里结论相反，事后对账对不上（见 BUG_AUDIT 的 B7）。"
+        },
+        {
+          "name": "summary",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "issues",
+          "type": "list[str]",
+          "default": "Field(default_factory=list)",
+          "doc": ""
+        },
+        {
+          "name": "failed_tests",
+          "type": "list[str]",
+          "default": "Field(default_factory=list)",
+          "doc": "解析出的失败测试 id，供前端/评测直接展示与统计"
+        }
+      ]
+    },
+    {
+      "event_type": "worker_finished",
+      "class": "WorkerFinished",
+      "doc": "一个 worker 结束；status: success / partial / failed / blocked。",
+      "fields": [
+        {
+          "name": "worker_id",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "task_id",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "role",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "status",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "summary",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "input_tokens",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "output_tokens",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "duration_ms",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "attempt",
+          "type": "int",
+          "default": 1,
+          "doc": "该任务的第几次尝试（1 = 首次；>1 表示重试）"
+        },
+        {
+          "name": "merged",
+          "type": "bool",
+          "default": false,
+          "doc": "Phase 3C：implement worker 的补丁是否已合并 / 合并错误"
+        },
+        {
+          "name": "merge_error",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "tool_calls",
+          "type": "int",
+          "default": 0,
+          "doc": "worker 内部执行的工具调用数（审计里逐条落账）"
+        },
+        {
+          "name": "queue_wait_ms",
+          "type": "int",
+          "default": 0,
+          "doc": "---- Phase 5：成本与审计指标 ----"
+        },
+        {
+          "name": "llm_ms",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "tool_ms",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "timed_out",
+          "type": "bool",
+          "default": false,
+          "doc": ""
+        },
+        {
+          "name": "artifact_id",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "depth",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "priority",
+          "type": "int",
+          "default": 0,
+          "doc": ""
+        },
+        {
+          "name": "scope_violations",
+          "type": "list[str]",
+          "default": "Field(default_factory=list)",
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "worker_started",
+      "class": "WorkerStarted",
+      "doc": "一个 worker 开始执行。\n\nPhase 4：由 dispatch 通过 LangGraph custom stream 实时发出，而不是等整批\nworker 结束后回放。`attempt` 便于前端区分重试。",
+      "fields": [
+        {
+          "name": "worker_id",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "task_id",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "role",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "goal",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "attempt",
+          "type": "int",
+          "default": 1,
+          "doc": ""
+        },
+        {
+          "name": "queue_wait_ms",
+          "type": "int",
+          "default": 0,
+          "doc": "进入 ready 队列后等待并发槽位的时间。"
+        }
+      ]
+    },
+    {
+      "event_type": "workflow_revised",
+      "class": "WorkflowRevised",
+      "doc": "用户要求重规划后，剩余任务图被重建。\n\n已完成/已合并的任务不会重跑；`tasks` 是重建后的**完整**任务列表\n（含保留的已完成任务），前端据此刷新树状进度。",
+      "fields": [
+        {
+          "name": "reason",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "tasks",
+          "type": "list[dict[str, Any]]",
+          "default": "Field(default_factory=list)",
+          "doc": ""
+        }
+      ]
+    },
+    {
+      "event_type": "workflow_selected",
+      "class": "WorkflowSelected",
+      "doc": "编排器选择了一个工作流模板。",
+      "fields": [
+        {
+          "name": "workflow",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        },
+        {
+          "name": "reason",
+          "type": "str",
+          "default": "",
+          "doc": ""
+        }
+      ]
+    }
+  ]
+}

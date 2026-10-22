@@ -1,0 +1,208 @@
+# Runbook · 故障场景 → 处置步骤
+#
+# 要求：精确、无歧义、**带可验证的回显**，让 Agent 能照着执行而不是猜。
+# 每条都写「怎么确认已解决」——没有回显的步骤等于没写。
+#
+# 与 docs/USAGE.md 的关系：那边按"怎么用"组织，这边按"出问题怎么办"组织。
+#
+# signal：可观察的表征（日志/事件/回显），用于先确认是不是这个场景。
+# last_drilled：最近一次故障演练日期；none 表示尚未演练，不是“没发生过”。
+
+version: 1
+owner: 项目作者
+last_reviewed: 2026-10-22
+review_cadence: 命令或故障场景变动时
+
+preflight:
+  - cmd: conda activate agent
+    why: agent / pytest 装在环境自己的 Scripts/ 下，未激活时不在 PATH
+  - cmd: agent doctor
+    expect: 全部通过
+    note: 不需要 API Key
+
+scenarios:
+  - id: RB-001
+    symptom: "agent: command not found"
+    signal: 'command not found: agent'
+    cause: 未激活 conda 环境
+    steps:
+      - conda activate agent
+      - 'python -c "import sys, sysconfig; print(sys.executable); print(sysconfig.get_path(\"scripts\"))"'
+      - agent --help
+    verify: agent --help 打印出命令列表
+    last_drilled: none
+    if_still_broken: pip install -e ".[dev,ui,web]"（可编辑安装会重建 console script）
+
+  - id: RB-002
+    symptom: DEEPSEEK_API_KEY 已配好但仍报未配置 / 一直 403
+    signal: 'agent doctor 出现 WARN 环境变量被 .env 覆盖，或 provider 返回 403'
+    cause: |
+      配置优先级被刻意设为「构造函数参数 > .env > 环境变量 > 默认值」。
+      某些工具链会在进程启动时注入陈旧值，改 .env 不生效。另：真实 key 与
+      格式合法但不存在的 key 都返回 403，空 key 返回 401 —— 403 说明钥匙不存在或已吊销。
+    see: docs/adr/0003-dotenv-over-env.md
+    steps:
+      - agent doctor
+      - 看输出里有没有 "WARN 环境变量被 .env 覆盖"（会指出哪个键、当前生效的是哪份）
+      - 确认改的是**当前工作目录**的 .env，不是别处的
+      - 确认 .env 里不是空占位（KEY= 不算配置，不会盖掉环境变量）
+    verify: agent doctor 不再有该 WARN，且 agent chat 能拿到回复
+    last_drilled: none
+    if_still_broken: 去 platform.deepseek.com 确认 key 本身是否有效/未吊销
+
+  - id: RB-003
+    symptom: 所有命令都被判「工作目录非法」
+    signal: '所有命令返回 工作目录非法'
+    cause: 工作区根目录解析错了（wsl.exe 会继承 Windows 当前目录）
+    steps:
+      - agent doctor        # 会打印实际解析出的工作区
+      - 'agent run -C "D:\proj" "..."'   # 显式指定
+    verify: doctor 打印的路径与预期一致
+    last_drilled: none
+
+  - id: RB-004
+    symptom: 检索很慢
+    signal: 'search_code 耗时显著高于 ripgrep 基线'
+    cause: 沙箱未装 ripgrep，退到 grep（grep 不读 .gitignore，已显式排除常见重目录）
+    steps:
+      - agent doctor        # 显示当前后端
+      - 'wsl -d Ubuntu -- sudo apt-get install -y ripgrep'   # 可选
+    verify: doctor 显示后端为 ripgrep
+    last_drilled: none
+    note: 优先用 search_code 工具而不是 shell 拼 grep —— xargs 不在 L0 白名单会被降级为 L2
+
+  - id: RB-005
+    symptom: 'find … | xargs grep … 被拦，降级为 L2'
+    signal: 'shell_exec 返回 L2 需要确认（xargs/管道）'
+    cause: xargs 不在 L0 白名单
+    steps:
+      - 改用 search_code 工具
+    verify: 返回结构化的「文件:行号:内容」
+    last_drilled: none
+    note: 这是**策略生效**，不是 bug。不要去给 xargs 加白名单
+
+  - id: RB-006
+    symptom: 模型报 "reasoning_content must be passed back"
+    signal: 'provider 400 reasoning_content must be passed back'
+    cause: deepseek-v4-flash 思考模式偶发 400；langchain-openai 不提取该字段
+    steps:
+      - 设置 DEEPSEEK_MODEL=deepseek-chat（也是默认值）
+    verify: 不再报该错误
+    last_drilled: none
+    status: 已知缺陷未修（无法稳定复现，不把无法验证的改动放进请求路径）
+    see: docs/tech-debt.yaml#TD-002
+
+  - id: RB-007
+    symptom: LangSmith 一直 403 / 没有任何数据也没报错
+    signal: 'LangSmith 403 或无 trace'
+    cause: |
+      403 = 服务端解析不出租户（钥匙不存在或已吊销）；空 key 返回 401。
+      追踪默认关闭（LANGSMITH_TRACING=false），数据会离开本机所以不默认开。
+    steps:
+      - agent doctor        # 追踪凭据可用性会提前报出来
+      - 确认 LANGSMITH_TRACING=true
+      - 追踪开关在**进程启动时**读取并缓存（langsmith 内部用了 lru_cache），
+        运行中改环境变量不生效 → 重启进程
+    verify: LangSmith 项目里出现 trace
+    last_drilled: none
+    note: metadata 只放标识与开关，不放提示词或文件内容
+
+  - id: RB-008
+    symptom: '测试太慢 / pytest 报 "unrecognized arguments: -n"'
+    signal: 'pytest 报 unrecognized arguments -n'
+    cause: addopts 默认带 -n auto，缺 pytest-xdist 会直接报错
+    steps:
+      - pip install -e ".[dev]"
+      - 'pytest -m "not wsl and not llm"'    # 约 1 分钟，跳过真实沙箱与真实模型
+    verify: 用例通过
+    last_drilled: none
+    note: 集成测试开销几乎全在 wsl.exe 进程启动上，所以默认并行
+
+  - id: RB-009
+    symptom: AGENT_SHELL_SANDBOX=bwrap 报「不可用」
+    signal: 'bwrap 可用性探测失败或拒绝执行'
+    cause: 沙箱内没装 bubblewrap
+    steps:
+      - 'wsl -d Ubuntu -- sudo apt-get install -y bubblewrap'
+      - 或改回 AGENT_SHELL_SANDBOX=off
+    verify: agent doctor 显示隔离后端可用
+    last_drilled: none
+    note: |
+      **配了却不可用时会拒绝执行**（fail closed），不静默降级 —— 这是有意的。
+      不要为了"跑起来"去改成静默降级。
+
+  - id: RB-010
+    symptom: agent doctor 报沙箱用户是 root
+    signal: 'agent doctor 显示沙箱用户为 root'
+    cause: 该 WSL 发行版默认用户为 root
+    steps:
+      - 改用非 root 普通用户（隔离形同虚设）
+    verify: doctor 显示非 root
+    last_drilled: none
+    severity: 高 —— root 下 WSL 隔离基本失效
+
+  - id: RB-011
+    symptom: 编排跑起来全是失败、0 个 patch 合并
+    signal: 'orchestration_finished 中 merged_patches=0 或 worker 全 failed'
+    cause: 历史 P0 已修；若再现多半是 worktree/脏检查或状态机回归
+    steps:
+      - 确认工作区是 git 仓库根且干净（.agent/ 与 __pycache__/ 不计入脏改动）
+      - 确认 AGENT_ORCHESTRATOR_WRITE_ENABLED=true 且会话带 --write
+      - 看 worker 审计 detail 里的 merge_error
+      - 'pytest -m "not llm" tests/integration/test_implement_worker.py -q'
+    verify: 该集成测试通过，且 patch 成功合并
+    last_drilled: none
+    see: docs/postmortem/2026-10-21-orchestrated-write.md
+
+  - id: RB-012
+    symptom: 想撤销 agent 的改动
+    signal: '需要回滚，但不确定快照或 checkpoint 的边界'
+    steps:
+      - agent snapshots                          # 看有哪些快照
+      - agent diff                               # 最近一次改了什么
+      - agent undo --last-run --dry-run          # 先演练
+      - agent undo --last-run                    # 整体回滚最近一次运行
+    verify: agent diff 显示无改动，或 git diff 为空
+    last_drilled: none
+    note: |
+      回滚本身也可回滚 —— 恢复前会先给当前内容留底。
+      checkpoint 回退（agent rewind）管的是**会话状态**，与文件内容回滚是两回事。
+
+  - id: RB-013
+    symptom: 上一轮异常中断，不确定改动有没有验证过
+    signal: '审计里出现 ok=None 或 interrupted，且缺少 finished'
+    steps:
+      - 新一轮会自动收到「可能有未验证改动」的恢复提示（run_status 留在 checkpoint 里）
+      - agent diff                               # 看实际改了什么
+      - 'pytest -m "not wsl and not llm"'        # 自己确认一遍
+    verify: 测试通过
+    last_drilled: none
+    note: 崩溃后只有 started 没有 finished 的副作用工具**不会自动重放**，而是明确告知"结果未知"
+
+  - id: RB-014
+    symptom: CI 契约检查红（docs/contracts 与源码不一致）
+    signal: 'docs.yml 契约检查红'
+    cause: 改了 events.py / config.py / approve.py / audit/models.py 但没重生成
+    steps:
+      - python scripts/gen_contracts.py
+      - git diff --stat    # 确认改动符合预期，随代码一起提交
+    verify: python scripts/gen_contracts.py --check 输出"契约一致"
+    last_drilled: none
+
+  - id: RB-015
+    symptom: 文档断链检查红
+    signal: 'docs.yml 文档一致性检查红'
+    cause: 引用了不存在的 .md 或 anchor
+    steps:
+      - python scripts/check_docs.py   # 会列出所有断链
+      - 修正引用，或把内容补回来
+    verify: 检查通过
+    last_drilled: none
+    note: |
+      历史上 docs/IMPROVEMENT_PLAN.md 与 docs/PLAN.md 被多处引用但文件不存在，
+      已归档到 docs/archive/README.md。
+
+escalation:
+  - 涉及 sandbox/ 或审批语义的异常 → 对照 docs/THREAT_MODEL.md 第 4 节，
+    确认防线等级没有下降，不要"先修好再说"
+  - 无法判断是否为安全事件 → 停手，把审计日志（agent audit --thread-id <id>）留下来再上报

@@ -1,3 +1,17 @@
+---
+layer: L3
+doc_id: langsmith-report
+title: LangSmith 量化报告
+owner: 项目作者
+status: snapshot
+last_reviewed: 2026-10-22
+review_cadence: 每次跑全量评测后
+warning: |
+  这是**一次性快照**，不是持续更新的事实源。文件名里的 experiment id 对应某一次实跑。
+  新结果请另起一份，不要覆盖 —— 历史数字是对比基线，覆盖掉就再也回不去。
+  评测方法论见 ../tests/eval/README.md。
+---
+
 # LangSmith 量化报告：`coding-agent-capability-139-final-2b8ea1a3`
 
 ## 总览

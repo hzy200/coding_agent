@@ -1,3 +1,5 @@
+<!-- owner: 项目作者 · last_reviewed: 2026-10-22 · review_cadence: 评测口径或任务集变动时 -->
+
 # 端到端能力评测（tests/eval）
 
 回答的问题是：**给定一个任务，这个智能体能不能把它做完。**
@@ -72,7 +74,7 @@ python tests/eval/langsmith_suite.py --run --kinds all --case-retries 1
 - **139 capability 全量真实模型运行：138/139 = 99.3%**；失败任务
   `long/discount_spec` 隔离复跑通过。该轮默认 `orchestrator_write_enabled=false`、
   `explore_enabled=false`，implement 与 subagent 路径由生产试跑单独验证；
-- 量化明细见 [docs/LANGSMITH_REPORT.md](../docs/LANGSMITH_REPORT.md)；
+- 量化明细见 [docs/LANGSMITH_REPORT.md](../../docs/LANGSMITH_REPORT.md)；
 - 另用真实 CLI 跑通 direct 修复与 4 个 implement worker 的并发写编排。
 
 ## 用法
@@ -383,7 +385,8 @@ python tests/eval/steering_bench.py --repeat 3 --delay-ms 50
 
 前两档的工作区是 1–9 个文件、几十行 —— 实测单任务 15–19s、7 次工具调用，
 60 次的工具预算只用了 10–25%。那种规模量不出"自主性"：不需要探索、不需要规划，
-一眼就能定位。这一档按 `IMPROVEMENT_PLAN §3.2 W2` 的要求提一个量级。
+一眼就能定位。这一档按原 `IMPROVEMENT_PLAN §3.2 W2`（该文件的去向见
+[docs/archive/README.md](../../docs/archive/README.md)）的要求提一个量级。
 
 | 项 | 值 |
 |---|---|
@@ -407,7 +410,8 @@ python tests/eval/steering_bench.py --repeat 3 --delay-ms 50
 
 ### 仓库从哪来：确定性生成器（**刻意偏离**计划里的风险对策）
 
-`docs/IMPROVEMENT_PLAN.md` 第四部分的风险对策写的是「任务源自真实仓库而非自造」。
+原 `docs/IMPROVEMENT_PLAN.md` 第四部分的风险对策写的是「任务源自真实仓库而非自造」
+（该文件已归档，去向见 [docs/archive/README.md](../../docs/archive/README.md)）。
 这里**没有照做**，理由要摆明：
 
 | 动机 | 说明 |
@@ -510,7 +514,7 @@ python tests/eval/runner.py --verify-seeds    # 双向自检，不需要 API Key
 然后跑：
 
 ```bash
-pytest tests/unit/test_eval_harness.py -q     # 结构 + 语法 + 种子必须失败
+pytest -m "not llm" tests/unit/test_eval_harness.py -q     # 结构 + 语法 + 种子必须失败
 python tests/eval/runner.py --verify-seeds    # 在真实沙箱里再确认一遍
 ```
 

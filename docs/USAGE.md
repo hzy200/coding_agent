@@ -1,3 +1,14 @@
+---
+layer: L3
+doc_id: usage
+title: 使用指南
+owner: 项目作者
+status: active
+last_reviewed: 2026-10-22
+review_cadence: 命令或配置变动时
+note: 场景化的「故障 → 处置步骤」版本见 docs/runbook.yaml。
+---
+
 # 使用指南
 
 命令清单见 [README](../README.md#命令一览)。这份文档讲**怎么用**与**出问题怎么办**。
@@ -66,9 +77,10 @@ agent sandbox-init                # 创建沙箱工作区
 |---|---|
 | （默认） | 只有 L0 只读命令与 `file_read` / `file_list` |
 | `--write` | L1：`file_write`/`file_edit`/`file_edit_many`/`file_restore`/`file_move`/`file_copy`/`file_mkdir`、`git_add` |
-| `-y` / `--yes` | L2/L3 不再逐条询问，自动批准（含 `file_delete`） |
+| `-y` / `--yes` | L2 自动批准；**L3 危险命令仍逐条确认**（含 `file_delete` 的 L2 会被自动批准） |
 
-L2/L3 默认会**停下来问**。不带 `-y` 时：
+L2/L3 默认会**停下来问**。`--yes` 只跳过 L2；L3（`rm -rf`、`git reset --hard`、
+`sudo` 等）始终需要人工回答。不带 `-y` 时：
 
 ```
 → [L2 变更性] shell_exec: pip install requests
@@ -308,6 +320,22 @@ agent run -C /mnt/d/proj "..."    # WSL 路径写法
 **路径安全**：词法归一化 + 沙箱内 `realpath` 双重校验。工作区里的符号链接
 若指向外部（含**悬空链接**）读写都会被拒。
 
+**环境隔离**：每条 WSL 命令都以 `env -i` 启动，宿主环境变量（CI token、云凭据、
+`LANGSMITH_API_KEY` 等）不会进入 Linux 子进程；`HOME` 由脚本内 `getent passwd`
+补回。需要构建工具变量（`JAVA_HOME`/`GOPATH`/`VIRTUAL_ENV` 等）时，用
+`AGENT_SHELL_ENV_ALLOWLIST` 显式列出名称；含 KEY/TOKEN/SECRET/PASSWORD 等
+名称即使写进去也会被忽略。`printenv` / `env` 被归为 L3，即使 `approve`
+模式也必须人工确认。
+
+**输出脱敏**：shell / search / file_read 的结果在回灌模型前会识别并替换常见
+凭据（OpenAI/GitHub/AWS/JWT/Slack/Google token、私钥块、`password=...`、
+数据库连接串）。这是模式匹配的 best-effort，不是完整的 DLP。
+
+**秘密文件**：默认拒绝读取 `.env`、私钥/证书、`.npmrc`、`.netrc`、
+`.aws/**`、`.kube/**`、`credentials*.json`、`*.tfstate` 等；可用
+`AGENT_READ_DENY_GLOBS` / `AGENT_WRITE_DENY_GLOBS` 追加。shell 中
+`cat .env*` 这类通配形状、以及检索密码关键词也会升级为 L2。
+
 ## 会话状态存放在哪
 
 宿主侧（相对命令所在目录）与沙箱侧（相对工作区）是两处，别混淆：
@@ -322,3 +350,79 @@ agent run -C /mnt/d/proj "..."    # WSL 路径写法
 `.agent/` 已在 `.gitignore` 里，而且 **git 工具会拒绝把它纳入版本控制**
 （`git_add` 拒绝暂存、`git_commit` 提交前检查暂存区）——
 否则模型一个 `git add -A` 就把 agent 自己的备份提交进你的仓库了。
+
+## 安全 profile
+
+`AGENT_SECURITY_PROFILE` 有三档：
+
+| profile | 隔离 | 网络 | 审批 | 写入 |
+|---|---|---|---|---|
+| `local`（默认） | `AGENT_SHELL_SANDBOX`（默认 off） | 默认开 | `ask` | 由 `--write` 决定 |
+| `untrusted` | 强制 bwrap | 强制关 | 强制 ask | 由 `--write` 决定 |
+| `production` / `ops` | 强制 bwrap | 强制关 | 强制 `deny` | **强制关闭** |
+
+`production/ops` 是只读审计档：`agent run --write`、`--yes` 以及 Web 的审批模式
+都不会放宽它，L2/L3 一律拒绝。适合"只排查、不改动"的生产环境。
+
+Web 会话固定只读：`/api/run` 不接受写权限，所有写操作请用本机 CLI/TUI。
+
+## 公网 / 多用户部署
+
+Web 默认按**不可信仓库**运行：`untrusted` profile（bwrap + 禁网 + 强制 ask +
+不信任仓库指令/记忆），并且只监听 `127.0.0.1`。
+
+1. 配置 Bearer Token（推荐用文件，权限 0600）：
+
+```bash
+AGENT_WEB_AUTH_TOKENS_FILE=/etc/coding-agent/tokens.json
+# 文件内容：{"token-a": "alice", "token-b": "bob"}
+# 也支持 "sha256:<hex>" 作为 key，避免保存明文 token
+```
+
+2. 预置每个用户的工作区（管理员操作）：
+
+```bash
+AGENT_WEB_WORKSPACES_ROOT=/srv/agent/workspaces   # WSL 路径
+AGENT_WEB_DATA_ROOT=/var/lib/coding-agent/web     # 宿主路径
+AGENT_WEB_MEMORY_ROOT=/srv/agent/memory           # WSL 路径
+# 用户目录：/srv/agent/workspaces/alice、/srv/agent/memory/alice
+```
+
+Web **不接受用户指定任意主机路径**，用户只能在自己目录里工作。
+
+3. 启动：
+
+```bash
+# 本机开发（loopback 匿名）
+agent web
+
+# 公网（TLS 由本进程终止）
+agent web --host 0.0.0.0 --allow-remote \
+  --ssl-certfile /etc/ssl/agent.crt --ssl-keyfile /etc/ssl/agent.key
+
+# 公网（TLS 由反向代理终止）
+agent web --host 127.0.0.1 --behind-proxy
+```
+
+非 loopback 且没有 token 会被拒绝；没有 TLS 且未声明 `--behind-proxy` /
+`--allow-insecure-remote` 也会被拒绝。同一数据目录只允许一个 Web 进程
+（单进程共享 governor）；不要使用 `uvicorn --workers > 1`。
+
+4. 审计校验：
+
+```bash
+agent audit --verify            # 校验当天片段
+agent audit --path <file> --verify
+```
+
+哈希链能发现本地日志被改动，但不能防拥有主机权限的人重写整条链；
+高保证场景应外发到 WORM/远程日志。
+
+5. 不可信仓库的已知边界：
+
+- shell 的递归检索仍是词法 best-effort：检索密码/凭据关键词会升级为 L2，
+  但变换写法仍可能绕过；请优先使用 `search_code`（会过滤秘密文件并脱敏输出）。
+- 文件内容级 secrets 识别是模式匹配；自定义格式的凭据仍需要人工避免读取。
+- `AGENTS.md`/`CLAUDE.md` 与仓库内记忆在 untrusted 下不注入。
+- `approve` 模式仍然等于完全信任模型；不可信场景必须使用 `ask`。
+- bwrap 不可用时 untrusted 模式拒绝执行；先 `agent doctor` 确认。

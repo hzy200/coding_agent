@@ -1,0 +1,125 @@
+# 技术债登记簿
+#
+# 防止 AI（和人）把临时 hack 当成范式复制。
+# 每条必须写清：是什么、为什么还没做、**什么时候该还**。
+# 与「有意为之的取舍」分开 —— 取舍不进这个表，取舍进 docs/adr/。
+
+version: 1
+owner: 项目作者
+last_reviewed: 2026-10-22
+review_cadence: 每次发版前过一遍；超过 due 的条目必须在 PR 里说明
+
+items:
+  - id: TD-001
+    title: runtime._stream 是最大的函数（623 行 / CC 114）
+    where: runtime.py
+    why_now: 事件翻译天然分支多；拆分需要行为绝对不变，风险中
+    debt_type: 结构
+    severity: medium
+    plan: per-node 分支拆成 `_emit_*` 或 `{node: handler}` 表驱动
+    blocked_by: 需要先把事件流测试铺满（已有 test_runtime_stream.py）
+    owner: 项目作者
+    due: 下一个重构窗口
+    do_not: 不要在拆的同时改事件语义；先拆结构，语义另开 PR
+
+  - id: TD-002
+    title: 思考模式 `reasoning_content` 偶发 400 未修
+    where: llm/deepseek.py
+    why_now: 根因已查清（langchain-openai 不提取该字段，序列化时不透传
+      additional_kwargs），但捕获侧无法稳定复现；不把无法验证的改动放进请求路径
+    debt_type: 已知缺陷
+    severity: low
+    workaround: 用 `DEEPSEEK_MODEL=deepseek-chat`（也是默认值）
+    owner: 项目作者
+    due: 能稳定复现时
+    do_not: 不要凭猜测改请求构造 —— 上一个这么做的人引入了不可验证的改动
+
+  - id: TD-003
+    title: 共享文件的并发写未实现
+    where: orchestrator/implement.py, orchestrator/merge.py
+    why_now: 当前用 write_scope 不重叠 + 顺序 patch 合并规避；
+      3-way rebase / 冲突自动合并留给后续
+    debt_type: 能力缺口
+    severity: medium
+    workaround: AGENT_ORCHESTRATOR_ALLOW_OVERLAP=true 时用临时 index 3-way 预演，
+      真实冲突仍整批回滚
+    owner: 项目作者
+    due: 需要多人改同一文件时
+    do_not: 不要用"放宽 write_scope 校验"来绕过 —— 那样会留下半合并状态
+
+  - id: TD-004
+    title: 成本预算与模型分层只计量不硬停
+    where: llm/, orchestrator/scheduler.py
+    why_now: 任务级 token 上限与 scheduler 全局准入已接入，
+      但预留是角色级 EWMA 估算，不是精确 prompt token 计数
+    debt_type: 能力缺口
+    severity: low
+    workaround: CostReport 会报告预算告警；AGENT_ORCHESTRATOR_WORKER_MODEL 可手动分层
+    owner: 项目作者
+    due: 成本成为瓶颈时
+    do_not: 不要把估算值当成精确值写进文档或断言
+
+  - id: TD-005
+    title: 检索默认后端是 grep（沙箱未装 ripgrep）
+    where: tools/search.py
+    why_now: 环境属性；两个后端输出格式一致（grep 分支显式 -E）
+    debt_type: 环境
+    severity: low
+    workaround: 大仓库上会慢；`agent doctor` 显示当前后端
+    owner: 环境维护
+    due: 沙箱预装 ripgrep 后可自动消除
+    do_not: 不要因为慢就改成 shell 拼 grep —— xargs 不在 L0 白名单，会被降级为 L2
+
+  - id: TD-006
+    title: default 评测套件已饱和（29/29 ×2，spread 0）
+    where: tests/eval/
+    why_now: 尺子对当前模型没有区分度，继续用它做 A/B 只会得到 0pp
+    debt_type: 度量失效
+    severity: medium
+    workaround: 改用 long 套件，或扩展更难的 default 任务
+    owner: 评测维护者
+    due: 下次要量化任何改动之前
+    do_not: |
+      **不要用 default 套件的单轮差异证明任何改进。** 历史上 52%/83%
+      （spread 31pp）就是这么来的 —— 那次读数说明不了任何事。
+
+  - id: TD-007
+    title: 快照落在工作区内，工作区可写时 agent 能改自己的留底
+    where: sandbox/snapshots.py
+    why_now: 改动会影响所有回滚路径；T2 达标项之一
+    debt_type: 安全
+    severity: medium
+    plan: 快照移出工作区，或加校验和
+    owner: 项目作者
+    due: 升到 T2 威胁模型之前（见 THREAT_MODEL.md §5.7）
+    do_not: 不要把这条当成"已解决" —— 它只在 T1 下可接受
+
+  - id: TD-008
+    title: 文档里的测试数字多份不一致（1561 / 1661 / 1443 / 1420 / 1403）
+    where: README.md, docs/ACCEPTANCE.md, docs/COMPLEXITY.md, docs/TEST_REPORT_*.md
+    why_now: 手写数字会过期；README 未纳入本次分层改造
+    debt_type: 文档
+    severity: low
+    plan: |
+      数字一律改成"生成命令 + 实测日期"，不再手抄。
+      docs/contracts/ 已实现自动生成；README 需单独一次编辑。
+    owner: 项目作者
+    due: 下次 README 编辑时
+    do_not: 不要在各文档之间互相抄数字 —— 抄一次错一次
+
+# ===========================================================================
+# 已还清（保留作历史，避免重复讨论）
+# ===========================================================================
+paid_off:
+  - id: TD-OLD-01
+    title: implement worker 无法识别 worktree 内的改动（P0-1）
+    resolved: 2026-10-21
+    how: _changed_files 仅在 stderr 不是 ignored-path 警告时才返回空
+    regression: test_implement_worker_creates_a_clean_patch（仓库加入 .gitignore）
+    see: docs/postmortem/2026-10-21-orchestrated-write.md
+  - id: TD-OLD-02
+    title: 等待合并的 implement 被重新启动（P0-2）
+    resolved: 2026-10-21
+    how: 结果进入合并队列时立即置 merging 并离开 pending
+    regression: test_completed_implement_is_not_relaunched_while_waiting_for_merge
+    see: docs/postmortem/2026-10-21-orchestrated-write.md

@@ -1,0 +1,131 @@
+# 由 scripts/gen_contracts.py 从源码生成，禁止手改。
+# 事实源：src/coding_agent/audit/models.py
+
+contract: coding-agent/audit
+version: 1
+storage: "宿主侧 <cwd>/.agent/audit/<YYYY-MM-DD>.jsonl，哈希链可校验"
+rule: "审计由 runtime 写，不由前端写 —— 任何界面都绕不过；写入失败会转成 RunFailed（宁可显式失败，也不静默丢记录）。"
+
+kinds:
+  - kind: run_start
+  - kind: plan
+  - kind: replan
+  - kind: tool_call
+  - kind: file_change
+  - kind: rollback
+  - kind: verify
+  - kind: review
+  - kind: nudge
+  - kind: repair
+  - kind: subagent
+  - kind: workflow
+  - kind: task_graph
+  - kind: worker
+  - kind: orchestration
+  - kind: steering
+  - kind: run_end
+  - kind: run_error
+  - kind: recovery
+  - kind: concurrency
+
+decisions:
+  - value: auto
+  - value: rejected
+  - value: approved
+  - value: denied
+
+field_groups:
+  - group: "common"
+    fields:
+      - name: ts
+        type: "str"
+      - name: kind
+        type: "str"
+      - name: prev_hash
+        type: "str"
+      - name: hash
+        type: "str"
+      - name: thread_id
+        type: "str"
+      - name: workspace
+        type: "str"
+      - name: call_id
+        type: "str"
+      - name: tool
+        type: "str"
+      - name: args
+        type: "dict[str, Any]"
+      - name: level
+        type: "str"
+      - name: decision
+        type: "str"
+      - name: ok
+        type: "bool | None"
+      - name: exit_code
+        type: "int | None"
+      - name: duration_ms
+        type: "int | None"
+      - name: steps
+        type: "list[str]"
+      - name: kinds
+        type: "list[str] | None"
+      - name: detail
+        type: "str"
+      - name: input_tokens
+        type: "int | None"
+      - name: output_tokens
+        type: "int | None"
+      - name: cost_usd
+        type: "float | None"
+      - name: billed_usd
+        type: "float | None"
+      - name: cache_hit_tokens
+        type: "int | None"
+      - name: cache_miss_tokens
+        type: "int | None"
+      - name: path
+        type: "str"
+      - name: action
+        type: "str"
+      - name: added
+        type: "int"
+      - name: removed
+        type: "int"
+      - name: snapshot_id
+        type: "str | None"
+      - name: agent_id
+        type: "str | None"
+      - name: parent_call_id
+        type: "str | None"
+      - name: task
+        type: "str | None"
+      - name: source
+        type: "str | None"
+      - name: workflow
+        type: "str | None"
+      - name: task_id
+        type: "str | None"
+      - name: role
+        type: "str | None"
+      - name: worker_id
+        type: "str | None"
+      - name: attempt
+        type: "int | None"
+      - name: merged
+        type: "bool | None"
+      - name: artifact_id
+        type: "str | None"
+      - name: timed_out
+        type: "bool | None"
+      - name: queue_wait_ms
+        type: "int | None"
+      - name: llm_ms
+        type: "int | None"
+      - name: tool_ms
+        type: "int | None"
+      - name: depth
+        type: "int | None"
+      - name: priority
+        type: "int | None"
+      - name: scope_violations
+        type: "list[str]"

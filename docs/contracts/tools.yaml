@@ -1,0 +1,129 @@
+# 由 scripts/gen_contracts.py 从源码生成，禁止手改。
+# 事实源：src/coding_agent/graph/nodes/approve.py
+
+contract: coding-agent/tools
+version: 1
+rule: "新工具必须在 approve.py::tool_level 登记；未登记一律按 L3 危险处理（fail-closed，不是默认值偷懒）。"
+
+# 命令四级分级
+levels:
+  - level: 0
+    label: "L0 只读"
+    behaviour: "自动执行"
+  - level: 1
+    label: "L1 低风险写"
+    behaviour: "需 --write 一次性授权后自动执行 + 审计"
+  - level: 2
+    label: "L2 变更性"
+    behaviour: "需用户确认"
+  - level: 3
+    label: "L3 危险"
+    behaviour: "需用户确认（标注危险）；--yes 也不能放行"
+
+# shell_exec 不参与静态分级，按命令文本实时分类
+shell:
+  tool: shell_exec
+  level: "按命令文本分类（policy.classify）"
+  note: "复合命令按 && || ; | 分段取最高级；无法解析的一律降级为 L2。"
+
+tools:
+  - tool: code_intel
+    level: 0
+    label: "L0 只读"
+    behaviour: "自动执行"
+  - tool: delegate_explore
+    level: 0
+    label: "L0 只读"
+    behaviour: "自动执行"
+  - tool: deps_list
+    level: 0
+    label: "L0 只读"
+    behaviour: "自动执行"
+  - tool: file_list
+    level: 0
+    label: "L0 只读"
+    behaviour: "自动执行"
+  - tool: file_read
+    level: 0
+    label: "L0 只读"
+    behaviour: "自动执行"
+  - tool: find_files
+    level: 0
+    label: "L0 只读"
+    behaviour: "自动执行"
+  - tool: git_diff
+    level: 0
+    label: "L0 只读"
+    behaviour: "自动执行"
+  - tool: git_log
+    level: 0
+    label: "L0 只读"
+    behaviour: "自动执行"
+  - tool: git_status
+    level: 0
+    label: "L0 只读"
+    behaviour: "自动执行"
+  - tool: memory_search
+    level: 0
+    label: "L0 只读"
+    behaviour: "自动执行"
+  - tool: search_code
+    level: 0
+    label: "L0 只读"
+    behaviour: "自动执行"
+  - tool: symbol_search
+    level: 0
+    label: "L0 只读"
+    behaviour: "自动执行"
+  - tool: file_copy
+    level: 1
+    label: "L1 低风险写"
+    behaviour: "需 --write 一次性授权后自动执行 + 审计"
+  - tool: file_edit
+    level: 1
+    label: "L1 低风险写"
+    behaviour: "需 --write 一次性授权后自动执行 + 审计"
+  - tool: file_edit_many
+    level: 1
+    label: "L1 低风险写"
+    behaviour: "需 --write 一次性授权后自动执行 + 审计"
+  - tool: file_mkdir
+    level: 1
+    label: "L1 低风险写"
+    behaviour: "需 --write 一次性授权后自动执行 + 审计"
+  - tool: file_move
+    level: 1
+    label: "L1 低风险写"
+    behaviour: "需 --write 一次性授权后自动执行 + 审计"
+  - tool: file_restore
+    level: 1
+    label: "L1 低风险写"
+    behaviour: "需 --write 一次性授权后自动执行 + 审计"
+  - tool: file_write
+    level: 1
+    label: "L1 低风险写"
+    behaviour: "需 --write 一次性授权后自动执行 + 审计"
+  - tool: git_add
+    level: 1
+    label: "L1 低风险写"
+    behaviour: "需 --write 一次性授权后自动执行 + 审计"
+  - tool: memory_save
+    level: 1
+    label: "L1 低风险写"
+    behaviour: "需 --write 一次性授权后自动执行 + 审计"
+  - tool: deps_install
+    level: 2
+    label: "L2 变更性"
+    behaviour: "需用户确认"
+  - tool: file_delete
+    level: 2
+    label: "L2 变更性"
+    behaviour: "需用户确认"
+  - tool: git_commit
+    level: 2
+    label: "L2 变更性"
+    behaviour: "需用户确认"
+  - tool: run_tests
+    level: 2
+    label: "L2 变更性"
+    behaviour: "需用户确认"

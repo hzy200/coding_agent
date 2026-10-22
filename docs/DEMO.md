@@ -1,3 +1,13 @@
+---
+layer: L3
+doc_id: demo
+title: 演示讲稿
+owner: 项目作者
+status: active
+last_reviewed: 2026-10-22
+review_cadence: 答辩/演示前
+---
+
 # 演示讲稿
 
 配套脚本：`scripts/demo.py`。四个场景各对应一个创新点，顺序刻意递进：
@@ -57,8 +67,8 @@ agent run -C <演示工作区> "用 pip 装一个 requests 库。"      # 不加
 
 这里可以现场敲 `n` 演示拒绝，再跑一遍敲 `y`。
 
-> 如果现场不方便交互，用 `--yes` 跑，它只把"人工确认"降级为"自动批准"，
-> **等级判定不变**，审计里记为 `approved` 而不是 `denied`。
+> 如果现场不方便交互，用 `--yes` 跑：它只自动批准 L2，**L3 危险命令仍会
+> 停下来要求确认**。等级判定不变，审计里记为 `approved` 而不是 `denied`。
 
 **追一句：** 判定完全在宿主侧，白名单 + 危险正则 + 复合命令取最高级，
 **无法解析的一律降级为 L2**，不赌。
@@ -138,8 +148,11 @@ cat calc.py          # 确认已还原
 
 `agent web` 打开 `http://127.0.0.1:8765`。流式对话、多会话列表、API 联通状态。
 
-**注意**：Web 端**固定拒绝**变更类命令（没有做审批交互），
-所以它只适合演示只读分析与多会话，不适合演示改动。要演示改动请用 TUI 或 CLI。
+**注意**：Web 端使用 `ask` 审批模式，L2/L3 会通过 SSE 发 `approval_requested`，
+页面收集答复后走 `/api/resume` 继续；也支持 pause/cancel/add/replan。
+本机默认 loopback 匿名；公网/多用户需配置 `AGENT_WEB_AUTH_TOKENS` 并用
+`--host 0.0.0.0 --allow-remote` + TLS（或 `--behind-proxy`）启动。
+不要在没有 token 的情况下把端口暴露到公网。
 
 ## 备选：Harness 与评测（Phase 3A–4D）
 

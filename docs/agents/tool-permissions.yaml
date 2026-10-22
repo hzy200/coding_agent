@@ -1,0 +1,103 @@
+# 工具 / 外部服务权限声明
+#
+# 每个能力都要写清：能读什么、能写什么、最小权限、是否需人工批准。
+# 绝不能把生产库或任意 shell 暴露成一个"万能工具"。
+
+version: 1
+owner: 项目作者
+last_reviewed: 2026-10-22
+review_cadence: 工具、外部服务或数据边界变动时
+
+# ---------------------------------------------------------------------------
+# MCP Server
+# ---------------------------------------------------------------------------
+mcp_servers: []
+mcp_note: |
+  本项目当前**没有**接入任何 MCP server。全部能力都是宿主内置的 BaseTool，
+  经 tools/registry.py 注册、graph/nodes/approve.py 分级后执行。
+  若后续接入 MCP，必须在此登记：server 名、能读什么、能写什么、最小权限、
+  审计要求、是否需人工批准 —— 未登记即不得调用。
+
+# ---------------------------------------------------------------------------
+# 工具权限模型（事实源：approve.py::tool_level + sandbox/policy.py）
+# ---------------------------------------------------------------------------
+permission_model:
+  decision_point: graph/nodes/approve.py（approval_gate，纯函数，只做决定）
+  enforcement_point: graph/nodes/tools.py（唯一执行咽喉）
+  fail_closed: true
+  fail_closed_cases:
+    - 审批记录缺失
+    - 答复无法解析
+    - call_id 为空或重复
+    - 非交互环境（管道 / CI）没有 stdin
+  default_for_unregistered: L3 危险（未登记即最严，不是默认值偷懒）
+  approval_ttl: 一次性有效，不跨轮次；approvals 用后即清
+
+levels:
+  - level: L0
+    access: 只读
+    approval: 自动执行
+    examples: [file_read, file_list, search_code, find_files, symbol_search,
+               git_status, git_diff, git_log, deps_list]
+  - level: L1
+    access: 低风险写
+    approval: 需 --write 一次性授权，之后自动执行 + 审计
+    examples: [file_write, file_edit, file_edit_many, file_restore,
+               file_move, file_copy, file_mkdir, git_add, memory_save]
+  - level: L2
+    access: 变更性（产生提交 / 改依赖环境 / 执行项目代码）
+    approval: 需用户确认
+    examples: [git_commit, deps_install, run_tests, file_delete]
+  - level: L3
+    access: 危险
+    approval: 需用户确认（标注危险）；**-y / approve 模式也不能放行**
+    examples: [rm -rf, git push -f, "curl | sh", sudo, printenv, env]
+
+# ---------------------------------------------------------------------------
+# 各角色的工具白名单（构造时 + 运行时双重校验）
+# ---------------------------------------------------------------------------
+worker_permissions:
+  explore:  {write: false, shell: false, git: false, deps: false, test: false}
+  review:   {write: false, shell: false, git: false, deps: false, test: false}
+  test:     {write: false, shell: false, git: false, deps: false, test: true}
+  implement: {write: true, shell: false, git: false, deps: false, test: false,
+              note: "写权限受 write_scope 约束，在文件工具 I/O 前强制校验"}
+
+# ---------------------------------------------------------------------------
+# 外部服务与数据出境
+# ---------------------------------------------------------------------------
+external_services:
+  - id: deepseek
+    purpose: 主模型推理
+    env: DEEPSEEK_API_KEY / AGENT_LLM_PROVIDERS
+    data_sent: 提示词与工具结果（脱敏后）
+    approval: 不需要（但受成本预算告警约束）
+  - id: langsmith
+    purpose: 调用链追踪
+    env: LANGSMITH_TRACING / LANGSMITH_API_KEY
+    default: off —— 追踪数据会离开本机
+    data_sent: run_name / tags / metadata
+    constraint: |
+      metadata **只放标识与开关**（thread_id / workspace / model / allow_write /
+      approval_mode），不放提示词或文件内容。
+  - id: provider_billing_api
+    purpose: 账单对账
+    env: AGENT_BILLING_ENABLED
+    default: off
+
+data_boundary:
+  host_to_sandbox: 不传。WSL 命令以 env -i 启动，宿主环境变量不进入 Linux 子进程
+  sandbox_to_host: 命令输出在回灌模型前做脱敏（模式匹配，best-effort 非完整 DLP）
+  never_leave_host: [.env, 私钥/证书, .aws/**, .kube/**, credentials*.json, *.tfstate]
+  workspace_root: 工作区外的读写、命令、符号链接逃逸一律拒绝
+
+# ---------------------------------------------------------------------------
+# 审计
+# ---------------------------------------------------------------------------
+audit:
+  writer: runtime（**不是前端**）—— 任何界面都绕不过
+  storage: 宿主侧 <cwd>/.agent/audit/<YYYY-MM-DD>.jsonl
+  integrity: 哈希链，`agent audit --verify` 可校验；能发现本地日志被改动，
+             但不能防拥有主机权限者重写整条链
+  failure_mode: 写入失败 → RunFailed（宁可显式失败，也不静默丢记录）
+  kinds: 见 docs/contracts/audit.yaml（代码生成）

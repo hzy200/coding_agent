@@ -1,3 +1,16 @@
+---
+layer: L3（第 6 节不变量、第 7 节取舍属 L2 内核）
+doc_id: architecture
+title: 架构
+owner: 项目作者
+status: active
+last_reviewed: 2026-10-22
+review_cadence: 拓扑或状态字段变动时
+note: |
+  第 6 节的 56 条不变量与第 7 节的取舍是本项目最硬的 L2 资产。
+  新决策请写入 docs/adr/（只增不改），不要改写这两节。
+---
+
 # 架构
 
 面向实现：分层、数据流、不变量与取舍理由。Harness 阶段方案见
@@ -15,7 +28,7 @@ LLM 拿不到操作系统句柄，只能产出结构化调用 `{tool, args}`；�
 | 后果 | 实现 |
 |---|---|
 | 模型说什么不算数，宿主说了算 | 命令分级在 `sandbox/policy.py`，不看模型自报 |
-| 危险操作过不去 | L2/L3 先挂起等审批；不批就不执行 |
+| 危险操作过不去 | L2/L3 先挂起等审批；`approve` 只自动放行 L2，L3 始终确认 |
 | 改动可回滚 | 写盘前快照，恢复前再留底 |
 | 一切可追溯 | 审计由 runtime 写，前端绕不过 |
 
@@ -164,7 +177,8 @@ Web 页面上一个按钮就能跳过命令分级。这条约束是安全属性�
 | `replan_count` | 已重建计划的次数 | planner 清零、replan 递增；**整个任务**的额度，advance 不动 |
 | `tool_rounds` | 当前步骤已用轮次 | planner / advance / repair 清零 |
 | `budget_exhausted` | 本步因预算耗尽收尾 | 同上 |
-| `dirty` | 本步是否改过东西 | 由 tools 置位，advance/planner 清零，repair 置位 |
+| `dirty` | 本步是否改过东西 | 由 tools 置位，advance 清零，planner 在编排合并后置位，repair 置位 |
+| `pending_verification` | 编排合并过补丁、主 agent 尚未验证 | scheduler 置位；verify 执行后清零；advance/repair/replan 不碰 |
 | `verification` | 最近一次验证结果 | planner / advance 清空 |
 | `review` | 最近一次代码审查结果 | 同 `verification`：planner / advance 清空，**repair 刻意不清**（act 要靠它知道该改什么） |
 | `review_watermark` | 已审过的最大快照 id | **只由 planner 归零**；advance / repair 都不许碰（见下方不变量 19） |
@@ -205,7 +219,7 @@ checkpoint 保存；未消费指令与 pause 标记由 `SteeringController` 原�
 | 7 | **审计失败显式报出** | 审计有缺口是这个项目不能接受的失败模式 | `test_audit_write_failure_surfaces_as_run_failed` |
 | 8 | **所有写操作先留底** | 回滚本身也要可回滚 | `test_restore_is_itself_undoable` |
 | 9 | **路径校验做两次**（词法 + realpath） | 词法挡不住"先建符号链接再穿透" | `test_symlink_escape_is_rejected` |
-| 10 | **审批结果跨挂起/恢复仍带调用参数** | 挂起与恢复是两次 `_stream`；配对表若只活在局部，恢复后审计会丢掉参数——偏偏是最高风险的 L2/L3 调用 | `test_approved_tool_call_keeps_args_across_resume` |
+| 10 | **审批结果跨挂起/恢复仍带调用参数** | 挂起与恢复是两次 `_stream`；配对表若只活在局部，恢复后审计会丢掉参数——偏偏是最高风险的 L2/L3 调用。进程重启后从 checkpoint 尾部的 tool_calls 恢复 | `test_approved_tool_call_keeps_args_across_resume`、`test_pending_call_args_survive_a_process_restart` |
 | 11 | **悬空符号链接也按目标解析**（`-e` 或 `-L` 都触发） | 悬空链接的 `-e` 为假，只判存在性会顺着链接写到工作区外 | `test_dangling_symlink_escape_is_rejected` |
 | 12 | **只读命令的参数越界升级到人工确认** | 命令名只读 ≠ 参数安全（`cat ~/.ssh/id_rsa`） | `test_external_access_is_escalated_to_confirmation` |
 | 13 | **引号内的字面量不当命令** | 危险模式匹配全文会把 `grep "rm -rf"` 误判；但 `$()` / `sh -c` 里的内容仍要扫 | `test_quoted_literals_are_not_dangerous` |
@@ -220,7 +234,7 @@ checkpoint 保存；未消费指令与 pause 标记由 `SteeringController` 原�
 | 22 | **审查没跑起来 ≠ 审查通过** | 与审计、验证同源的一条：脚本崩了要留一条可见的告警，而不是静默当成"审过了没问题" | `test_a_crashed_review_is_not_reported_as_clean` |
 | 23 | **「这一步只读了文件」不等于「这一步做完了」** | `verify` 与 `review` 都只在 `dirty` 时执行，所以一个只读步骤会**一路短路到 advance** —— 实测里模型因此把整个计划"读"完就算完成（长程任务 10 次运行里 5 次一次写都没尝试过）。改为一律经 `nudge` 打回重做一次，并在提示里说明原因 | `test_a_step_with_no_change_is_sent_back_to_act`、`test_a_step_that_changes_nothing_is_retried_once_then_accepted` |
 | 26 | **语法错在落盘前就拒** | 原先「先写下去 → review 事后查 → 不合格再 repair」，白烧一轮工具预算与一次模型往返。语法错是这里最便宜就能确定的错误（纯解析、零 I/O），没理由等到事后。**判据是「有没有变坏」而不是「是不是好的」** —— 原本就坏的文件允许继续改，否则会堵死模型自己的分步修复 | `test_write_rejects_broken_python`、`test_edit_rejects_a_change_that_breaks_syntax`、`test_an_already_broken_file_can_still_be_edited` |
-| 25 | **「没验证」不等于「通过」** | 识别不出测试命令时原先是 `not_configured` → 路由判为非 failed → **审计记成 `ok=True`**，于是"没做"与"做对了"在账上分不开（P0-2）。现在：① 有源码就做**语法解析级降级验证**（`kind=syntax`），② 事件与审计的 `ok` 都是**三态**（True/False/**None=没验证**） | `test_a_python_project_without_tests_falls_back_to_a_syntax_check`、`test_the_audit_records_not_configured_as_unverified_not_passed`、`test_verification_ok_is_three_state` |
+| 25 | **「没验证」不等于「通过」** |  识别不出测试命令时原先是 `not_configured` → 路由判为非 failed → **审计记成 `ok=True`**，于是"没做"与"做对了"在账上分不开（P0-2）。现在：① 有源码就做**语法解析级降级验证**（`kind=syntax`），② 事件与审计的 `ok` 都是**三态**（True/False/**None=没验证**） | `test_a_python_project_without_tests_falls_back_to_a_syntax_check`、`test_the_audit_records_not_configured_as_unverified_not_passed`、`test_verification_ok_is_three_state` |
 | 24 | **空步骤的重做有界，且必须给退路** | 只读步骤是合法的（计划第一步常常就是探索）。无限要求"必须有改动"会逼出无意义的改动，所以只给一次机会，且提示里明确写了"这一步确实只需只读就说明理由停下" | `test_the_nudge_happens_only_once_per_step`、`test_nudge_tells_the_model_why_it_is_back` |
 | 27 | **`delegate_explore` 子智能体只能绑定只读白名单工具；implement worker 只能绑定文件/检索白名单** | 子智能体输入包含仓库内容，不能让它获得写/执行能力。构造时校验工具集合，运行时再按名字二次校验；委托调用本身仍走 `approval_gate → tools` 唯一咽喉。编排 implement worker 是另一条受控路径，构造时断言不含 shell/git/deps/test（见 32） | `test_runner_refuses_non_readonly_tools_at_construction`、`test_non_whitelisted_tool_call_is_refused` |
 | 28 | **主 agent 的并发只发生在只读子智能体之间；编排并发由 scheduler 统一管理** | 多个 delegate 同批并发；主 agent 的普通工具（含写）仍串行。编排路径由 scheduler 的 ready 堆与信号量控制并发，任务完成即解锁依赖，失败立即短路。写操作与探索混在同一条消息时，提示词要求模型拆开，避免读到改动前的状态 | `test_multiple_delegate_calls_run_concurrently`、`test_concurrent_batch_respects_the_task_budget`、`test_dependent_starts_as_soon_as_its_predecessor_finishes` |
@@ -234,14 +248,14 @@ checkpoint 保存；未消费指令与 pause 标记由 `SteeringController` 原�
 | 36 | **写文件必须原子替换，并对瞬时占用做短重试** | 直接 `> file` 在进程被杀/磁盘满时会留下半截文件；`EBUSY/ETXTBSY` 往往只是编辑器/构建工具短暂持有文件，立刻报错会让模型做无意义的“修代码”。同目录临时文件 + `rename` 保证读者看到完整内容 | `test_write_uses_a_temp_file_and_atomic_replace`、`test_write_retries_on_busy_file`、`test_write_does_not_retry_a_semantic_failure` |
 | 37 | **模型读到写之间文件被外部改过时不覆盖** | 否则 `file_write` 会静默丢掉编辑器/另一个进程的改动。只拿模型自己的读取缓存做乐观比较；没有读取记录不猜 | `test_changed_since_read_detects_external_modification`、`test_overwrite_is_rejected_when_file_changed_since_read` |
 | 38 | **checkpoint 要能承受并发，且中断必须可识别** | 多前端共享 SQLite 时，默认 journal 模式容易 `database is locked`；WAL + busy_timeout 降低冲突。`run_status` 留在 checkpoint 里，下一次同 thread 运行才能判断上一轮是否异常中断，并把“可能有未验证改动”交给模型 | `test_sqlite_uses_wal_and_busy_timeout`、`test_interrupted_run_produces_a_recovery_notice`、`test_finished_run_does_not_produce_a_recovery_notice` |
-| 39 | **有副作用的工具必须可检测“结果未知”，不能盲目重放** | 工具已执行、checkpoint 未记录时重放会造成第二次副作用（重复 commit / shell 写入）。日志按 `(thread_id, call_id)` 记录 started/finished；只有 started 时明确回灌“结果未知”并强制验证 | `test_a_side_effect_with_only_started_is_not_replayed`、`test_a_finished_side_effect_is_replayed_without_executing`、`test_a_side_effect_execution_is_recorded` |
+| 39 | **有副作用的工具必须可检测“结果未知”，不能盲目重放** | 工具已执行、checkpoint 未记录时重放会造成第二次副作用（重复 commit / shell 写入）。日志按 `(thread_id, call_id)` 记录 started/finished；只有 started 时明确回灌“结果未知”并强制验证。事件与审计用 `interrupted` / `ok=None` 保留三态，不能退化成成功 | `test_a_side_effect_with_only_started_is_not_replayed`、`test_a_finished_side_effect_is_replayed_without_executing`、`test_a_side_effect_execution_is_recorded`、`test_interrupted_tool_audit_is_recorded_as_unknown` |
 | 40 | **运行与验证各有独立时限** | `recursion_limit` 只管步数，管不住模型长时间卡住；验证命令通常比普通 shell 长，不能共用 60s。总时限跨 resume 累计，验证超时单独配置 | `test_run_deadline_stops_a_stuck_graph`、`test_verification_uses_the_dedicated_timeout` |
 | 41 | **WSL 传输故障要熔断，但不能把命令失败算进去** | WSL 掉线时每个工具调用都拉起一个注定失败的 `wsl.exe`，会把一次运行拖成几分钟；连续传输失败后应 fail fast。命令退出码非零只说明用户命令失败，必须重置/保持闭合。冷却后只放一个半开探测，避免恢复瞬间又打满 | `test_transport_failures_open_the_breaker`、`test_normal_command_failures_do_not_open_the_breaker`、`test_half_open_probe_closes_the_breaker` |
 | 42 | **worker / 工具 / WSL / LLM 并发由同一套资源池治理** | 各层独立限流会让高层在低层饱和时继续准入，优先级也传不下去。统一池让 scheduler、tools、sandbox、router 共享上限，获取槽位必须有超时，避免线程池被拖死 | `test_async_pool_limits_and_times_out`、`test_governor_limits_concurrent_llm_calls`、`test_sync_pool_times_out` |
 | 43 | **调度要工作守恒：边界只管返回时机，预算不足不能全阻塞** | `checkpoint_every` 同时当启动上限会让 6 任务图先跑 4 个再空等；固定角色 token 预留会让大任务把小任务一起拖死。边界只按完成数返回；预算用 EWMA + next-fit 选择可容纳任务 | `test_checkpoint_boundary_does_not_cap_launches`、`test_observed_usage_lets_a_small_task_fit_where_static_reserve_would_not` |
 | 44 | **低优先级任务要被 aging，探针要有保留槽** | 固定角色优先级会让 explore 在 implement 潮水下永久等待；WSL 长命令会把健康探针一起堵死。ready 队列按等待时间提升优先级；WSL 池保留 1 个槽只给 `reserved=True` 的探针 | `test_aging_raises_priority_but_does_not_beat_implement`、`test_reserved_slot_stays_available_for_probes` |
 | 45 | **写批次要有合并背压，且只等待真正在跑的 implement** | 无上限地启动写 worker 会让补丁/快照堆积。在飞 + 待合并超过阈值时暂停新 implement；`has_active_implement` 只认 `in_flight`，否则待启动任务会让合并队列永远不 flush，收尾时还会整批丢弃 | `test_merge_backpressure_limits_concurrent_implement`、`test_merge_queue_only_waits_for_in_flight_implement_workers` |
-| 46 | **同一工作区只能有一个运行中的 runtime** | 两个进程会同时拉起 WSL、同时改文件/合并补丁，快照与 review 水位线互相污染。用审计目录下的工作区哈希锁做进程内 + OS 级互斥 | `test_workspace_lock_blocks_a_second_runtime`、`test_same_workspace_is_exclusive` |
+| 46 | **同一工作区只能有一个运行中的 runtime** | 两个进程会同时拉起 WSL、同时改文件/合并补丁，快照与 review 水位线互相污染。用审计目录下的工作区哈希锁做进程内 + OS 级互斥；OS 锁返回“忙”时 fail closed，只有文件系统明确不支持锁才降级 | `test_workspace_lock_blocks_a_second_runtime`、`test_same_workspace_is_exclusive`、`test_lock_is_exclusive_across_processes` |
 | 47 | **LLM 自适应并发要跨进程收敛** | 同一台机器上多个 runtime 各调各的，会在 429 恢复时一起打满。AIMD 结果写入现有共享限流文件，其他进程在下一次调用前同步并 clamp 本地池 | `test_concurrency_limit_is_shared_across_processes`、`test_aimd_shrinks_on_429_and_recovers_on_success` |
 | 48 | **WSL 弹性并发只在饱和时依据 p95 延迟调整** | 非饱和时命令本身就慢（构建/测试），据此降并发会把正常负载误判成争用。只有 `in_flight >= limit` 时才按 p95 高/低于目标调整，且不抢占在飞命令 | `test_saturation_with_high_latency_lowers_the_limit`、`test_low_latency_recovers_toward_the_ceiling` |
 | 49 | **常驻 shell 默认开启，但任何会话异常都必须退回一次性执行** | 一次性 `wsl.exe` 每次约 0.2s，是工具延迟的主要来源；常驻会话把读/检索降到约 20ms。会话破裂/超时/未返回结束标记时必须禁用它并回退，不能把稳定性押在一个长连接上 | `test_persistent_shell_reuses_one_process`、`test_persistent_shell_timeout_does_not_poison_the_next_command`、`test_non_wsl_test_cannot_execute_real_sandbox_command` |
@@ -364,9 +378,12 @@ START ─ route_entry ─┬─ direct → planner → act ...
   workflow + 任务图，避免第二次规划往返。
 
 **写路径**：`implement` worker 仍在独立 git worktree 中修改，导出 patch 后由
-宿主串行合并。`write_scope` 现在有**写时校验**：文件工具在 I/O 前拒绝越界路径；
-事后 diff 校验保留为第二道防线。写编排要求 `--write`、git 仓库根、干净工作区；
-`.agent/` 与 `__pycache__/` 不算用户脏改动。
+宿主串行合并。合并成功后 scheduler 会置 `pending_verification`，保证主 agent
+至少对合并结果跑一次自动验证（否则主 agent 只读时 `dirty=False` 会让 verify 短路）。
+`write_scope` 现在有**写时校验**：文件工具在 I/O 前拒绝越界路径；事后 diff 校验
+保留为第二道防线。worker 工具白名单**不含 `file_delete`**：删除在主 agent 路径
+是 L2 审批，不能从不走 approval_gate 的并发 worker 变成无审批通道。写编排要求
+`--write`、git 仓库根、干净工作区；`.agent/` 与 `__pycache__/` 不算用户脏改动。
 
 **Steering**：`runtime.steer()` → `SteeringController`（按 thread 隔离）。
 `cancel` 在 worker 轮次/工具边界协作式轮询；`pause/add/replan` 只在 scheduler
@@ -377,7 +394,103 @@ drain 后的边界消费。pause 用 `interrupt()` + checkpoint，恢复时已�
 文件/检索白名单，不绑定 shell/git/deps/test。`WslSandbox` 增加并发命令信号量与
 探测缓存锁；所有 worker 工具调用、合并、超时、scope 违规、取消均写审计。
 
-## 9. 扩展点
+## 9. 并发与进程模型
+
+### 单 runtime
+
+- **一个事件循环**驱动图、scheduler 与 async 池；同步工具/沙箱经
+  `asyncio.to_thread` 下放。
+- `run` / `resume` / `resume_steering` 共用 `_stream_active` 闸门：同一
+  runtime 不允许并发驱动同一张图（工作区锁是可重入的，不能替代这一层）。
+- `AsyncLeasePool` 只在事件循环内变更，临界区不含 `await`；WSL 的
+  `SyncLeasePool` 用 `Condition` 做线程侧互斥。
+- `ReadCache` 用 `RLock` 保护：同一条消息里的多个只读工具会并发共享它。
+- `WslSandbox` 的常驻会话池创建/关闭有锁，池同时跟踪 idle 与 active
+  会话；`close()` 能清理正在执行的会话。延迟统计也串行化。
+
+### 多 runtime（Web）
+
+- `AgentRuntime(governor=...)` 允许注入共享 `ConcurrencyGovernor`；
+  `web/app.py` 为一个进程创建一份并传给所有会话。这样 WSL / worker /
+  tool / LLM 的上限是**进程级**的，不会随会话数相乘。
+- 每个 runtime 仍有独立的 `WorkspaceLock`、checkpointer 连接与 steering
+  状态；工作区锁保证同一工作区只有一个运行中的 runtime。
+
+### 跨进程
+
+- 工作区锁：占用时 fail closed，只有文件系统明确不支持锁才降级。
+- 限流状态、审计 JSONL、steering 队列、工具执行日志统一使用
+  `filelock.FileLock`（线程 RLock + OS 文件锁；OS 锁不可用时退化为线程锁）。
+- 需要「读-改-写」的 steering 队列在持有文件锁后**强制重读**，避免两个
+  `agent steer` 进程互相覆盖。
+- SQLite checkpoint 使用 WAL + `busy_timeout`；多个进程共享同一文件时
+  写冲突会等待而不是立刻失败。
+- 已知边界：资源上限是**单进程**的；多个 `agent` 进程各自有独立池。
+  跨进程只共享 LLM 冷却/AIMD 与工作区互斥，不共享 WSL 并发额度。
+  **运维建议**：同时开多个终端会话时，按总预算调低
+  `AGENT_CONCURRENCY_WSL` 与 `AGENT_PERSISTENT_SHELL_POOL`；需要统一配额时
+  应让多个会话共用一个 Web 进程（共享 governor），而不是启动多个独立进程。
+- `FileLock` 在 OS 锁不可用时退化为线程锁；`agent doctor` 会探测并给出
+  WARN。审计记录做了长度截断，`read_records` 会跳过损坏行，因此降级不会
+  破坏安全判定，只是跨进程协调变弱。
+
+### 输出与状态边界
+
+- 用户命令/验证命令的 stdout/stderr 在**捕获阶段**就受
+  `AGENT_MAX_CAPTURE_BYTES` 限制：一次性执行用有界读取，常驻会话在沙箱内
+  只回传 head+tail。文件工具等内部脚本通过 stdout 传 base64/JSON 协议，
+  **不套用该上限**（由调用方显式传入），否则会破坏协议。
+- scheduler 的自适应并发/退避状态写入 `OrchestratorState`，跨
+  checkpoint 边界保留（墙钟时间戳，进程重启后仍可用）。
+
+## 10. 多用户、公网与不可信仓库
+
+### 认证与租户
+
+- `web/auth.py`：Bearer Token → 用户名；支持 `sha256:<hex>` token；未配置
+  token 时只允许 loopback 匿名。
+- `tenancy.py`：每个用户独立 workspace（WSL）、audit/checkpoint/steering
+  （宿主）、memory（WSL 且仓库外）。用户只能得到
+  `workspaces_root/<user>`，Web 不接受任意主机路径。
+- 内部 thread id 在多用户模式加 `user:` 前缀；runtime registry 按
+  `(user, thread)` 隔离，杜绝跨用户读取/恢复。
+- 单 Web 进程：共享 governor；CLI 启动时用工作区锁占住数据根，避免多进程
+  绕过进程级配额。
+
+### 安全 profile
+
+- `AGENT_SECURITY_PROFILE=untrusted` 强制：
+  - `AGENT_SHELL_SANDBOX=bwrap`（不可用则拒绝执行）；
+  - `AGENT_SHELL_NETWORK=false`；
+  - `approval_mode=ask`，并清空 `allow_rules`；
+  - 不注入仓库 `AGENTS.md`/`CLAUDE.md`；
+  - 不读取仓库 `.agent/memory.md`，记忆移到 `AGENT_MEMORY_ROOT`。
+- `security/read_policy.py`：默认拒绝 `.env`、私钥/证书、`.npmrc`、`.netrc`、
+  `.aws/**`、`.kube/**`、`credentials*.json`、`*.tfstate` 等；文件工具在读
+  之前拒绝，shell 显式引用/通配形状/凭据关键词升级为 L2，search 工具过滤命中。
+- `security/secrets.py`：审计、shell、search、file_read 回灌前统一脱敏。
+- WSL 命令以 `env -i` 启动，宿主环境不继承；`printenv`/`env` 为 L3。
+- `production/ops` profile 强制只读 + 禁网 + `deny`，运行时忽略 `--write`。
+
+### 审计与日志
+
+- 每条记录带 `prev_hash`/`hash`，链跨轮转连续；`agent audit --verify`
+  可检测本地篡改。
+- 审计/工具日志写盘前脱敏；工具日志的 content/artifact 也会 redact。
+- 哈希链不是防篡改存储：拥有主机权限的人仍可重写整条链；高保证场景需要
+  外部 WORM/远程日志。
+
+### 残余边界
+
+- shell 递归检索仍是词法 best-effort：凭据关键词会升级为 L2，但变换写法
+  仍可能绕过；推荐 `search_code`（过滤 + 脱敏）。
+- 内容级 secret 识别是模式匹配，不覆盖任意自定义凭据格式。
+- bwrap 是 Linux 命名空间隔离，不防内核逃逸或恶意 WSL 发行版；仍未接入
+  seccomp / cgroup。
+- 不提供 Web 上传/克隆；仓库由管理员预置。
+- 不做跨进程 WSL 总配额；Web 按单进程部署。
+
+## 11. 扩展点
 
 ### 加一个工具
 

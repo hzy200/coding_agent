@@ -1,4 +1,9 @@
+<!-- owner: 项目作者 · last_reviewed: 2026-10-22 · review_cadence: 命令、状态数字或架构变动时 -->
+
 # CodingAgent
+
+[![CI](https://github.com/hzy200/coding_agent/actions/workflows/ci.yml/badge.svg)](https://github.com/hzy200/coding_agent/actions/workflows/ci.yml)
+[![Docs](https://github.com/hzy200/coding_agent/actions/workflows/docs.yml/badge.svg)](https://github.com/hzy200/coding_agent/actions/workflows/docs.yml)
 
 基于 LangGraph 的终端原生编程智能体。
 
@@ -17,11 +22,14 @@ orchestrator 子图，拆成 DAG 并发处理，最后把结构化结果交回�
 
 | 项 | 结果 |
 |---|---|
-| 测试 | `pytest -m "not llm"` **1561 passed**（含真实 WSL） |
-| 覆盖率 | **87.5%**（上次覆盖测量；本轮新增用例后未重测） |
-| CI 子集 | `pytest -m "not wsl and not llm"` **1350 passed**，覆盖率 **80.7%** |
+| 测试 | `pytest -m "not llm"` **1765 passed**（含真实 WSL，2026-10-22 实跑） |
+| 覆盖率 | **86.6%**（2026-10-22 实跑，`fail_under=76`） |
+| CI 子集 | `pytest -m "not wsl and not llm"` **1546 passed**，覆盖率 **80.7%** |
 | lint | `ruff check src tests` 干净 |
 | 说明 | 另有 3 个 `llm` 标记用例需要 `DEEPSEEK_API_KEY`，默认排除；不加 `-m` 时会真实调用模型 |
+
+> 上表是 **2026-10-22 本机实跑**的快照；最新结果见上方 CI badge。
+> 数字会随代码变化，长期事实源是 CI 与 `docs/contracts/`，不是这张表。
 
 四个选题创新点均已落地并有测试守着：双工具架构、可审计的命令安全策略、
 可回滚的修改流程、失败驱动的修复循环。
@@ -400,11 +408,19 @@ TUI 快捷键：`Ctrl+Q` 退出 · `Ctrl+N` 新会话 · `Ctrl+L` 清屏。
 设 `AGENT_SHELL_SANDBOX=bwrap`：命令在挂载命名空间里执行，`/home`、`/root`、
 `/mnt` 不可见、仅工作区可写；配置了却不可用时**拒绝执行**，不静默降级。
 `AGENT_SHELL_NETWORK=false` 会再加 `--unshare-net`，彻底切断命令网络。
+bwrap 同时启用 `--cap-drop ALL`、`--new-session`、`--unshare-ipc`。
 
-审计落盘前会对常见密钥（`sk-*`、GitHub token、AWS key、JWT、私钥块、
-`password=...`）做脱敏；`file_write`/`file_edit` 默认拒绝 `.env`、私钥、
-`.git/`、`.agent/` 等敏感目标，可用 `AGENT_WRITE_DENY_GLOBS` 追加。
-`AGENT_ALLOW_RULES` 可把明确安全的 L2 命令持久放行，但不会绕过 L3 或 `deny` 模式。
+每条 WSL 命令以 `env -i` 启动，宿主环境变量不会进入 Linux 子进程；
+`AGENT_SHELL_ENV_ALLOWLIST` 可显式放行 `JAVA_HOME` 等构建变量，含
+KEY/TOKEN/SECRET/PASSWORD 的名称始终忽略。`printenv` / `env` 归为 L3。
+
+审计、shell、search、file_read 回灌前都会对常见密钥（`sk-*`、
+GitHub/GitLab token、AWS key、JWT、Slack/Google token、私钥块、
+`password=...`、数据库连接串）做脱敏。`file_write`/`file_edit` 默认拒绝
+`.env`、私钥/证书、`.npmrc`、`.netrc`、`.aws/**`、`.kube/**`、
+`credentials*.json`、`*.tfstate`、`.git/`、`.agent/` 等敏感目标，可用
+`AGENT_WRITE_DENY_GLOBS` 追加。`AGENT_ALLOW_RULES` 可把明确安全的 L2 命令
+持久放行，但不会绕过 L3 或 `deny` 模式。
 
 资产、假设与边界见 [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)。
 
@@ -501,13 +517,16 @@ agent rewind --thread-id <id> -n 1   # 回退 1 个 checkpoint（历史保留）
 **TUI 是主要界面**（`agent tui`）：计划面板、任务图/worker 时间线、流式输出、
 审批弹窗。侧栏常驻显示会话、工作区与权限等级。
 
-**Web 是验证界面**（`agent web`）：SSE 流式对话、多会话列表、API 联通测试，
-以及 L2/L3 审批、pause/cancel/add/replan、审批/暂停后的 resume。
-一个自包含 HTML，不引前端构建链；端点与 TUI 共用同一套 runtime/steering 语义。
+**Web 是验证/多用户界面**（`agent web`）：SSE 流式对话、多会话列表、
+审批、pause/cancel/add/replan、审批/暂停后的 resume。
+默认按 `untrusted` profile 运行，并支持 Bearer Token + per-user 工作区；
+公网部署必须配置 token 与 TLS（见 [USAGE.md](docs/USAGE.md#公网--多用户部署)）。
+前端拆成静态 HTML/CSS/JS，不引构建链；端点与 TUI 共用同一套 runtime/steering 语义。
+Web 在 runtime 被 TTL 清理或进程重启后，会从 per-user checkpoint 重建并 resume。
 
 **CLI 实时干预**：`agent steer --thread-id <id> pause|cancel|add|replan`
-把指令写入 `.agent/steering/`，运行中的进程在下一个边界消费；
-跨进程恢复审批/暂停仍建议用 TUI 或 Web（它们持有 runtime/checkpoint 生命周期）。
+把指令写入 `.agent/steering/`，运行中的进程在下一个边界消费。
+Web 支持跨进程 resume；TUI 持有进程内 runtime；CLI 不提供 resume 子命令。
 
 ## 演示
 
@@ -565,6 +584,9 @@ CI 在无 WSL 的 runner 上跑 `ruff` + `pytest -m "not wsl and not llm" --cov`
 
 > 优先级：**命令行/构造函数参数 > `.env` > 环境变量 > 默认值**。
 > `agent doctor` 会列出两边不一致的键。
+>
+> 本节只列常用项；**全量配置项以 [`docs/contracts/config.md`](docs/contracts/config.md) 为准**，
+> 那里由 `scripts/gen_contracts.py` 从 `config.py` 生成，CI 会校验漂移。
 
 ### 模型与追踪
 
@@ -593,16 +615,19 @@ CI 在无 WSL 的 runner 上跑 `ruff` + `pytest -m "not wsl and not llm" --cov`
 | `AGENT_WSL_WORKSPACE` | 空 = `$HOME/agent-ws` | 支持 Windows 路径；Git Bash 下建议 `wsl:/home/u/proj` 避免 MSYS 路径转换 |
 | `AGENT_SHELL_SANDBOX` | `off` | `off` / `bwrap`；配了 bwrap 但不可用时拒绝执行 |
 | `AGENT_SHELL_NETWORK` | `true` | 仅 bwrap 生效；`false` 时加 `--unshare-net` |
+| `AGENT_SHELL_ENV_ALLOWLIST` | 空 | 显式放行给 WSL 的宿主变量名（如 `JAVA_HOME,GOPATH`）；敏感名称始终忽略 |
 | `AGENT_PERSISTENT_SHELL` | `true` | 常驻 WSL bash 会话池；失败自动退回逐命令执行 |
 | `AGENT_PERSISTENT_SHELL_POOL` | `4` | 常驻会话数量（保留并发能力） |
 | `AGENT_SHELL_TIMEOUT` | `60` | 单条命令墙钟上限 |
-| `AGENT_WRITE_DENY_GLOBS` | 空 | 追加敏感写保护 glob（`.env`/密钥/`.git` 默认已保护） |
+| `AGENT_WRITE_DENY_GLOBS` | 空 | 追加敏感写保护 glob（`.env`/密钥/凭据文件/`.git`/`.agent` 默认已保护） |
+| `AGENT_READ_DENY_GLOBS` | 见 `.env.example` | 追加秘密文件读保护 glob；`.env.example` 等模板自动放行 |
 | `AGENT_REPO_MAP_CHARS` | `4000` | 注入 planner 的 AST repo map 字符预算（0 = 关闭） |
 | `AGENT_LSP_COMMAND` | 空 | 可选 language server 命令（如 `pylsp`）；空则 `symbol_search` 用 AST |
 | `AGENT_LSP_TIMEOUT` | `10` | LSP 请求超时（秒） |
 | `AGENT_LSP_DIAGNOSTICS_WAIT_S` | `2` | pull 诊断不可用时等待 publishDiagnostics 的最长秒数 |
 | `AGENT_SHELL_CPU_SECONDS` / `_MEMORY_MB` / `_MAX_FILE_MB` / `_MAX_PROCESSES` | `600` / `0` / `512` / `1024` | 0 = 不限制 |
-| `AGENT_SANDBOX_MAX_CONCURRENT_COMMANDS` | `8` | 同时启动的 `wsl.exe` 上限 |
+| `AGENT_SANDBOX_MAX_CONCURRENT_COMMANDS` | `8` | 同时启动的 `wsl.exe` 上限（单进程；Web 多会话共享 governor，多个独立 `agent` 进程不共享） |
+| `AGENT_MAX_CAPTURE_BYTES` | `1000000` | 单条命令 stdout/stderr 各自捕获上限（0 = 不限制）；超出部分在沙箱侧丢弃 |
 
 ### 编排 / harness
 
@@ -633,12 +658,32 @@ CI 在无 WSL 的 runner 上跑 `ruff` + `pytest -m "not wsl and not llm" --cov`
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `AGENT_APPROVAL_MODE` | `ask` | `ask` / `approve` / `deny` |
+| `AGENT_APPROVAL_MODE` | `ask` | `ask` / `approve`（自动放行 L2；L3 仍确认）/ `deny` |
 | `AGENT_ALLOW_RULES` | 空 | 持久放行规则，如 `shell_exec:git status*,run_tests:*`；只覆盖 L2 ASK |
 | `AGENT_VERIFY_ENABLED` / `AGENT_VERIFY_COMMAND` | `true` / 空 | 自动验证；命令留空按清单识别 |
 | `AGENT_VERIFY_ONLY_FINAL` | `true` | 多步任务只在 verify 步/最后一步跑全量 |
 | `AGENT_REVIEW_ENABLED` | `true` | 验证通过后的确定性代码审查 |
+| `AGENT_REVIEW_LINT_BLOCKING` | `true` | 探测到的 ruff/mypy/gofmt/rustfmt 对**改动文件**的发现是否阻断；Markdown 代码块未闭合也会阻断 |
 | `AGENT_NUDGE_EMPTY_STEPS` | `true` | 一步无改动时给一次带提示的重做机会 |
+
+### 安全 profile / 多用户 Web
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `AGENT_SECURITY_PROFILE` | `local` | `untrusted` 强制 bwrap + 禁网 + ask + 不信任仓库指令/记忆；`production`/`ops` 强制 bwrap + 禁网 + deny + 只读；`agent web` 默认 untrusted |
+| `AGENT_TRUST_REPO_INSTRUCTIONS` | `true` | 是否把仓库 `AGENTS.md` / `CLAUDE.md` 当可信指令注入 |
+| `AGENT_TRUST_REPO_MEMORY` | `true` | 是否读取仓库 `.agent/memory.md`；false 时记忆移到 `AGENT_MEMORY_ROOT` / `$HOME/.agent-memory` |
+| `AGENT_READ_DENY_GLOBS` | `.env,*.pem,...` | 秘密文件读保护；`.env.example` 等模板自动放行 |
+| `AGENT_WEB_AUTH_TOKENS` | 空 | JSON `{"token":"user"}`；支持 `sha256:<hex>` |
+| `AGENT_WEB_AUTH_TOKENS_FILE` | 空 | 从文件读取同样格式的 token 表 |
+| `AGENT_WEB_WORKSPACES_ROOT` | `$HOME/agent-ws/users`（WSL） | per-user 工作区根 |
+| `AGENT_WEB_DATA_ROOT` | `./.agent/web/users`（宿主） | per-user 审计/checkpoint/steering 根 |
+| `AGENT_WEB_MEMORY_ROOT` | `$HOME/agent-memory`（WSL） | per-user 记忆根 |
+| `AGENT_WEB_MAX_BODY_BYTES` / `_MAX_PROMPT_CHARS` | `262144` / `100000` | 请求体与 prompt 上限 |
+| `AGENT_WEB_RATE_LIMIT_PER_MIN` | `60` | 每用户 run/steer/resume 的固定窗口限流 |
+| `AGENT_WEB_MAX_RUNTIMES` / `_PER_USER` | `8` / `2` | 进程级 / 每用户活跃 runtime 上限 |
+| `AGENT_WEB_RUNTIME_TTL_S` | `1800` | 挂起 runtime 的空闲保留；resume 时从 checkpoint 重建 |
+| `AGENT_WEB_ALLOW_ANONYMOUS_LOCAL` | `true` | 未配置 token 时是否允许 loopback 匿名 |
 
 ### 上下文与循环
 
@@ -698,5 +743,7 @@ CI 在无 WSL 的 runner 上跑 `ruff` + `pytest -m "not wsl and not llm" --cov`
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | 环境配置、依赖版本快照、复现与导出、常见问题 |
 | [docs/USAGE.md](docs/USAGE.md) | 常见工作流、配置来源、故障排查 |
 | [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md) | 需求逐条对照、自检清单、已知限制 |
+| [docs/rfc/](docs/rfc/README.md) | RFC 流程与模板（动手前的范围与权衡；批准后落 ADR、契约与验收锚点） |
+| [docs/adr/](docs/adr/README.md) | 架构决策记录（只增不改的“为什么”） |
 | [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md) | 保护对象、对手假设、T1/T2 边界 |
 | [docs/DEMO.md](docs/DEMO.md) | 答辩演示讲稿（配 `scripts/demo.py`） |

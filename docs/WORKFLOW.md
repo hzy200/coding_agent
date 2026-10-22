@@ -1,3 +1,13 @@
+---
+layer: L3（第 2.9 节已知张力属 L2 决策记录）
+doc_id: workflow
+title: 工作流设计
+owner: 项目作者
+status: active
+last_reviewed: 2026-10-22
+review_cadence: 拓扑或状态生命周期变动时
+---
+
 # 工作流设计
 
 > 面向实现：说清项目里**三套工作流**（运行 / 开发 / 使用）的设计、关键状态与决策，
@@ -316,7 +326,7 @@ CI（ubuntu，无 WSL）: pip install -e ".[dev,ui,web]" → ruff → pytest -m 
 |---|---|---|---|
 | CLI `agent run` | 消费事件 → 渲染 → 收集 `ApprovalRequested` → 提问 → `resume` 循环 | 逐条问，非交互默认拒绝 | 最简 |
 | TUI `agent tui` | Textual：事件→渲染→弹窗→`resume` 直到跑完 | `ApprovalScreen`（Esc 默认拒绝） | 主界面，斜杠命令 |
-| Web `agent web` | SSE 直接推 `event.model_dump_json()` | **固定 deny**（无审批交互） | 最小验证 |
+| Web `agent web` | SSE 直接推 `event.model_dump_json()` | **ask**：SSE 发 `approval_requested`，`/api/resume` 恢复 | Bearer Token + per-user 工作区；默认 untrusted profile |
 
 三者的 resume 循环结构相同，都基于"**挂起以 `ApprovalRequested` 收尾**"这条契约。
 
@@ -336,7 +346,8 @@ CI（ubuntu，无 WSL）: pip install -e ".[dev,ui,web]" → ruff → pytest -m 
 `SteeringApplied` 与 `WorkflowRevised`；审计写 `kind=steering`（含来源与动作）。
 CLI 用 `agent steer --thread-id <id> pause|cancel|add|replan` 注入指令；
 Web 端点提供 `/api/steer`、`/api/resume`、`/api/resume_steering`，
-页面也带审批与暂停/恢复按钮。
+页面也带审批与暂停/恢复按钮。所有 `/api/*` 需要 Bearer Token（loopback 匿名
+仅限未配置 token 的本地模式）；公网启动必须显式 `--allow-remote` 并配置 TLS。
 
 ---
 

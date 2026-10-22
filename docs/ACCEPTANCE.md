@@ -1,3 +1,17 @@
+---
+layer: L3
+doc_id: acceptance
+title: 需求对照与自检
+owner: 项目作者
+status: active
+last_reviewed: 2026-10-22
+review_cadence: 每次发版前
+note: |
+  第 1 节是需求 → 落点 → 验证的对照表。
+  机读的 Given-When-Then 版本见 docs/acceptance/acceptance-criteria.yaml。
+  第 4 节的「待办」已抽到 docs/tech-debt.yaml。
+---
+
 # 需求对照与自检
 
 逐条对照原始需求 → 实现落点 → 怎么验证。附**已知限制**（诚实列出，不藏）。
@@ -60,12 +74,13 @@
 | 关 | 代码 | 检查什么 |
 |---|---|---|
 | `verify` | `tools/testrun.py`、`nodes/verify.py` | 跑项目自己的测试/构建，把失败结构化 |
-| `review` | `tools/review.py`、`nodes/review.py` | 语法坏没坏、测试有没有被改弱、调试残留（`breakpoint()`/`pdb`）、有没有写进 `.agent/`；探测到 ruff/mypy 时一并跑 |
+| `review` | `tools/review.py`、`nodes/review.py` | 语法坏没坏、测试有没有被改弱、调试残留（`breakpoint()`/`pdb`）、有没有写进 `.agent/`；Markdown 代码块闭合、相对链接与标题层级；探测到 ruff/mypy/gofmt/rustfmt 时一并跑，**改动文件**的 lint/格式问题默认阻断（mypy 因空配置噪声只作告警） |
 
 review 的「改动前」**直接复用快照**（不变量 8：所有写操作先留底），不另建基线；
 只审水位线之后**新增**的行，水位线跨步骤保留 —— 否则每一步都会重审前面所有步骤
 的改动。阻断项（结构性缺陷）与验证失败**共用**同一份修复预算，走同一条
-`repair` 出口；告警只记录，不阻断。
+`repair` 出口；其余告警只记录，不阻断。`AGENT_REVIEW_LINT_BLOCKING=false`
+可把 lint/格式问题降回告警。
 
 ## 3. 自检清单
 
@@ -118,7 +133,8 @@ python scripts/demo.py --only 1
 > **CI 与本地不是一回事**：CI 是 Linux runner、没有 WSL2，只跑快反馈那 1309 个用例，
 > 覆盖率 80.7%。沙箱层与能力层的覆盖（`tools/files.py` 85%、`sandbox/snapshots.py` 88%）
 > 全靠 `-m wsl` 的 211 个用例，它们**只在本地执行**。CI 会以 `::warning::` 显式提示这个缺口 ——
-> 详见 [IMPROVEMENT_PLAN.md](IMPROVEMENT_PLAN.md) 的 Q1。
+> 详见 [archive/README.md](archive/README.md)（原 `IMPROVEMENT_PLAN.md` 的 Q1 去向）；
+> 缺陷与待办现集中在 [tech-debt.yaml](tech-debt.yaml)。
 >
 > 上面每个数字都是量出来的，命令见本节第 2–4 条；改动后请重跑核对，别手抄。
 
@@ -128,10 +144,13 @@ python scripts/demo.py --only 1
 
 ### 有意为之
 
-**Web 端固定拒绝变更类命令。**
-没有做审批交互。与其让 L2/L3 命令悬着等一个永远不会来的答复，不如明确拒绝
-并在页面上说清楚。`web/app.py::WEB_APPROVAL_MODE` 有测试锁着，
-防止以后被改成 `ask` 把页面卡死。
+**Web 支持审批、多用户与公网部署。**
+`web/app.py::WEB_APPROVAL_MODE = "ask"`：L2/L3 通过 SSE 发
+`approval_requested`，页面收集答复后调用 `/api/resume` 恢复；同时支持
+pause/cancel/add/replan。认证使用 Bearer Token；每个用户有独立
+workspace/audit/checkpoint/memory；非 loopback 必须 token + TLS（本进程
+或可信反向代理）。默认仍只监听 `127.0.0.1`，未配置 token 时只允许 loopback
+匿名。主交付界面仍是 TUI/CLI。
 
 **长期记忆只支持显式增删，不做 LLM 自动提炼。**
 自动记忆容易积累噪声，也难以回答"这条结论是哪来的"。
@@ -158,10 +177,11 @@ shell 的修改。
 所以没有把无法验证的改动放进请求路径。规避方式是 `DEEPSEEK_MODEL=deepseek-chat`。
 详见 [USAGE.md 故障排查](USAGE.md#模型报-reasoning_content-must-be-passed-back)。
 
-**实时干预只在节点边界生效，且只有 TUI 入口。**
-pause/cancel 不会打断正在跑的 LLM 轮次或同步工具；steering 队列不持久化，
-重启后能恢复 checkpoint 的暂停状态，但未消费的 add/replan 会丢失。CLI 与 Web
-只透传 `SteeringApplied` / `WorkflowRevised` 事件，不提供控制入口。
+**实时干预只在节点边界生效。**
+pause/cancel 不会打断正在跑的 LLM 轮次或同步工具；direct 模式的 cancel 额外在
+每轮 act/tools 之间检查，但长工具本身仍不可中断。入口包括 TUI 命令、Web 控制
+按钮与 CLI `agent steer`；steering 队列与暂停标记原子持久化，重启后未消费的
+add/replan 仍可恢复。
 
 **检索默认后端是 grep。**
 沙箱里没装 ripgrep，自动退到 `grep`/`find`。两个后端输出格式一致（grep 分支显式 `-E`），

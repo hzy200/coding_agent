@@ -1,0 +1,135 @@
+# 子 Agent / Worker 与可复用工作流定义
+#
+# 这一层回答的是「AI 能以什么身份、拿什么工具、按什么预算行动」。
+# 事实源：orchestrator/workers.py、orchestrator/implement.py、agents/explore.py、
+#         agents/policy.py、tools/registry.py。
+# 契约（工具等级）以 docs/contracts/tools.yaml 为准，那里是代码生成的。
+
+version: 1
+owner: 项目作者
+last_reviewed: 2026-10-22
+review_cadence: worker 角色或工具白名单变动时
+
+# ---------------------------------------------------------------------------
+# 三种并发实体。名字很像，但机制完全不同 —— 详见 docs/glossary.md
+# ---------------------------------------------------------------------------
+entities:
+  - id: orchestrator_worker
+    name: 编排 worker
+    where: orchestrator/workers.py
+    spawned_by: scheduler（按任务图依赖派发）
+    depth: 1             # 固定为 1，worker 不能再派生 worker
+    context: 独立 messages，不继承主 agent 历史
+    exception: 唯一注入的共享上下文是 session_brief（有界会话摘要，默认 4000 字符）
+    returns: 结构化 WorkerResult，不把中间工具输出写回主历史
+
+  - id: delegate_subagent
+    name: 委派子智能体
+    where: agents/explore.py（delegate_explore 工具）
+    spawned_by: 主 agent 在 act 阶段主动调用
+    depth: 1
+    context: 只有系统提示 + 本次任务
+    returns: SubAgentArtifact（summary / findings / files / tokens）
+    default: 关闭（AGENT_EXPLORE_ENABLED=false），不改变既有评测基线
+
+  - id: concurrent_tools
+    name: 同消息并发只读工具
+    where: graph/nodes/tools.py
+    spawned_by: 同一条 act 消息里的多个只读工具调用
+    limit: AGENT_MAX_CONCURRENT_TOOLS（默认 4）
+    note: 写工具与有依赖的调用保持串行
+
+# ---------------------------------------------------------------------------
+# Worker 角色 → 能力矩阵
+# ---------------------------------------------------------------------------
+roles:
+  - id: explore
+    purpose: 只读定位代码、总结事实
+    may_write: false
+    tools: [file_read, file_list, search_code, find_files, symbol_search, code_intel]
+    isolation: 独立上下文；只读工具白名单（构造时 + 运行时双重校验）
+    budget:
+      max_rounds: AGENT_EXPLORE_MAX_ROUNDS（8）
+      timeout_s: AGENT_EXPLORE_TIMEOUT（120）
+      max_tokens: AGENT_ORCHESTRATOR_TASK_TOKENS
+    may_propose_tasks: true    # 最多 2 个，且只能是只读角色
+
+  - id: review
+    purpose: 只读审查风险与遗漏，返回 [blocking] / [warning] 发现
+    may_write: false
+    tools: [file_read, file_list, search_code, find_files, symbol_search]
+    isolation: 独立上下文；只读白名单
+    budget:
+      retries: AGENT_ORCHESTRATOR_TASK_RETRIES（1）
+    may_propose_tasks: true
+    note: depends_mode 通常用 any，可消费 partial 产出
+
+  - id: test
+    purpose: 宿主运行项目测试并结构化输出
+    may_write: false
+    tools: [run_tests]
+    llm: false                # 不调模型，纯确定性执行
+    isolation: 独立上下文
+
+  - id: implement
+    purpose: 在 write_scope 内修改文件
+    may_write: true
+    tools: [file_read, file_write, file_edit, file_edit_many, file_restore,
+            file_move, file_copy, file_delete, file_mkdir, file_list,
+            search_code, find_files]
+    forbidden_tools: [shell_exec, git_*, deps_*, run_tests]
+    isolation: 独立 git worktree；write_scope 在文件工具 I/O 前强制校验
+    budget:
+      max_rounds: AGENT_ORCHESTRATOR_WORKER_ROUNDS（12）
+      repairs: AGENT_ORCHESTRATOR_WORKER_REPAIRS（2）
+      timeout_s: AGENT_ORCHESTRATOR_WORKER_TIMEOUT（240）
+    may_propose_tasks: false
+    note: 写范围必须来自 planner 或用户，worker 不能自行扩大
+
+# ---------------------------------------------------------------------------
+# 委派预算（按仓库规模分级，避免过度拆分）
+# ---------------------------------------------------------------------------
+delegation_budget:
+  policy: agents/policy.py
+  tiers:
+    - files: "<30"       -> 0    # 不委派
+    - files: "30-99"     -> 2
+    - files: "100-299"   -> 4
+    - files: ">=300"     -> AGENT_MAX_DELEGATE_CALLS（6）
+  rule: 只有 kind=explore 的步骤允许委派；实现/验证步一律主 agent 自己完成
+
+# ---------------------------------------------------------------------------
+# 可复用工作流（把重复干的事固化下来）
+# ---------------------------------------------------------------------------
+skills:
+  - id: verify_repair_loop
+    trigger: 本步改过东西（dirty=true）
+    flow: verify（跑项目测试）→ 失败则结构化回灌 → repair → 重试
+    hard_limit: AGENT_MAX_REPAIR_ROUNDS（3，按步计算）
+    exit: 同一失败签名连续到上限 → replan 换做法；到顶后如实上报"没修好"
+    note: |
+      不要"顺手"提高重试上限。验证环境异常时 verify 记为 error 并直接收尾
+      ——模型修不了坏掉的执行环境，让它重试只是烧 token。
+
+  - id: review_gate
+    trigger: verify 通过之后
+    checks: [语法是否坏, 测试有没有被改弱, 调试残留（breakpoint/pdb）,
+             有没有写进 .agent/, Markdown 代码块闭合, 相对链接与标题层级,
+             探测到的 ruff/mypy/gofmt/rustfmt 对改动文件的发现]
+    blocking: 结构性缺陷阻断，与验证失败共用同一份修复预算
+    watermark: 只审水位线之后新增的行；水位线只由 planner 归零
+
+  - id: patch_merge_transaction
+    trigger: implement worker 完成
+    flow: 全部 git apply --check → 解析路径 → 全部留快照 → 顺序 apply
+    failure: 反向撤销已应用补丁，必要时恢复快照；整批回滚，不留半合并状态
+
+  - id: steering
+    trigger: 用户 pause / cancel / add / replan
+    boundaries: [steering_plan, steering_dispatch, steering_step,
+                 steering_cancel, steering_final]
+    semantics:
+      cancel: 终态。同批后续 add/replan 一律不执行（防止"取消后仍派发"）
+      pause: 只在节点边界 interrupt()，不打断在跑的 LLM 轮次
+      add: 只接受只读角色（自由文本无法安全推断 write_scope）
+      replan: 保留 success/partial 任务，只重建剩余；已合并写补丁后新任务只允许只读

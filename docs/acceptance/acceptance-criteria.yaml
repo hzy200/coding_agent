@@ -1,0 +1,388 @@
+# 验收标准（可执行规格）
+#
+# 需求文档最好的形态就是 Given-When-Then —— 它能被 AI 直接转成测试用例，
+# 也能被 CI 直接锚定。每条都有 ID，便于按特性切片注入 context。
+#
+# 与 docs/ACCEPTANCE.md 的关系：那边是「需求 → 落点 → 怎么验证」的**叙述版**；
+# 这里是**机读版**。两边冲突时以测试为准 —— 测试才是唯一不会过期的描述。
+
+version: 1
+owner: 项目作者
+last_reviewed: 2026-10-22
+review_cadence: 需求或测试变动时
+convention:
+  id_prefix: REQ
+  status_values: [implemented, partial, planned]
+  how_to_run:
+    all: 'pytest -m "not llm"'
+    fast: 'pytest -m "not wsl and not llm"'
+    one: 'pytest <file>::<test> -q'
+  note: |
+    永远带 -m。裸 pytest 会把 3 条 llm 标记用例也跑掉，真的调用模型、真的计费。
+    tests 优先写到 `::test_name`；只有无法唯一对应时才保留文件级，
+    `scripts/check_docs.py` 会校验文件与用例都存在。
+
+criteria:
+  # ---------------------------------------------------------------- 核心设计
+  - id: REQ-01
+    title: 模型只输出意图，宿主代执行
+    given: 一次 agent 运行，模型产出任意工具调用
+    when: 调用到达宿主
+    then: |
+      调用必须是 {tool, args} 结构，经宿主校验后才执行；模型拿不到任何
+      操作系统句柄；每一次调用都写入审计。
+    status: implemented
+    tests: [tests/unit/test_architecture.py::test_ui_does_not_import_capability_or_sandbox, tests/unit/test_nodes.py::test_denied_call_is_not_executed]
+    see: docs/adr/0001-model-outputs-intent-only.md
+
+  - id: REQ-02
+    title: 文件修改走专用工具，不经 shell
+    given: 需要修改一个文件
+    when: 走 file_write / file_edit 工具
+    then: |
+      old_string 必须唯一（0 次或多次都拒绝并说明原因）；写盘前留快照；
+      产生 FileChanged 事件；内容经 base64 在沙箱内落盘，不经命令行解释。
+    status: implemented
+    tests:
+      - tests/integration/test_file_tools.py::test_edit_refuses_ambiguous_match
+      - tests/unit/test_write_policy.py
+    see: docs/adr/0001-model-outputs-intent-only.md
+
+  - id: REQ-03
+    title: 经 shell 的修改不产生快照（已知限制，不是 bug）
+    given: 模型用 shell（如 sed -i）改文件
+    when: 命令被执行（属 L2，需确认）
+    then: 置 dirty 触发验证，但**不生成快照、不发 FileChanged**
+    status: implemented
+    known_limitation: true
+    tests: [tests/unit/test_nodes.py::test_shell_mutation_warns_about_missing_snapshot]
+
+  # ---------------------------------------------------------------- 安全
+  - id: REQ-04
+    title: 命令四级分级，判定不看模型自报
+    given: 任意一条 shell 命令文本
+    when: 进入 sandbox/policy.py::classify
+    then: |
+      判定为 L0–L3 之一；复合命令按 && || ; | 分段取**最高级**；
+      无法解析的一律降级为 L2（fail-closed，不赌）。
+    status: implemented
+    tests: [tests/unit/test_policy.py::test_composite_takes_max_level]
+
+  - id: REQ-05
+    title: 未登记的工具按 L3 危险处理
+    given: 一个新工具未在 approve.py::tool_level 登记
+    when: 被模型调用
+    then: 等级为 L3，需人工确认；-y / approve 模式也不能放行
+    status: implemented
+    rationale: 故意 fail-closed —— 漏登记应该表现为"卡住"而不是"悄悄放行"
+    tests: [tests/unit/test_approve.py::test_unregistered_tool_fails_closed]
+
+  - id: REQ-06
+    title: 审批缺失时一律拒绝
+    given: 审批记录缺失 / 答复无法解析 / call_id 空或重复 / 非交互环境无 stdin
+    when: tools 节点准备执行
+    then: '**拒绝执行**，不进入"可恢复"路径'
+    status: implemented
+    tests: [tests/unit/test_nodes.py::test_missing_approval_fails_closed, tests/unit/test_approve.py]
+
+  - id: REQ-07
+    title: 审批结果一次性有效
+    given: 一轮审批已通过
+    when: 下一轮开始
+    then: approvals 已清空，不会复用上一轮的批准
+    status: implemented
+    rationale: 这是安全属性，不是清理逻辑
+    tests: [tests/unit/test_approve.py::test_approvals_do_not_leak_into_next_round]
+
+  - id: REQ-08
+    title: 路径双重校验，符号链接逃逸被拒
+    given: 工作区内有指向外部的符号链接（含悬空链接）
+    when: 文件工具尝试读写
+    then: 词法归一化 + 沙箱内 realpath 两层都拒绝
+    status: implemented
+    tests: [tests/integration/test_file_tools.py::test_symlink_escape_is_rejected]
+
+  - id: REQ-09
+    title: 秘密文件默认拒绝读写
+    given: 目标路径匹配 .env / 私钥 / .npmrc / .aws/** / credentials*.json 等
+    when: file_write / file_edit 尝试写入，或读取被保护文件
+    then: 默认拒绝；可用 AGENT_WRITE_DENY_GLOBS / AGENT_READ_DENY_GLOBS 追加
+    status: implemented
+    tests: [tests/unit/test_read_protection.py::test_file_read_rejects_secret_files_before_io, tests/unit/test_write_policy.py::test_env_and_keys_are_protected]
+
+  - id: REQ-10
+    title: 宿主环境变量不进入 Linux 子进程
+    given: 任意一条 WSL 命令
+    when: 命令启动
+    then: 以 env -i 启动；AGENT_SHELL_ENV_ALLOWLIST 中名含 KEY/TOKEN/SECRET/PASSWORD 的始终忽略
+    status: implemented
+    tests: [tests/unit/test_bwrap_args.py::test_wsl_argv_clears_the_host_environment, tests/unit/test_policy.py]
+
+  # ---------------------------------------------------------------- 可回滚
+  - id: REQ-11
+    title: 每次改动可回滚
+    given: 一次通过文件工具的修改
+    when: 执行 agent undo
+    then: 内容恢复到修改前
+    status: implemented
+    tests: [tests/integration/test_runtime_rollback.py::test_restore_latest_change]
+
+  - id: REQ-12
+    title: 回滚本身也可回滚
+    given: 刚执行过一次 undo
+    when: 再执行一次 undo
+    then: 回到 undo 之前的状态（恢复前先给当前内容留底）
+    status: implemented
+    tests: [tests/integration/test_runtime_rollback.py::test_restore_is_itself_undoable]
+
+  - id: REQ-13
+    title: 编排合并的改动可整体回滚
+    given: implement worker 的 patch 已合并进主工作区
+    when: 执行 agent undo --last-run
+    then: 合并前为目标文件留的快照（worker_results.snapshot_ids）被恢复
+    status: implemented
+    tests: [tests/integration/test_implement_worker.py::test_merged_patch_takes_snapshots_so_undo_can_restore]
+
+  # ---------------------------------------------------------------- 验证与修复
+  - id: REQ-14
+    title: 改过东西就自动验证
+    given: 本步 dirty=true
+    when: 进入 verify 节点
+    then: |
+      跑由宿主从固定清单推导的命令（allow_manifest=False），
+      失败输出结构化成「文件:行号 + 消息」回灌；ok 是三态 True/False/None。
+    status: implemented
+    tests: [tests/unit/test_verify_node.py::test_dirty_step_attempts_verification, tests/unit/test_testrun_parse.py]
+    see: docs/adr/0005-auto-verify-no-manifest.md
+
+  - id: REQ-15
+    title: 修复次数有硬上限
+    given: 验证持续失败
+    when: repair 轮次达到 AGENT_MAX_REPAIR_ROUNDS（默认 3，按步计算）
+    then: 停止重试，如实上报"试过了没修好"
+    status: implemented
+    tests: [tests/unit/test_repair.py::test_loop_converges_after_one_repair]
+
+  - id: REQ-16
+    title: 同一失败签名连续出现则改走 replan
+    given: 连续多次验证失败且失败签名相同
+    when: 次数达到 max_same_failures
+    then: 不再原地 repair，改由 replan 换做法
+    status: implemented
+    tests: [tests/unit/test_failure_signature.py::test_signature_is_stable_across_line_numbers_and_addresses, tests/unit/test_replan.py::test_failure_entry_offers_a_new_approach]
+
+  - id: REQ-17
+    title: 验证环境异常不拖垮整轮
+    given: 验证命令因环境原因跑不起来
+    when: verify 节点执行
+    then: 记为 status=error 并直接收尾（**不进 repair** —— 模型修不了坏掉的执行环境）
+    status: implemented
+    tests: [tests/unit/test_verify_node.py::test_environment_failure_is_reported_not_fatal]
+
+  - id: REQ-18
+    title: review 管代码质量，且只审新增行
+    given: verify 通过之后
+    when: review 节点执行
+    then: |
+      检查语法、被改弱的测试、调试残留（breakpoint/pdb）、写进 .agent/ 等；
+      只审水位线之后新增的行；水位线只由 planner 归零。
+    status: implemented
+    tests: [tests/unit/test_review.py::test_weakened_tests_block, tests/integration/test_review.py]
+
+  # ---------------------------------------------------------------- 编排
+  - id: REQ-19
+    title: 小任务不进编排
+    given: 仓库文件数 < AGENT_ORCHESTRATOR_MIN_FILES（默认 30）
+    when: runtime 选择执行路径
+    then: 走 direct 快速路径
+    status: implemented
+    tests: [tests/unit/test_orchestrator.py::test_rule_workflow_small_repo_is_direct, tests/unit/test_delegation_policy.py::test_small_repo_disables_delegation]
+
+  - id: REQ-20
+    title: 任务图校验失败必须整图降级且不静默
+    given: 任务图违反任一校验规则（id 重复 / 有环 / write_scope 重叠 / 超 max_tasks）
+    when: 进入派发
+    then: |
+      写模式退化为单个保守 implement，只读模式退化为单 explore；
+      发出事件、写审计，显式标记 degraded。
+    status: implemented
+    tests: [tests/unit/test_orchestrator.py::test_empty_or_invalid_graph_degrades_to_one_explore]
+
+  - id: REQ-21
+    title: 并发 implement 的 write_scope 不重叠，且 implement 之间不能互相依赖
+    given: 多个 implement 任务
+    when: 任务图校验
+    then: 违反即整图降级；运行中文件工具在 I/O 前强制校验 write_scope
+    status: implemented
+    tests: [tests/unit/test_orchestrator.py::test_overlapping_write_scopes_are_rejected, tests/unit/test_orchestrator.py::test_implement_tasks_cannot_depend_on_each_other]
+
+  - id: REQ-22
+    title: 同一批 implement 补丁作为一个事务合并
+    given: 一批 implement patch
+    when: 宿主在主工作区合并
+    then: |
+      全部 --check → 解析路径 → 全部留快照 → 顺序 apply；
+      任一失败反向撤销已应用补丁，必要时恢复快照，**不留半合并状态**。
+    status: implemented
+    tests: [tests/unit/test_atomic_merge.py::test_second_patch_failure_rolls_back_the_first, tests/integration/test_implement_worker.py::test_merged_patch_takes_snapshots_so_undo_can_restore]
+
+  - id: REQ-23
+    title: 等待合并的 implement 不会被重新派发
+    given: 一个 implement 已完成、正在等待合并
+    when: scheduler 刷新 ready 队列
+    then: 该任务状态为 merging（已离开 pending），不会被重新启动
+    status: implemented
+    regression_for: docs/postmortem/2026-10-21-orchestrated-write.md（P0-2）
+    tests: [tests/unit/test_scheduler.py::test_completed_implement_is_not_relaunched_while_waiting_for_merge]
+
+  - id: REQ-24
+    title: 并发 worker 的脏检查忽略 .agent/ 与 __pycache__/
+    given: worktree 与 patch 落在主工作区 .agent/ 下
+    when: 第二个 worker 做 git 脏检查
+    then: 不把它们误判为用户未提交改动
+    status: implemented
+    regression_for: docs/postmortem/2026-10-21-orchestrated-write.md（P0-1）
+    tests: [tests/integration/test_implement_worker.py::test_concurrent_implement_workers_ignore_agent_state]
+
+  - id: REQ-25
+    title: depends_mode=any 可消费 partial 产出
+    given: 依赖任务状态为 partial
+    when: 下游任务判定是否可启动
+    then: mode=any 可启动；mode=full 标 blocked；failed/blocked/cancelled 任何模式都不满足
+    status: implemented
+    tests: [tests/unit/test_orchestrator.py::test_partial_dependency_is_consumable_with_any_mode]
+
+  - id: REQ-26
+    title: worker 只能提议只读任务，且经 host 校验
+    given: explore/review worker 报告里带 proposed_tasks
+    when: scheduler 在完成点消费
+    then: |
+      每个 worker 最多 2 个；只接受 explore/test/review；校验角色/去重/依赖存在/
+      无环/总量；拒绝 write_scope；failed/cancelled worker 的提议不采纳。
+    status: implemented
+    tests: [tests/unit/test_orchestrator.py::test_validate_proposals_rejects_unsafe_or_duplicate_items, tests/unit/test_scheduler.py::test_dynamic_readonly_proposal_is_scheduled]
+
+  # ---------------------------------------------------------------- 干预
+  - id: REQ-27
+    title: cancel 是终态
+    given: 同一批 steering 指令里 cancel 之后还有 add / replan
+    when: 节点边界消费
+    then: 后续 add/replan 一律不执行（防止"取消后仍派发"）
+    status: implemented
+    tests: [tests/unit/test_steering.py::test_dispatch_node_cancel_marks_pending_tasks_cancelled]
+
+  - id: REQ-28
+    title: 干预只在节点边界生效
+    given: 一条 pause 或 cancel 指令
+    when: 正在跑的 LLM 轮次或同步工具
+    then: 不打断；在下一个节点边界生效。direct 模式的 cancel 额外在每轮 act/tools 之间检查
+    status: implemented
+    known_limitation: true
+    tests: [tests/unit/test_steering.py::test_pause_interrupts_and_requeues_sibling_commands, tests/unit/test_runtime_steering.py::test_resume_steering_sends_the_resume_payload]
+
+  - id: REQ-29
+    title: /add 只接受只读角色
+    given: 用户输入 /add <目标>
+    when: 追加任务
+    then: 只能是 explore/test/review —— 自由文本无法安全推断 write_scope
+    status: implemented
+    tests: [tests/unit/test_steering.py::test_add_rejects_write_roles]
+
+  # ---------------------------------------------------------------- 前端边界
+  - id: REQ-30
+    title: 前端不得导入 tools/ 或 sandbox/
+    given: cli/ tui/ web/ 任一模块
+    when: AST 扫描检查 import
+    then: 没有任何指向 tools/ 或 sandbox/ 的边
+    status: implemented
+    rationale: 安全属性 —— 保证任何界面都绕不过命令分级审批
+    tests: [tests/unit/test_architecture.py::test_ui_does_not_import_capability_or_sandbox]
+
+  - id: REQ-31
+    title: 挂起以 ApprovalRequested 收尾，不发 RunFinished
+    given: 图因审批挂起
+    when: 前端消费事件流
+    then: 收到 ApprovalRequested 且**不**收到 RunFinished —— 前端据此判断该 resume 还是收工
+    status: implemented
+    tests: [tests/unit/test_runtime_stream.py::test_interrupt_emits_approval_and_stops_without_run_finished]
+
+  - id: REQ-32
+    title: 每个图节点都有事件覆盖
+    given: 图里的每个节点
+    when: 检查事件翻译
+    then: 都有对应事件（否则前端会静默丢信息）
+    status: implemented
+    tests: [tests/unit/test_graph_event_coverage.py::test_every_graph_node_is_translated_or_declared_silent]
+
+  # ---------------------------------------------------------------- 持久化
+  - id: REQ-33
+    title: 审计由 runtime 写，写入失败要显式失败
+    given: 审计日志写入失败
+    when: runtime 处理
+    then: 转成 RunFailed，**不静默丢记录**
+    status: implemented
+    tests: [tests/unit/test_runtime_stream.py::test_audit_write_failure_surfaces_as_run_failed]
+
+  - id: REQ-34
+    title: 审计哈希链可校验
+    given: 一天的审计 JSONL
+    when: agent audit --verify
+    then: 能发现本地日志被改动；但**不能**防拥有主机权限者重写整条链
+    status: implemented
+    known_limitation: true
+    tests: [tests/unit/test_audit_chain.py::test_chain_verifies_after_writes]
+
+  - id: REQ-35
+    title: .agent/ 不进版本控制
+    given: 任意 git_add / git_commit
+    when: 涉及 .agent/ 路径
+    then: git_add 拒绝暂存；git_commit 提交前检查暂存区；经 shell 的 git add -A 升级为需确认
+    status: implemented
+    tests: [tests/integration/test_git_tools.py::test_add_refuses_agent_state_directory]
+
+  - id: REQ-36
+    title: 分层项目指令可被发现并注入
+    given: 仓库内有 AGENTS.md / CLAUDE.md
+    when: 一次运行开始
+    then: |
+      从根目录到 4 层子目录发现并合并（单文件 8k 字符、总量 24k、最多 12 个）；
+      untrusted profile 下**不注入**（仓库内容不可信）。
+    status: implemented
+    tests: [tests/unit/test_instructions.py::test_load_merges_files_with_headers]
+
+  - id: REQ-37
+    title: 长期记忆不做自动提炼
+    given: 任意一次运行结束
+    when: 宿主处理记忆
+    then: |
+      不产生任何自动蒸馏的记忆；只接受 agent memory --add 或模型显式
+      memory_save 调用；写入前扫描密钥。
+    status: implemented
+    tests: [tests/unit/test_memory.py::test_memory_save_tool_appends_fact]
+    see: docs/adr/0008-memory-no-auto-distillation.md
+
+  # ---------------------------------------------------------------- 评测
+  - id: REQ-38
+    title: 评测判定固定用 stdlib unittest
+    given: 任意评测任务
+    when: 判定
+    then: 用显式模块名跑 unittest；判分前用纯净副本覆盖测试文件
+    status: implemented
+    tests: [tests/unit/test_eval_harness.py::test_judge_is_the_dependency_free_default]
+    see: docs/adr/0006-eval-judge-stdlib-unittest.md
+
+  - id: REQ-39
+    title: 种子必须失败、参考解必须通过
+    given: 任意进阶档任务
+    when: --verify-seeds
+    then: 双向自检通过（拦住假阳性与假阴性两种相反的错误）
+    status: implemented
+    tests: [tests/unit/test_eval_harness.py::test_seed_is_unsolved_under_the_judge, tests/unit/test_full_task_catalog.py]
+
+  - id: REQ-40
+    title: 不可比的基线不许写
+    given: 工作区脏 / 只跑了子集 / 沙箱无 pytest
+    when: runner 准备写入 baseline
+    then: 开跑**之前**退出码 2 拒绝（--force 可绕过并标记 comparable=false）
+    status: implemented
+    tests: [tests/unit/test_eval_compare.py::test_delta_within_spread_refuses_conclusions]

@@ -1,3 +1,14 @@
+---
+layer: L3（第 4 节版本快照属环境属性，非契约）
+doc_id: environment
+title: 环境配置
+owner: 项目作者
+status: active
+last_reviewed: 2026-10-22
+review_cadence: 依赖或 Python 版本变动时
+note: 声明的依赖范围见 docs/contracts/dependencies.md（代码生成）。
+---
+
 # 环境配置
 
 从零把项目跑起来所需的**完整流程**，附当前环境的实测版本快照，供复现。
@@ -69,7 +80,7 @@ make check                    # ruff + 快反馈测试
 
 ## 4. 实测版本快照
 
-当前环境（2026-10-04 首测，2026-10-18 复核未变）直接依赖的 install 版本：
+当前环境（2026-10-04 首测，2026-10-22 复核未变）直接依赖的 install 版本：
 
 | 分组 | 包 | 版本 |
 |---|---|---|
@@ -93,6 +104,11 @@ make check                    # ruff + 快反馈测试
 | Web | `uvicorn` | 0.52.1 |
 
 Python 3.11.15 · pip 26.1.2 · 环境内共 239 个包。
+
+> 这段是**实测快照**，会随环境漂移；声明依赖以 `pyproject.toml` 与
+> `docs/contracts/dependencies.md` 为准。
+> 复核：`python scripts/snapshot_env.py --check`；
+> 重生成表格：`python scripts/snapshot_env.py`（需在 `agent` 环境运行）。
 
 ## 5. 复现与导出
 

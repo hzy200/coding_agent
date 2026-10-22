@@ -1,3 +1,16 @@
+---
+layer: L2（第 5 节事故复盘）+ L3（其余）
+doc_id: test-report-2026-10-21
+title: 全量测试报告
+owner: 项目作者
+status: snapshot
+last_reviewed: 2026-10-22
+review_cadence: 不适用（一次性快照）
+warning: |
+  这是**一次性快照**。第 5 节的两个 P0 已抽成正式复盘，见 postmortem/2026-10-21-orchestrated-write.md
+  —— 那里才是应该被检索和引用的地方，本文只作历史记录。
+---
+
 # 全量测试报告（2026-10-21）
 
 > 本轮包含三部分：LangSmith 全量评测、脱离测试环境的真实上机运行、

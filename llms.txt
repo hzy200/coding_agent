@@ -1,0 +1,76 @@
+# owner: 项目作者
+# last_reviewed: 2026-10-22
+# 这是纯文本的目录卡，元数据用注释形式写在头部。
+
+# CodingAgent
+
+> 基于 LangGraph 的终端原生编程智能体。核心设计只有一条：**宿主内置工具，
+> 模型只输出意图**。LLM 不直接接触操作系统，只产出结构化工具调用 `{tool, args}`，
+> 由宿主校验后在 WSL2 沙箱里执行。文件修改走专用工具（精确替换 + diff + 写前备份），
+> 不经 shell。
+
+这是**目录卡**，不是事实源。任何与 `docs/contracts/` 冲突的说法以契约为准
+（那里由代码生成），任何数字以实跑结果为准。
+
+## 先读什么（按顺序）
+
+- [AGENTS.md](AGENTS.md)：AI 操作手册 —— 确切命令、目录边界、**禁区清单**。改代码前必读。
+- [docs/glossary.md](docs/glossary.md)：统一语言词汇表。本项目术语重载严重
+  （三套数字编号系统并存），先查这里再动手。
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：分层、数据流、**56 条不变量**、取舍理由。
+
+## L0 可执行事实（代码生成，最可信）
+
+- [docs/contracts/index.md](docs/contracts/index.md)：契约索引
+- [docs/contracts/config.md](docs/contracts/config.md)：配置项**全量**（README 只是摘录）
+- [docs/contracts/config.json](docs/contracts/config.json)：机器可读，可直接校验配置项是否存在
+- [docs/contracts/events.md](docs/contracts/events.md)：领域事件契约（前端唯一可消费的东西）
+- [docs/contracts/tools.yaml](docs/contracts/tools.yaml)：工具 → 命令等级
+- [docs/contracts/audit.yaml](docs/contracts/audit.yaml)：审计记录类型与字段分组
+- [docs/contracts/dependencies.md](docs/contracts/dependencies.md)：依赖声明范围
+
+## L1 指令（分层加载）
+
+- [AGENTS.md](AGENTS.md)：根级（命令 / 边界 / 禁区 / 敏感数据 / 提交规范）
+- [src/coding_agent/graph/AGENTS.md](src/coding_agent/graph/AGENTS.md)：主图与状态生命周期
+- [src/coding_agent/orchestrator/AGENTS.md](src/coding_agent/orchestrator/AGENTS.md)：harness 子图与并发写
+- [src/coding_agent/sandbox/AGENTS.md](src/coding_agent/sandbox/AGENTS.md)：执行安全层
+- [src/coding_agent/tools/AGENTS.md](src/coding_agent/tools/AGENTS.md)：能力层
+- [src/coding_agent/security/AGENTS.md](src/coding_agent/security/AGENTS.md)：脱敏 / 读写保护
+- [src/coding_agent/audit/AGENTS.md](src/coding_agent/audit/AGENTS.md)：审计与哈希链
+- [src/coding_agent/llm/AGENTS.md](src/coding_agent/llm/AGENTS.md)：provider 路由 / 限流 / 上下文预算
+- [src/coding_agent/agents/AGENTS.md](src/coding_agent/agents/AGENTS.md)：子智能体与委派策略
+- [src/coding_agent/memory/AGENTS.md](src/coding_agent/memory/AGENTS.md)：长期记忆 / checkpoint / 会话索引
+
+> `cli/` `tui/` `web/` `codeintel/` 不单独设模块 AGENTS：
+> 前端边界见根 AGENTS 第 3 节（只消费 events，不得绕过审批），
+> 索引层只读且由 `tests/unit/test_architecture.py` 守着。
+- [docs/agents/subagents.yaml](docs/agents/subagents.yaml)：worker / 子智能体角色与预算
+- [docs/agents/tool-permissions.yaml](docs/agents/tool-permissions.yaml)：工具权限与数据边界
+
+## L2 决策与边界（AI 读不到的"为什么"）
+
+- [docs/adr/README.md](docs/adr/README.md)：架构决策记录索引（只增不改）
+- [docs/rfc/README.md](docs/rfc/README.md)：RFC 流程与索引（动手前的范围与权衡；批准后落 ADR 与验收锚点）
+- [docs/glossary.md](docs/glossary.md)：统一语言词汇表
+- [docs/bounded-contexts.yaml](docs/bounded-contexts.yaml)：模块边界、依赖与所有权
+- [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md)：资产 / 对手假设 / T1–T3 边界
+- [docs/tech-debt.yaml](docs/tech-debt.yaml)：技术债登记簿
+- [docs/postmortem/](docs/postmortem/)：事故复盘（AI 最好的反例教材）
+
+## L3 叙事与上下文
+
+- [README.md](README.md)：项目概览与快速开始（注意：其配置表与测试数字可能已过期）
+- [docs/onboarding.md](docs/onboarding.md)：新人上手路径
+- [docs/USAGE.md](docs/USAGE.md)：怎么用、故障排查
+- [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md)：环境配置与版本快照
+- [docs/acceptance/acceptance-criteria.yaml](docs/acceptance/acceptance-criteria.yaml)：
+  验收标准（Given-When-Then + 可执行测试 ID）
+- [docs/runbook.yaml](docs/runbook.yaml)：故障场景 → 处置步骤
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)：架构
+- [docs/HARNESS.md](docs/HARNESS.md)：harness 设计
+- [docs/WORKFLOW.md](docs/WORKFLOW.md)：运行 / 开发 / 使用三套工作流
+- [docs/ACCEPTANCE.md](docs/ACCEPTANCE.md)：需求逐条对照与自检清单
+- [docs/COMPLEXITY.md](docs/COMPLEXITY.md)：复杂度度量与热点
+- [docs/DEMO.md](docs/DEMO.md)：答辩演示讲稿
+- [tests/eval/README.md](tests/eval/README.md)：能力评测方法与噪声口径

@@ -1,0 +1,33 @@
+# 责任域（Code Owners）
+#
+# 目的不是"找谁批"，而是让高风险路径的改动必须经过人工 review。
+# 注意：本文件只有在 GitHub 分支保护里开启
+# "Require review from Code Owners" 之后才会强制执行；否则只是声明。
+#
+# 单人项目仍保留该文件：它同时是给 Agent 的边界信号——
+# 以下路径的改动不应由 Agent 自行合并。
+
+# 默认责任人
+*                           @hzy200
+
+# 安全与执行边界
+/src/coding_agent/sandbox/       @hzy200
+/src/coding_agent/security/      @hzy200
+/src/coding_agent/audit/         @hzy200
+/src/coding_agent/workspace_lock.py @hzy200
+
+# 契约与决策：禁止手改生成物，决策只增不改
+/docs/contracts/                 @hzy200
+/docs/adr/                       @hzy200
+/docs/rfc/                       @hzy200
+/docs/acceptance/                @hzy200
+/docs/THREAT_MODEL.md            @hzy200
+/docs/tech-debt.yaml             @hzy200
+
+# 常驻指令与流水线
+/AGENTS.md                       @hzy200
+/CLAUDE.md                       @hzy200
+/llms.txt                        @hzy200
+/.github/workflows/              @hzy200
+/scripts/gen_contracts.py        @hzy200
+/scripts/check_docs.py           @hzy200

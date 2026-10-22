@@ -1,0 +1,159 @@
+# 限界上下文映射
+#
+# 回答三个问题：模块边界在哪、允许依赖谁、改动谁的代码要找谁。
+# 决定 Agent 改动的合法范围 —— 跨边界的改动必须显式说明，不能顺手带过。
+#
+# 事实源：src/ 目录结构 + tests/unit/test_architecture.py（AST 扫描守着依赖方向）
+
+version: 1
+owner: 项目作者
+last_reviewed: 2026-10-22
+review_cadence: 模块边界或依赖方向变动时
+
+# ===========================================================================
+# 允许的依赖方向（单向、无环）
+# ===========================================================================
+dependency_rules:
+  - "cli/tui/web → runtime"
+  - "runtime     → graph, orchestrator, sandbox, tools, audit, memory, steering, llm"
+  - "graph       → orchestrator, tools, sandbox, llm, messages, config, steering"
+  - "orchestrator→ agents, tools, sandbox, llm, codeintel, graph.state, config, steering"
+  - "agents      → tools, sandbox, llm, config, messages"
+  - "tools       → sandbox, codeintel, config, diffing"
+  - "sandbox     → config, diffing"
+  - "llm         → config"
+  - "codeintel   → (标准库)"
+  - "audit       → (无内部依赖)"
+
+forbidden:
+  - from: [cli, tui, web]
+    to: [tools, sandbox]
+    why: |
+      安全属性，不是代码风格。前端只消费 events.py 的领域事件，
+      拿不到工具与沙箱，因此任何界面都绕不过命令分级审批。
+    enforced_by: tests/unit/test_architecture.py（AST 扫描）
+  - from: [orchestrator]
+    to: [cli, tui, web]
+    why: 编排层不知道前端存在
+  - from: [sandbox]
+    to: [tools, graph, orchestrator]
+    why: 安全层必须是最底下的，不能反向依赖调用方
+
+# ===========================================================================
+# 上下文清单
+# ===========================================================================
+contexts:
+  - id: orchestration
+    name: 编排
+    path: [runtime.py, graph/]
+    owns: [执行入口, 计划与步进, 审批决定, 事件翻译, 审计写入]
+    upstream: []
+    downstream: [orchestrator, tools, sandbox, audit]
+    invariants: 见 docs/ARCHITECTURE.md 第 6 节（56 条）
+    change_note: |
+      runtime._stream 是全项目最大的函数（CC 114）。改它要有事件流测试兜底，
+      见 docs/COMPLEXITY.md 第 7 节。
+
+  - id: harness
+    name: 编排子图（harness）
+    path: [orchestrator/]
+    owns: [仓库画像 survey, 工作流选择, 任务图校验, DAG 调度, worker 派发, fan-in, patch 合并]
+    upstream: [graph]
+    downstream: [agents, tools, sandbox, codeintel]
+    isolation: 独立子图；不复制主 messages，只注入 session_brief
+    change_note: |
+      任务图校验失败必须整图降级并标记 degraded，不能静默截断。
+      并发写是该上下文风险最高的部分，改动前读 src/coding_agent/orchestrator/AGENTS.md。
+
+  - id: sandbox
+    name: 执行安全层
+    path: [sandbox/]
+    owns: [WSL2 执行, 命令分级, 路径守卫, 文件读写, 快照, 资源上限]
+    upstream: []
+    downstream: []
+    risk: 最高 —— 全系统唯一"模型意图落地成副作用"的地方
+    change_note: 改这里必须对照 docs/THREAT_MODEL.md 第 4 节防线分级
+
+  - id: capabilities
+    name: 能力层
+    path: [tools/]
+    owns: [shell, 文件, git, 依赖, 检索, 符号, 测试运行, 委派, 审查, 记忆工具]
+    upstream: [graph, orchestrator, agents]
+    downstream: [sandbox, codeintel]
+    change_note: 加工具必须同步 approve.py::tool_level 登记等级 + 重跑 gen_contracts.py
+
+  - id: codeintel
+    name: 代码索引
+    path: [codeintel/]
+    owns: [AST 符号索引, import 图与测试影响分析, 最小 LSP 客户端]
+    upstream: [tools, orchestrator]
+    downstream: []
+    change_note: |
+      只读、不写工作区；LSP 未配置时必须降级为 AST 索引。
+      索引是静态近似（动态 import、条件 import 会偏保守），不要把结果当成
+      类型检查或安全判定的依据。
+
+  - id: subagents
+    name: 子智能体
+    path: [agents/]
+    owns: [explore 只读循环, review 循环, 委派预算策略]
+    upstream: [orchestrator, graph]
+    downstream: [tools]
+    depth: 固定 1，不能再派生
+
+  - id: llm
+    name: 模型接入
+    path: [llm/]
+    owns: [DeepSeek 客户端, provider 路由与冷却, 提示词, 上下文裁剪, 计费]
+    upstream: [graph, orchestrator, agents]
+    downstream: []
+    change_note: 上下文裁剪用字符 + 估算 token 双预算，刻意不引入 tokenizer
+
+  - id: memory
+    name: 记忆与持久化
+    path: [memory/]
+    owns: [checkpoint, 会话索引, 长期记忆]
+    upstream: [runtime]
+    downstream: [sandbox]
+    note: 长期记忆不做 LLM 自动提炼（ADR-0008）
+
+  - id: audit
+    name: 审计
+    path: [audit/]
+    owns: [JSONL 记录, 哈希链, 轮转]
+    upstream: [runtime]
+    downstream: []
+    note: |
+      由 runtime 写，不由前端写 —— 任何界面都绕不过。
+      写入失败转 RunFailed（宁可显式失败，也不静默丢记录）。
+
+  - id: frontends
+    name: 前端
+    path: [cli/, tui/, web/]
+    owns: [事件渲染, 审批交互, 会话管理, Web 认证与租户隔离]
+    upstream: []
+    downstream: [runtime]
+    constraint: 不得 import tools/ 或 sandbox/（AST 测试守着）
+    note: |
+      Web 默认 untrusted profile（bwrap + 禁网 + 强制 ask + 不信任仓库指令/记忆），
+      只监听 127.0.0.1；公网必须 token + TLS。
+
+  - id: evaluation
+    name: 能力评测
+    path: [tests/eval/]
+    owns: [任务集, 判定, 基线, 噪声对比, 干预延迟基准]
+    upstream: []
+    downstream: [runtime]
+    note: |
+      它是**尺子**不是回归：评测通过率下降只说明能力变了，需要人判断。
+      判定固定 stdlib unittest（ADR-0006），仓库用确定性生成器（ADR-0007）。
+
+# ===========================================================================
+# 改动范围判定
+# ===========================================================================
+change_scope:
+  - 只动一个 context 内部 → 正常 PR
+  - 跨 context 边界 → 必须在 PR 说明为什么，并确认两侧测试都在
+  - 动 sandbox 或 approve.py → 对照 THREAT_MODEL 第 4 节，说明防线等级没有下降
+  - 动 events.py / config.py / approve.py::tool_level / audit/models.py
+    → 必须重跑 `python scripts/gen_contracts.py`（CI 会拦）

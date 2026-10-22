@@ -1,0 +1,52 @@
+name: Docs
+
+# 防腐化的自动闸门：契约漂移、断链、无主文档、过期文档、危险命令示例。
+# 单独一个 workflow 而不是塞进 ci.yml —— 文档问题不该和代码测试混着判断，
+# 但也不该被跳过。它是"文档不腐烂"的唯一自动保障。
+#
+# 只用标准库，不安装项目依赖也能跑（gen_contracts.py 用 ast 静态解析，
+# check_docs.py 只做文本扫描），因此在 Linux runner 上零安装成本。
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  # 每周一 02:00 UTC 巡检一次：即使没人改代码，也能发现文档过期与漂移。
+  schedule:
+    - cron: "0 2 * * 1"
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 契约与源码一致性
+        # docs/contracts/ 全部由 scripts/gen_contracts.py 从源码生成。
+        # 改了 events.py / config.py / approve.py / audit/models.py 却没重生成 → 这里红。
+        run: python scripts/gen_contracts.py --check
+
+      - name: 文档一致性（断链 / owner / 过期 / 命令卫生 / 验收锚点 / 体量预算）
+        # --strict：过期与超长文档也算失败。阈值见 scripts/check_docs.py 的
+        # STALE_DAYS / CONTEXT_BUDGETS / DOC_SOFT_LIMIT。
+        run: python scripts/check_docs.py --strict
+
+      - name: 文档—代码漂移
+        # 代码注释里的 docs/... 与文档里的 src/ tests/ scripts/ 路径必须存在。
+        run: python scripts/check_drift.py
+
+      - name: 生成文档指标
+        # 指标不是门禁：即使上一步失败也生成，便于在 artifact 里看趋势。
+        if: always()
+        continue-on-error: true
+        run: python scripts/check_docs.py --json > docs-metrics.json
+
+      - name: 上传文档指标
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-metrics
+          path: docs-metrics.json
