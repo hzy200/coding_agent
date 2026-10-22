@@ -3,7 +3,7 @@
 没有这一步，分层做得再好也会腐烂：契约会漂移、链接会断、
 文档会变成没有 owner 的孤儿、数字会各说各话。
 
-七项检查：
+八项检查：
     1. 契约漂移 —— docs/contracts/ 是否与源码一致（委托给 gen_contracts.py --check）
     2. 断链     —— .md / .txt 里的相对链接与 anchor 是否存在
     3. owner    —— 每份文档必须有 owner（无主文档等于无文档）
@@ -11,6 +11,7 @@
     5. 命令卫生 —— 文档里不许出现裸 `pytest`（会真调模型、真的计费）
     6. 验收锚点 —— acceptance-criteria.yaml 引用的测试文件与用例必须存在
     7. 体量预算 —— 常驻上下文（AGENTS/llms）与模块 AGENTS 不得无限增长
+    8. 不变量计数 —— ARCHITECTURE 第 6 节的条数与文档中的「N 条不变量」一致
 
 只用标准库，不依赖项目自身可导入 —— 这样 Linux runner 上无需安装依赖也能跑。
 
@@ -310,6 +311,43 @@ def check_acceptance_tests() -> list[str]:
 # --------------------------------------------------------------------------
 
 
+INVARIANT_ROW = re.compile(r"^\|\s*(\d+)\s*\|", re.MULTILINE)
+INVARIANT_CLAIM = re.compile(r"(\d+)\s*条不变量")
+
+
+def check_invariants() -> tuple[list[str], int]:
+    """ARCHITECTURE §6 的不变量表是硬资产；条数在别处被反复引用。
+
+    这里同时校验两件事：编号从 1 连续，以及其它文档声称的「N 条」与表格一致。
+    """
+    arch = DOCS / "ARCHITECTURE.md"
+    if not arch.exists():
+        return [f"缺少 {rel(arch)}"], 0
+    text = arch.read_text(encoding="utf-8")
+    try:
+        section = text.split("## 6.", 1)[1].split("## 7.", 1)[0]
+    except IndexError:
+        return ["ARCHITECTURE.md 缺少第 6 节不变量表"], 0
+
+    numbers = [int(value) for value in INVARIANT_ROW.findall(section)]
+    errors: list[str] = []
+    if numbers != list(range(1, len(numbers) + 1)):
+        errors.append(f"不变量编号不连续：共 {len(numbers)} 条（{numbers[:8]}…）")
+
+    count = len(numbers)
+    for path in collect_doc_files():
+        if path.suffix not in {".md", ".txt"}:
+            continue
+        for match in INVARIANT_CLAIM.finditer(path.read_text(encoding="utf-8")):
+            claimed = int(match.group(1))
+            if claimed != count:
+                errors.append(
+                    f"{rel(path)} 声称 {claimed} 条不变量，"
+                    f"但 ARCHITECTURE 第 6 节有 {count} 条"
+                )
+    return errors, count
+
+
 def check_budgets(files: list[Path]) -> tuple[list[str], list[str]]:
     """返回 (硬超限, 软警告)。硬超限直接失败，软警告在 --strict 下失败。"""
     errors: list[str] = []
@@ -345,6 +383,7 @@ def main() -> int:
     link_errors = check_links(files)
     acceptance_errors = check_acceptance_tests()
     budget_errors, budget_warnings = check_budgets(files)
+    invariant_errors, invariant_count = check_invariants()
     missing, stale = check_owners(files)
     stale += budget_warnings
     command_errors = check_commands(files)
@@ -354,6 +393,7 @@ def main() -> int:
         + link_errors
         + acceptance_errors
         + budget_errors
+        + invariant_errors
         + missing
         + command_errors
     )
@@ -401,6 +441,7 @@ def main() -> int:
                 "broken": len(acceptance_errors),
             },
             "budget": {"errors": len(budget_errors), "warnings": len(budget_warnings)},
+            "invariants": {"count": invariant_count, "consistent": not invariant_errors},
             "command_hygiene": len(command_errors),
             "largest_document": {"path": largest_path, "chars": largest_chars},
             "errors": errors,
@@ -413,7 +454,7 @@ def main() -> int:
     if problems:
         print(f"文档检查失败（{len(problems)} 项）：")
         for item in problems:
-            print(f"  ✗ {item}")
+            print(f"  - {item}")
     if stale and not strict:
         print(f"\n过期警告（{len(stale)} 项，--strict 时算失败）：")
         for item in stale:
