@@ -29,6 +29,15 @@ jobs:
         # 改了 events.py / config.py / approve.py / audit/models.py 却没重生成 → 这里红。
         run: python scripts/gen_contracts.py --check
 
+      - name: 契约兼容性（PR 相对基线）
+        # 删除事件/字段、配置项、工具或审计字段会失败；等级降低也会失败。
+        # 有意破坏时给 PR 加 `contracts-breaking` 标签跳过本步。
+        if: ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'contracts-breaking') }}
+        run: |
+          pip install pyyaml
+          git fetch --depth=1 origin "${{ github.base_ref }}"
+          python scripts/gen_contracts.py --check-compat --base FETCH_HEAD
+
       - name: 文档一致性（断链 / owner / 过期 / 命令卫生 / 验收锚点 / 体量预算）
         # --strict：过期与超长文档也算失败。阈值见 scripts/check_docs.py 的
         # STALE_DAYS / CONTEXT_BUDGETS / DOC_SOFT_LIMIT。

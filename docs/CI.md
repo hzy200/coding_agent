@@ -43,6 +43,7 @@ CI 是 Linux runner、没有 WSL2，所以 `wsl` 标记的用例**一行都没�
 | 步骤 | 命令 |
 |---|---|
 | 契约漂移 | `python scripts/gen_contracts.py --check` |
+| 契约兼容性（PR） | `python scripts/gen_contracts.py --check-compat --base <base>` |
 | 文档一致性 | `python scripts/check_docs.py --strict` |
 | 文档—代码漂移 | `python scripts/check_drift.py` |
 
@@ -53,6 +54,12 @@ CI 是 Linux runner、没有 WSL2，所以 `wsl` 标记的用例**一行都没�
 `check_drift.py` 补的是链接检查覆盖不到的一类漂移：代码注释/docstring 里引用的
 `docs/...`、以及文档里反引号标注的 `src/` `tests/` `scripts/` 路径必须存在。
 它只做存在性检查，不判断内容是否过时。
+
+**契约兼容性**在 PR 上以目标分支为基线，阻断这些破坏性变更：删除事件类型 /
+事件字段、删除配置项或改变类型、删除工具或降低工具等级（更宽松）、删除审计
+记录类型 / 审批决定 / 字段。新增与等级升高只提醒。有意破坏时给 PR 加
+`contracts-breaking` 标签；本地可用 `--allow-breaking` 仅报告。YAML 契约的
+比较需要 PyYAML，CI 在这一步临时安装。
 
 每次运行还会生成 `docs-metrics.json` 并作为 artifact 上传（文档数、断链、
 无 owner、过期、契约漂移、验收锚点、模块 AGENTS 覆盖率、最大文档）。

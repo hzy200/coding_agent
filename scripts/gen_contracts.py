@@ -2,8 +2,9 @@
 
 设计约束（都是为了能让 CI 用 `git diff --exit-code` 拦住漂移）：
 
-1. **只用标准库**：不 import `coding_agent`，因此不需要装 langgraph/pydantic，
-   任意 Python 3.11+ 都能跑，Linux runner 上也能跑。
+1. **生成与 `--check` 只用标准库**：不 import `coding_agent`，因此不需要装
+   langgraph/pydantic，任意 Python 3.11+ 都能跑。`--check-compat` 的 YAML 部分
+   可选依赖 PyYAML；JSON 契约（events/config）不需要。
 2. **输出确定性**：不写时间戳、不写 git commit、不做字典序以外的排序。
    否则每次生成都不一样，CI 的 diff 检查会永远红。
 3. **事实源单一**：events.py / config.py / approve.py / audit/models.py 是唯一权威，
@@ -12,12 +13,15 @@
 用法：
     python scripts/gen_contracts.py            # 生成
     python scripts/gen_contracts.py --check    # 只比对，不一致则退出码 1
+    python scripts/gen_contracts.py --check-compat --base HEAD
+                                               # 与基线比较破坏性变更
 """
 
 from __future__ import annotations
 
 import ast
 import json
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -644,6 +648,190 @@ def render_index(events: list[dict[str, Any]], fields: list[dict[str, Any]], too
 
 
 # --------------------------------------------------------------------------
+# 7. 兼容性检查（相对某个 git 基线）
+# --------------------------------------------------------------------------
+
+COMPAT_CONTRACTS = ("events.json", "config.json", "tools.yaml", "audit.yaml")
+
+
+def _git_show(base: str, name: str) -> str | None:
+    proc = subprocess.run(
+        ["git", "show", f"{base}:docs/contracts/{name}"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _load_contract(name: str, text: str) -> dict[str, Any] | None:
+    try:
+        if name.endswith(".json"):
+            return json.loads(text)
+        import yaml  # 只有兼容性检查需要；生成与 --check 仍保持零依赖
+    except (ImportError, json.JSONDecodeError):
+        return None
+    try:
+        return yaml.safe_load(text)
+    except yaml.YAMLError:
+        return None
+
+
+def _diff_events(old: dict, new: dict) -> list[str]:
+    problems: list[str] = []
+    old_events = {item["event_type"]: item for item in old.get("events", [])}
+    new_events = {item["event_type"]: item for item in new.get("events", [])}
+    for name in sorted(old_events.keys() - new_events.keys()):
+        problems.append(f"events.json: 删除事件类型 `{name}`")
+    for name in sorted(old_events.keys() & new_events.keys()):
+        old_fields = {f["name"]: f for f in old_events[name].get("fields", [])}
+        new_fields = {f["name"]: f for f in new_events[name].get("fields", [])}
+        for field in sorted(old_fields.keys() - new_fields.keys()):
+            problems.append(f"events.json: `{name}` 删除字段 `{field}`")
+        for field in sorted(old_fields.keys() & new_fields.keys()):
+            before = old_fields[field].get("type")
+            after = new_fields[field].get("type")
+            if before != after:
+                problems.append(
+                    f"events.json: `{name}.{field}` 类型 `{before}` -> `{after}`"
+                )
+    return problems
+
+
+def _diff_config(old: dict, new: dict) -> tuple[list[str], list[str]]:
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    old_envs = set(old.get("env_vars", []))
+    new_envs = set(new.get("env_vars", []))
+    for env in sorted(old_envs - new_envs):
+        problems.append(f"config.json: 删除配置项 `{env}`")
+
+    old_fields = {f["env"]: f for f in old.get("fields", []) if f.get("env")}
+    new_fields = {f["env"]: f for f in new.get("fields", []) if f.get("env")}
+    for env in sorted(old_fields.keys() & new_fields.keys()):
+        before = old_fields[env].get("type")
+        after = new_fields[env].get("type")
+        if before != after:
+            problems.append(f"config.json: `{env}` 类型 `{before}` -> `{after}`")
+        if old_fields[env].get("default") != new_fields[env].get("default"):
+            warnings.append(f"config.json: `{env}` 默认值发生变化")
+    if old.get("priority") != new.get("priority"):
+        warnings.append("config.json: 配置优先级顺序发生变化")
+    return problems, warnings
+
+
+def _diff_tools(old: dict, new: dict) -> tuple[list[str], list[str]]:
+    problems: list[str] = []
+    warnings: list[str] = []
+    old_tools = {item["tool"]: item for item in old.get("tools", [])}
+    new_tools = {item["tool"]: item for item in new.get("tools", [])}
+    for name in sorted(old_tools.keys() - new_tools.keys()):
+        problems.append(f"tools.yaml: 删除工具 `{name}`")
+    for name in sorted(old_tools.keys() & new_tools.keys()):
+        before = old_tools[name].get("level")
+        after = new_tools[name].get("level")
+        if before == after:
+            continue
+        if isinstance(before, int) and isinstance(after, int):
+            if after < before:
+                problems.append(
+                    f"tools.yaml: `{name}` 等级降低 L{before} -> L{after}（更宽松）"
+                )
+            else:
+                warnings.append(
+                    f"tools.yaml: `{name}` 等级升高 L{before} -> L{after}"
+                    "（更严格，可能影响自动化）"
+                )
+        else:
+            warnings.append(f"tools.yaml: `{name}` 等级 `{before}` -> `{after}`")
+    return problems, warnings
+
+
+def _diff_audit(old: dict, new: dict) -> list[str]:
+    problems: list[str] = []
+
+    old_kinds = {item["kind"] for item in old.get("kinds", [])}
+    new_kinds = {item["kind"] for item in new.get("kinds", [])}
+    for kind in sorted(old_kinds - new_kinds):
+        problems.append(f"audit.yaml: 删除记录类型 `{kind}`")
+
+    old_decisions = {item["value"] for item in old.get("decisions", [])}
+    new_decisions = {item["value"] for item in new.get("decisions", [])}
+    for value in sorted(old_decisions - new_decisions):
+        problems.append(f"audit.yaml: 删除审批决定 `{value}`")
+
+    old_groups = {
+        group["group"]: {field["name"] for field in group.get("fields", [])}
+        for group in old.get("field_groups", [])
+    }
+    new_groups = {
+        group["group"]: {field["name"] for field in group.get("fields", [])}
+        for group in new.get("field_groups", [])
+    }
+    for group in sorted(old_groups.keys() - new_groups.keys()):
+        problems.append(f"audit.yaml: 删除字段组 `{group}`")
+    for group in sorted(old_groups.keys() & new_groups.keys()):
+        for field in sorted(old_groups[group] - new_groups[group]):
+            problems.append(f"audit.yaml: `{group}` 删除字段 `{field}`")
+    return problems
+
+
+def check_compat(base: str, allow_breaking: bool) -> int:
+    files = build()
+    breaking: list[str] = []
+    warnings: list[str] = []
+    skipped: list[str] = []
+
+    for name in COMPAT_CONTRACTS:
+        old_text = _git_show(base, name)
+        if old_text is None:
+            skipped.append(name)
+            continue
+        old = _load_contract(name, old_text)
+        new = _load_contract(name, files[name])
+        if old is None or new is None:
+            skipped.append(name)
+            continue
+        if name == "events.json":
+            breaking += _diff_events(old, new)
+        elif name == "config.json":
+            problems, notes = _diff_config(old, new)
+            breaking += problems
+            warnings += notes
+        elif name == "tools.yaml":
+            problems, notes = _diff_tools(old, new)
+            breaking += problems
+            warnings += notes
+        elif name == "audit.yaml":
+            breaking += _diff_audit(old, new)
+
+    if skipped:
+        print(f"兼容性基线不可用，已跳过：{', '.join(skipped)}")
+        if any(name.endswith(".yaml") for name in skipped):
+            print("  （YAML 检查需要 PyYAML：pip install pyyaml）")
+
+    if warnings:
+        print("兼容性提醒（非破坏性）：")
+        for item in warnings:
+            print(f"  ! {item}")
+
+    if breaking:
+        print(f"检测到 {len(breaking)} 项破坏性契约变更：")
+        for item in breaking:
+            print(f"  - {item}")
+        if allow_breaking:
+            print("已指定 --allow-breaking：仅报告，不失败。")
+            return 0
+        print("确认是有意变更后，用 --allow-breaking 放行；否则请恢复兼容性。")
+        return 1
+
+    print(f"契约兼容性检查通过（基线 {base}）。")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # 主流程
 # --------------------------------------------------------------------------
 
@@ -669,6 +857,14 @@ def build() -> dict[str, str]:
 
 
 def main() -> int:
+    if "--check-compat" in sys.argv:
+        base = "HEAD"
+        if "--base" in sys.argv:
+            index = sys.argv.index("--base")
+            if index + 1 < len(sys.argv):
+                base = sys.argv[index + 1]
+        return check_compat(base, "--allow-breaking" in sys.argv)
+
     check_only = "--check" in sys.argv
     files = build()
 
